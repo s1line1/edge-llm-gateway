@@ -197,12 +197,10 @@ stop: ## 停止 dev 启动的全部后台进程
 		fi; \
 	done
 
-## home-llm-gateway 根路径下执行
-docker-gateway-down:
+docker-gateway-down: ## 用 compose 构建并后台启动网关容器（在仓库根执行）
 	docker compose -f crates/gateway/docker-compose.yml down
 
-## home-llm-gateway 根路径下执行
-docker-gateway-up:
+docker-gateway-up: ## 用 compose 构建并后台启动网关容器（在仓库根执行）
 	docker compose -f crates/gateway/docker-compose.yml up -d --build
 
 ## ---------- 清理 ----------
