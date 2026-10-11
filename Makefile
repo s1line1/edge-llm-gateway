@@ -197,7 +197,7 @@ stop: ## 停止 dev 启动的全部后台进程
 		fi; \
 	done
 
-docker-gateway-down: ## 用 compose 构建并后台启动网关容器（在仓库根执行）
+docker-gateway-down: ## 用 compose 停止并移除网关容器（在仓库根执行）
 	docker compose -f crates/gateway/docker-compose.yml down
 
 docker-gateway-up: ## 用 compose 构建并后台启动网关容器（在仓库根执行）
