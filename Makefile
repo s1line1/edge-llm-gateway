@@ -21,7 +21,8 @@ LIMIT ?= 20
 
 .PHONY: help setup certs certs-required web-install web-build web-dev build build-debug fmt clippy check test bench bench-k6 \
         bench-admission bench-admission-local release release-strict check-records \
-        run-gateway run-agent run-mock dev dev-ui logs stop clean
+        run-gateway run-agent run-mock dev dev-ui logs stop clean \
+		docker-gateway-up docker-gateway-down
 
 help: ## 显示所有命令
 	@grep -E '^[-a-zA-Z0-9_]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -195,6 +196,12 @@ stop: ## 停止 dev 启动的全部后台进程
 			rm -f .tmp/$$p.pid; \
 		fi; \
 	done
+
+docker-gateway-down:
+	docker compose -f crates/gateway/docker-compose.yml down
+
+docker-gateway-up:
+	docker compose -f crates/gateway/docker-compose.yml up -d --build
 
 ## ---------- 清理 ----------
 
