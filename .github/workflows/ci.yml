@@ -1,9 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: 
-      - feature_*
+  # push:
+  #   branches: 
+  #     - feature_*
   pull_request:
     branches:
       - main
