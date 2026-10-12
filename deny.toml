@@ -71,9 +71,16 @@ feature-depth = 1
 #db-urls = ["https://github.com/rustsec/advisory-db"]
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
-# 评估记录：以下均为 "unmaintained" 类公告（非漏洞/CVE），功能简单稳定，接受：
+# 评估记录：以下均为 "unmaintained" 类公告（非漏洞/CVE）；前两条功能简单稳定，接受。
+# 第三条是例外，理由见它自己那条：
 # - RUSTSEC-2025-0134: rustls-pemfile（直接依赖，仅做 PEM 证书/私钥解析）
 # - RUSTSEC-2023-0089: atomic-polyfill（传递依赖，postcard 的 heapless 链）
+# - RUSTSEC-2024-0449: unsafe-libyaml（serde_yaml_ng 的传递依赖；patched = []，无修复版本）。
+#   ⚠️ 这条的理由**不是**"功能简单稳定"——它是 c2rust 机器翻译的 libyaml，上游明确不再修 bug。
+#   接受的真实理由是**暴露面**：serde_yaml_ng 只用于解析运维本机自己写的配置文件
+#   （crates/agent/src/config.rs:103、crates/gateway/src/config.rs:243），没有攻击者输入路径。
+#   另记：版本升级拆不掉它——serde_yaml_ng 0.10.0 已是最新，要拆只能换解析器
+#   （advisory 建议 saphyr / serde-saphyr，另有 noyalib）。
 ignore = [
     "RUSTSEC-2025-0134",
     "RUSTSEC-2023-0089",
