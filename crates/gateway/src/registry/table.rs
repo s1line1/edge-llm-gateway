@@ -14,7 +14,7 @@ use std::{
 };
 
 use serde::Serialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::entry::{is_fresh, now_millis, since_millis, Entry, NEVER};
 use super::routing::{pick, AcquireError};
@@ -236,9 +236,12 @@ impl Registry {
     /// 那类。接管是**正常事件**（agent 重连），不是故障，所以它必须和其它摘除路径走同一套
     /// 处置：先移出路由（新条目入表即是），再等在途收尾或宽限到期才关连接。
     ///
-    /// **为什么 `inflight <= 1` 就立刻关**：那个 1 是**本次接管调用自己**占的槽位（调用方先
-    /// `try_acquire` 取到旧条目、再重连注册），所以"<=1"等于"没有别人的请求会被牵连"。
-    /// 与 [`Registry::evict`] 用同一个判据、同一个理由：空闲连接立刻换手，别让它变僵尸。
+    /// **为什么 `inflight == 0` 才立刻关**（**不要**照抄 [`Registry::evict`] 的 `<= 1`）：
+    /// `evict` 的调用者**自己持有一个槽位**（那个 1 就是它，见 `evict` 的注释），而接管来自
+    /// 控制面（`quic::handle_conn_inner` 的 `Register` 分支）——调用者**不占任何请求槽位**。
+    /// 所以这里 `inflight == 1` 意味着**真有一个在途请求**，它必须被 drain。
+    /// 抄 `<= 1` 恰好会关掉"只有一个在途请求"的连接，也就是最常见的形态（2026-10-16 实测：
+    /// 单测与 e2e 都会因此变红）。
     #[allow(clippy::too_many_arguments)]
     pub fn register_with_grace(
         &self,
@@ -252,26 +255,30 @@ impl Registry {
     ) -> usize {
         let peer_ip = normalize_ip(peer_ip);
         let key = AgentKey::new(&agent_id, peer_ip);
+        // 锁外的分层日志要用它，而 `agent_id` 在锁内被移进 `Entry`（每连接一次克隆，可忽略）。
+        let logged_agent_id = agent_id.clone();
         let stable_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         // 写锁下只碰 map（与 `evict` 同一条纪律）：被顶替的那条连接的关闭动作留到锁外，
         // 免得把传输调用夹在守卫里。
-        let superseded = {
+        // 锁内算出来、锁外打日志：日志要读 `same_id_other_ips`（同 id 的**其他**来源 IP），
+        // 而它是从 map 里扫出来的。锁内只做 map 操作（既有纪律），输出一律留到锁外。
+        let (superseded, same_id_other_ips) = {
             let mut inner = write_or_recover(&self.inner);
+            // C2 的判据：这个 `agent_id` 是否**已有别的来源 IP** 的条目在表里。
+            // D1 下"同名不同源"是合法形态（两个节点并存），所以这不是错误——但它是"换了来源"
+            // 这个信号本身，值得 warn 一次；而"同名同源"只是重连（接管），不该报。
+            let other_ips: Vec<IpAddr> = inner
+                .keys()
+                .filter(|k| k.agent_id == agent_id && k.peer_ip != peer_ip)
+                .map(|k| k.peer_ip)
+                .collect();
             // `stable_id` 是本调用刚发的新号（单调、永不复用），表里那条一定属于**另一条**
             // 连接，所以"条目存在"与"它被顶替"是同一件事——早期版本在这里又比了一次
             // `old.stable_id != stable_id`，那是恒真条件（读起来像在防误关，其实什么都没防）。
-            let superseded = match inner.get(&key) {
-                Some(old) => {
-                    warn!(
-                        agent = %agent_id,
-                        ip = %peer_ip,
-                        "duplicate (agent_id, ip) connection, closing old one"
-                    );
-                    // 锁内**只取句柄与计数**（不调传输、不 spawn），关闭时机留到锁外决定。
-                    Some((old.conn.clone(), old.inflight.clone(), old.agent_id.clone()))
-                }
-                None => None,
-            };
+            // 锁内**只取句柄与计数**（不调传输、不 spawn、不打日志），处置留到锁外决定。
+            let superseded = inner
+                .get(&key)
+                .map(|old| (old.conn.clone(), old.inflight.clone(), old.agent_id.clone()));
             // **接管时继承在途计数**（复用同一个 `Arc`），不能给新条目发一个新的计数器：
             // 换连接之前取到的 `SlotGuard` 持有的是**旧那个 `Arc`**，而每个在途请求都靠它计数。
             // 新开一个计数器会让"已经送达上游、模型正在生成"的那些请求**不再被新条目看见**——
@@ -305,8 +312,34 @@ impl Registry {
                     last_heartbeat_millis: Arc::new(AtomicU64::new(NEVER)),
                 },
             );
-            superseded
+            (superseded, other_ips)
         };
+
+        // 锁外的分层日志（C2 定案）：
+        //   · 同名**同源** = 接管（正常事件）→ debug：每次 agent 重连都会发生，warn 会变噪声；
+        //   · 同名**不同源** → warn 一次，带上新 IP 与该 id 已知的其他 IP：这才是"换了来源 /
+        //     疑似冒用"那个信号，D2 要的就是它（**不拒绝**，只让运维看得见）；
+        //   · 全新的 `(id, ip)` → debug（首注册由调用方的 "agent registered" 那条 info 负责）。
+        match &superseded {
+            Some((_, _, old_agent_id)) => debug!(
+                agent = %logged_agent_id,
+                ip = %peer_ip,
+                replaced = %old_agent_id,
+                "same (agent_id, ip) reconnected; taking over the entry"
+            ),
+            None if !same_id_other_ips.is_empty() => warn!(
+                agent = %logged_agent_id,
+                new_ip = %peer_ip,
+                other_ips = ?same_id_other_ips,
+                "agent_id is now connecting from an additional source IP; its existing nodes keep serving (not rejected)"
+            ),
+            None => debug!(
+                agent = %logged_agent_id,
+                ip = %peer_ip,
+                "first registration for this node"
+            ),
+        }
+
         if let Some((old_conn, old_inflight, old_agent_id)) = superseded {
             let inflight = old_inflight.load(Ordering::Relaxed);
             // **判据是 `== 0`，不是 `<= 1`**：接管路径与 `evict` 的调用者不同——`evict` 是在

@@ -1839,7 +1839,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       只打一条 debug 日志，`crates/gateway/src/quic.rs:216`）。
       **改动形状**：`upstream` 允许是**一组** `{origin, models}`（字符串继续合法，向后兼容）；
       agent 按请求 `model` 筛候选 → 取在途最少 → 转发；**本地熔断**沿用「同一原因连续 N 次」
-      的既有纪律（同 `crates/gateway/src/registry/table.rs:317` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），
+      的既有纪律（同 `crates/gateway/src/registry/table.rs:432` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），
       但**判据是连接级失败，不是上游 404**——404 的意思是"这个模型不存在"，误当"后端坏"会熔断
       一个健康后端。
       **本机闸门按后端各一个**（今天是**一个全局** `Semaphore`，`crates/agent/src/lib.rs:280`

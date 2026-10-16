@@ -72,6 +72,63 @@ mod tests {
     use rcgen::{CertificateParams, KeyPair};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::net::IpAddr;
+
+    /// 测试用的日志捕获：断言"这一条 warn 到底有没有打"。
+    ///
+    /// 为什么不用 `tracing_subscriber::fmt::init()` 之类：那会装**全局** subscriber，与同进程
+    /// 其它测试互相覆盖。`set_default` 是**线程局部**的，所以要用它的测试必须是
+    /// `#[tokio::test(flavor = "current_thread")]`（多线程 runtime 会把任务调度到别的 worker 上，
+    /// 事件就抓不到了）。这与 agent 侧 `crate::test_log::CapturedLogs` 是同一个理由。
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// 装一个线程局部的捕获 subscriber，返回 `(守卫, 读文本的句柄)`。
+    /// **必须**在 `flavor = "current_thread"` 的测试里用（见 [`CapturedLogs`]）。
+    fn capture_logs() -> (
+        tracing::subscriber::DefaultGuard,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("debug")
+            // 关颜色：带 ANSI 时字段名被画成斜体、字节里就没有字面量可 grep（agent 侧踩过同样的坑）。
+            .with_ansi(false)
+            .finish();
+        (tracing::subscriber::set_default(subscriber), logs.0.clone())
+    }
+
+    fn captured_text(handle: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(handle.lock().unwrap().clone()).unwrap()
+    }
+
+    /// 捕获里是否出现过 **WARN 级别**的事件。
+    ///
+    /// 为什么按级别判而不是按消息文本判：只 grep 某条消息时，"该 warn 的没 warn"能测出来，
+    /// 但"**不该 warn 的 warn 了别的内容**"测不出来（实测：把接管那条 debug 改成 warn 之后，
+    /// 文本断言照样通过）。这一层的契约本来就是"什么级别"，所以判据也应该是级别。
+    fn has_warn(handle: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> bool {
+        captured_text(handle)
+            .lines()
+            .any(|l| l.split_whitespace().any(|w| w == "WARN"))
+    }
     use std::time::Duration;
 
     /// 摘除宽限：单测不关心具体时长（那由 `Options::evict_close_grace` 决定，默认 15s），
@@ -678,6 +735,78 @@ mod tests {
         assert_eq!(reg.len(), 1);
         drop(fourth);
         assert_eq!(reg.len(), 0);
+    }
+
+    /// 自检：确认日志捕获**真的**在工作（否则后面那条用例的断言全是空的）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_logs_selftest() {
+        let (_guard, logs) = capture_logs();
+        tracing::warn!("SELFTEST-MARKER");
+        let text = captured_text(&logs);
+        assert!(text.contains("SELFTEST-MARKER"), "捕获没工作：{text:?}");
+    }
+
+    /// 规格（D2 + C2 定案）：同一个 `agent_id` 从**新的来源 IP** 接入时打一条 `warn`，带上
+    /// 新 IP 与该 id 已知的其他 IP；同名**同来源**重连（接管）**不许**打 warn（那是正常事件，
+    /// 每次 agent 重连都会发生，打 warn 就成了噪声）；全新节点也不打 warn（首注册由调用方的
+    /// "agent registered" 那条 info 负责）。
+    ///
+    /// 变异验证：把 warn 的条件改成"只要该 id 出现过"⇒ 第二条断言红（接管也会 warn）；
+    /// 改成不打日志 ⇒ 第一条红。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ip_change_warns_once_but_takeover_and_first_registration_stay_quiet() {
+        let (_guard, logs) = capture_logs();
+
+        // ① 全新节点：只 debug，不 warn
+        let reg = Registry::default();
+        reg.register(
+            "edge".into(),
+            IP,
+            vec!["m".into()],
+            4,
+            test_connection().await,
+        );
+        let text = captured_text(&logs);
+        assert!(
+            !text.contains("additional source IP"),
+            "首注册不该报 IP 变动：{text}"
+        );
+        assert!(text.contains("first registration for this node"));
+
+        // ② 同名同来源重连 = 接管：debug，不 warn
+        reg.register(
+            "edge".into(),
+            IP,
+            vec!["m".into()],
+            4,
+            test_connection().await,
+        );
+        let text = captured_text(&logs);
+        assert!(
+            !has_warn(&logs),
+            "同名同源接管**一条 warn 都不该有**（那是每次重连都会发生的正常事件）：{text}"
+        );
+        assert!(text.contains("taking over the entry"));
+
+        // ③ 同名**不同来源** = 新的来源 IP：warn 一条，带 new_ip 与 other_ips
+        reg.register(
+            "edge".into(),
+            OTHER_IP,
+            vec!["m".into()],
+            4,
+            test_connection().await,
+        );
+        let text = captured_text(&logs);
+        assert!(
+            text.contains("additional source IP"),
+            "同名新来源必须打 warn（D2 要的那个信号）：{text}"
+        );
+        assert!(
+            text.contains("new_ip=127.0.0.2") && text.contains("127.0.0.1"),
+            "warn 必须同时带上新 IP 与已知的其他 IP：{text}"
+        );
+        // 两个节点都在表里（D1：不拒绝、并存）
+        assert_eq!(reg.len(), 2);
     }
 
     /// 规格（R4）：IP 归一——剥端口、v4-mapped IPv6 折叠成 IPv4、其余 IPv6 原样。
