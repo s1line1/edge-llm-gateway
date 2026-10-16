@@ -34,9 +34,14 @@ use std::{
 
 use tracing::warn;
 
+/// 关闭发生后要通知的人。**只服务于测试**：`s2n-quic` 的 `Handle` 在连接关闭后
+/// 仍能回答 `remote_addr()`（实测过：close 之后依然 `Ok`），所以"这条连接到底关没关"
+/// 无法从外部观测。传 `None` 时是一个零成本的空操作，生产路径永远传 `None`。
+pub(crate) type CloseObserver = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// 等在途请求收尾（或超过 `grace`）再关闭连接。
 ///
-/// 参数**恰好**是它需要的那三样：连接句柄、在途计数、日志用的 agent_id。
+/// 参数是它需要的那几样：连接句柄、在途计数、日志用的 agent_id、宽限，以及可选的关闭通知。
 /// 故意不接收 `registry::Entry`：`Entry` 的字段是私有的（见它的文档），
 /// 为一个模块开后门等于把"关掉任意一条连接"的能力扩散出去。
 pub(crate) fn defer_close(
@@ -44,6 +49,7 @@ pub(crate) fn defer_close(
     inflight: Arc<AtomicU32>,
     agent_id: &str,
     grace: Duration,
+    on_closed: Option<CloseObserver>,
 ) {
     let agent_id = agent_id.to_string();
     tokio::spawn(async move {
@@ -63,5 +69,8 @@ pub(crate) fn defer_close(
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         conn.close(0u32.into());
+        if let Some(notify) = on_closed {
+            notify();
+        }
     });
 }

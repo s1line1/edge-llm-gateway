@@ -186,6 +186,7 @@ impl Gateway {
                 registry.clone(),
                 metrics.clone(),
                 opts.stream_ceiling(),
+                opts.evict_close_grace,
                 shutdown.subscribe(),
             )),
         ];

@@ -1,4 +1,4 @@
-// Agents 页：在线 agent 状态。明细来自 /admin/agents（agent_id / models /
+// Agents 页：在线 agent 状态。明细来自 /admin/agents（agent_id / ip / models /
 // max_concurrency / inflight / last_seen），顶部卡展示在线总数（/metrics）
 // 与明细聚合（在途、并发上限合计）。
 
@@ -16,6 +16,7 @@ function AgentTable({ agents }: { agents: NonNullable<Awaited<ReturnType<typeof 
         <thead>
           <tr className="border-b border-slate-100 text-xs text-slate-500">
             <th className="pb-2 pr-4 font-medium">Agent ID</th>
+            <th className="pb-2 pr-4 font-medium">来源 IP</th>
             <th className="pb-2 pr-4 font-medium">模型</th>
             <th className="pb-2 pr-4 font-medium">并发上限</th>
             <th className="pb-2 pr-4 font-medium">在途</th>
@@ -29,11 +30,16 @@ function AgentTable({ agents }: { agents: NonNullable<Awaited<ReturnType<typeof 
             // 按 `agent_stale_secs` 算出的在线数会在配置不是 15 时互相矛盾）。
             const stale = !a.healthy;
             const full = a.inflight >= (a.max_concurrency || Number.POSITIVE_INFINITY);
+            // **key 必须含 IP**：`agent_id` 不再是唯一键——同名不同来源是两个并存节点，
+            // 只用 `agent_id` 做 key 会让 React 把两行当成同一行（行状态/子节点会串）。
+            // 旧网关不返回 `ip`，那时 `agent_id` 确实是唯一的，用它与空串拼接仍然安全。
+            const rowKey = `${a.agent_id}@${a.ip ?? ""}`;
             return (
-              <tr key={a.agent_id} className="border-b border-slate-50 last:border-0">
+              <tr key={rowKey} className="border-b border-slate-50 last:border-0">
                 <td className="py-2.5 pr-4 font-mono text-xs font-medium text-slate-800">
                   {a.agent_id}
                 </td>
+                <td className="py-2.5 pr-4 font-mono text-xs text-slate-600">{a.ip ?? "—"}</td>
                 <td className="py-2.5 pr-4 text-xs text-slate-600">{a.models.join(", ") || "—"}</td>
                 <td className="py-2.5 pr-4 tabular-nums text-slate-600">
                   {a.max_concurrency === 0 ? "不限" : a.max_concurrency}
