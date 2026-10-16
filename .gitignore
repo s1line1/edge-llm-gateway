@@ -25,3 +25,5 @@ keys.db-shm
 
 /docs/*
 /diagrams/*
+
+/specs/*
