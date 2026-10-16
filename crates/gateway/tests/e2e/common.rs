@@ -367,6 +367,22 @@ pub struct TestGateway {
     pub keys_path: PathBuf,
     /// `http://<真实端口>`。
     pub base: String,
+    /// 可直连的 QUIC 地址。
+    ///
+    /// 为什么与 `gw.quic_addr` 分开：`quic_bind` 配成通配地址（`0.0.0.0:0` 或 `[::]:0`）时，
+    /// `local_addr()` 报回来的是**未指定地址**加真实端口——客户端无法把 `0.0.0.0` 当目的地。
+    /// 这个字段把通配折成回环（v4 → `127.0.0.1`，v6 → `::1`，两者共用同一个端口与同一个 socket）。
+    pub quic_connect: SocketAddr,
+}
+
+/// 把"未指定地址"折成可直连的回环地址（见 [`TestGateway::quic_connect`]）。
+pub fn connectable(addr: SocketAddr) -> SocketAddr {
+    let ip = match addr.ip() {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        other => other,
+    };
+    SocketAddr::new(ip, addr.port())
 }
 
 /// 起一个**裸网关**（不接 agent）。`tune` 只改这个用例真正要动的旋钮。
@@ -416,6 +432,7 @@ pub async fn start_gateway_with(tune: impl FnOnce(&mut Options, &TestCerts)) -> 
 
     let base = format!("http://{}", gw.http_addr);
     TestGateway {
+        quic_connect: connectable(gw.quic_addr),
         gw,
         certs,
         key,
@@ -457,6 +474,72 @@ pub async fn start_stack_with_mock(
     wait_for_agents(&t.gw, 1, Duration::from_secs(10)).await;
     let TestGateway { gw, key, base, .. } = t;
     (gw, agent, base, key, mock_addr)
+}
+
+/// 从**指定的本地地址**注册一个裸 agent（不读请求流），返回它的稳定注册结果。
+///
+/// 存在的理由：`(agent_id, peer_ip)` 是节点身份，而"从**另一个来源 IP** 接入"这件事在
+/// e2e 里只有一种造法——**绑不同的本地地址**。macOS 上 `127.0.0.2` 不可用（没有 lo0 别名，
+/// 实测 `bind` 报 `Errno 49`），所以用 IPv6 回环：客户端绑 `[::1]:0` 连到 `[::1]:端口`，
+/// 服务端看到的对端就是 `::1`，与 `127.0.0.1` 是**真正不同**的两个 IP。
+///
+/// 前提：网关的 QUIC 监听必须是**双栈**的（绑 `[::]:0`，macOS 的 UDP socket 默认
+/// `IPV6_V6ONLY=0`，所以同一个 socket 同时收 v4 与 v6）——实测过两种客户端都能握手成功。
+pub async fn register_raw_agent_from(
+    gateway_port: u16,
+    local: &str,
+    certs: &TestCerts,
+    agent_id: &str,
+    max_concurrency: u32,
+) {
+    // 目的地按**客户端自己的地址族**取回环地址：双栈监听在**同一个端口**上同时收 v4 与 v6，
+    // 而"未指定地址"（`[::]` / `0.0.0.0`）本身不能当目的地。用客户端的地址族推导，
+    // 比让调用方各自拼一个地址更不容易写错（第一版就是把 v4 客户端指向了 `[::1]`，握手直接超时）。
+    let target = if local.starts_with('[') {
+        SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), gateway_port)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway_port)
+    };
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(
+            std::sync::Arc::new(
+                agent::tls::rustls_client_tls(
+                    &certs.ca,
+                    certs.client_cert.clone(),
+                    certs.client_key.clone_key(),
+                )
+                .unwrap(),
+            ),
+        ))
+        .unwrap()
+        .with_io(local)
+        .unwrap()
+        .start()
+        .unwrap();
+    let mut conn = client
+        .connect(s2n_quic::client::Connect::new(target).with_server_name("localhost"))
+        .await
+        .unwrap();
+    let stream = conn.open_bidirectional_stream().await.unwrap();
+    let (mut recv, mut send) = stream.split();
+    write_frame(
+        &mut send,
+        &Frame::Register {
+            agent_id: agent_id.into(),
+            models: vec!["mock-llm".into()],
+            max_concurrency,
+            version: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), FrameReader::new(&mut recv).next()).await;
+    // 连接搬进永不结束的任务：保持它活着（否则 drop 会摘掉刚注册的条目）
+    tokio::spawn(async move {
+        let _conn = conn;
+        std::future::pending::<()>().await;
+    });
 }
 
 /// 起一个**会真正服务请求**的 agent 连接（注册 + 持续 accept 代理流）。
