@@ -216,6 +216,40 @@ impl Registry {
         max_concurrency: u32,
         conn: s2n_quic::connection::Handle,
     ) -> usize {
+        self.register_with_grace(
+            agent_id,
+            peer_ip,
+            models,
+            max_concurrency,
+            conn,
+            crate::options::Options::DEFAULT_EVICT_CLOSE_GRACE,
+            None,
+        )
+    }
+
+    /// 同 [`Self::register`]，但显式给出接管旧连接时用的**宽限期**，并可挂一个关闭通知
+    /// （通知只给测试用：`s2n-quic` 的连接句柄在关闭后仍能回答 `remote_addr()`，外部观测不到
+    /// "关没关"，见 [`crate::evict_close::CloseObserver`]）。
+    ///
+    /// **为什么接管要宽限**（D3，2026-10-16）：被顶替的那条连接上往往还有在途请求，两类都
+    /// 不该被连带打断——已经把请求完整送达上游、模型正在生成的那类，以及还在合法等响应头的
+    /// 那类。接管是**正常事件**（agent 重连），不是故障，所以它必须和其它摘除路径走同一套
+    /// 处置：先移出路由（新条目入表即是），再等在途收尾或宽限到期才关连接。
+    ///
+    /// **为什么 `inflight <= 1` 就立刻关**：那个 1 是**本次接管调用自己**占的槽位（调用方先
+    /// `try_acquire` 取到旧条目、再重连注册），所以"<=1"等于"没有别人的请求会被牵连"。
+    /// 与 [`Registry::evict`] 用同一个判据、同一个理由：空闲连接立刻换手，别让它变僵尸。
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_grace(
+        &self,
+        agent_id: String,
+        peer_ip: IpAddr,
+        models: Vec<String>,
+        max_concurrency: u32,
+        conn: s2n_quic::connection::Handle,
+        close_grace: Duration,
+        on_superseded_closed: Option<crate::evict_close::CloseObserver>,
+    ) -> usize {
         let peer_ip = normalize_ip(peer_ip);
         let key = AgentKey::new(&agent_id, peer_ip);
         let stable_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
@@ -233,9 +267,20 @@ impl Registry {
                         ip = %peer_ip,
                         "duplicate (agent_id, ip) connection, closing old one"
                     );
-                    Some(old.conn.clone())
+                    // 锁内**只取句柄与计数**（不调传输、不 spawn），关闭时机留到锁外决定。
+                    Some((old.conn.clone(), old.inflight.clone(), old.agent_id.clone()))
                 }
                 None => None,
+            };
+            // **接管时继承在途计数**（复用同一个 `Arc`），不能给新条目发一个新的计数器：
+            // 换连接之前取到的 `SlotGuard` 持有的是**旧那个 `Arc`**，而每个在途请求都靠它计数。
+            // 新开一个计数器会让"已经送达上游、模型正在生成"的那些请求**不再被新条目看见**——
+            // 新条目的 `inflight` 从 0 起算，而 drain 等待的正是这个数 ⇒ 上一条连接会被**立刻**
+            // 关掉（正是本改动要修的那件事），忙/死判据与 `/admin/agents` 的在途数也一起偏低。
+            // 逻辑上也没变：在途请求属于**这个节点**，不属于某一条 TCP/QUIC 连接。
+            let inflight = match &superseded {
+                Some((_, old_inflight, _)) => old_inflight.clone(),
+                None => Arc::new(AtomicU32::new(0)),
             };
             inner.insert(
                 key,
@@ -246,7 +291,7 @@ impl Registry {
                     peer_ip,
                     models,
                     max_concurrency,
-                    inflight: Arc::new(AtomicU32::new(0)),
+                    inflight,
                     open_timeouts: Arc::new(AtomicU32::new(0)),
                     head_timeouts: Arc::new(AtomicU32::new(0)),
                     tunnel_write_failures: Arc::new(AtomicU32::new(0)),
@@ -262,8 +307,38 @@ impl Registry {
             );
             superseded
         };
-        if let Some(old) = superseded {
-            old.close(0u32.into());
+        if let Some((old_conn, old_inflight, old_agent_id)) = superseded {
+            let inflight = old_inflight.load(Ordering::Relaxed);
+            // **判据是 `== 0`，不是 `<= 1`**：接管路径与 `evict` 的调用者不同——`evict` 是在
+            // 一个**持有槽位**的请求上下文里被调用的（那个 1 就是它自己），而接管来自控制面
+            // （`quic::handle_conn_inner` 的 `Register` 分支），调用者**不占任何请求槽位**。
+            // 所以这里 `inflight == 1` 意味着**真有一个在途请求**，它必须被 drain 而不是被立刻关掉
+            // （把 `<= 1` 从 `evict` 抄过来的话，恰好会关掉"只有一个在途请求"的那条连接——
+            // 也就是最常见的那一种，drain 机制等于形同虚设）。
+            if inflight == 0 {
+                // 空连接 → 立刻关，让 agent 察觉并收敛到新连接。
+                // （**保持同步关闭**：`defer_close` 即使 inflight==0 也是异步的，改过去会让
+                // "空闲接管"的关闭时机白白延后一个 tick。）
+                old_conn.close(0u32.into());
+                if let Some(notify) = &on_superseded_closed {
+                    notify();
+                }
+            } else {
+                warn!(
+                    agent = %old_agent_id,
+                    ip = %peer_ip,
+                    inflight,
+                    grace_secs = close_grace.as_secs(),
+                    "agent node took over an old connection; deferring its close until in-flight requests drain"
+                );
+                crate::evict_close::defer_close(
+                    old_conn,
+                    old_inflight,
+                    &old_agent_id,
+                    close_grace,
+                    on_superseded_closed,
+                );
+            }
         }
         stable_id
     }

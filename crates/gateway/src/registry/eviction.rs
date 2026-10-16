@@ -170,6 +170,7 @@ impl Registry {
                 entry.inflight.clone(),
                 &entry.agent_id,
                 close_grace,
+                None,
             );
             EvictOutcome::RemovedClosedLater { inflight }
         }

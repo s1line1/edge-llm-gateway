@@ -226,15 +226,29 @@ pub async fn wait_for_any_agent_inflight(base: &str, want: u64) {
     let client = test_client();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let agents: serde_json::Value = client
+        // 解析失败按"还没就绪"处理、继续轮询——**不要 panic**：这个函数本身就是个轮询循环，
+        // 而 `/admin/agents` 在网关刚起来/连接刚建立的那个瞬间可能返回一个 `.json()` 解析不了的
+        // 体（实测：`EOF while parsing a value, line 1 column 0`）。以前这里 `.unwrap()` 会把这个
+        // **瞬态**变成整条用例的硬失败，只因为它恰好落在第一次轮询上（`agents.rs` 的既有用法
+        // 触发不到，新加的接管用例会）。
+        let agents: serde_json::Value = match client
             .get(format!("{base}/admin/agents"))
             .header("Authorization", "Bearer admin-token")
             .send()
             .await
-            .expect("/admin/agents 应当可查（测试里要配 admin_token）")
-            .json()
-            .await
-            .unwrap();
+        {
+            Ok(resp) => match resp.json().await {
+                Ok(v) => v,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+            },
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+        };
         let total: u64 = agents
             .as_array()
             .map(|list| list.iter().filter_map(|e| e["inflight"].as_u64()).sum())
@@ -443,6 +457,83 @@ pub async fn start_stack_with_mock(
     wait_for_agents(&t.gw, 1, Duration::from_secs(10)).await;
     let TestGateway { gw, key, base, .. } = t;
     (gw, agent, base, key, mock_addr)
+}
+
+/// 起一个**会真正服务请求**的 agent 连接（注册 + 持续 accept 代理流）。
+///
+/// 与 [`spawn_raw_agent`] 的区别：那个故意不读请求流（用来测写背压/可路由性），而
+/// "接管不打断在途请求"必须有一个**会把请求跑完**的新连接，否则响应永远不回来，测不出
+/// "旧连接被 drain 而不是被掐断"。
+///
+/// 复用 `agent::stream::handle_stream`（真实 agent 用的同一条转发实现），所以这里测的是
+/// 端到端的真实路径，不是自造的简化版。
+pub async fn spawn_serving_agent(
+    gw: &Gateway,
+    certs: &TestCerts,
+    agent_id: &str,
+    upstream: SocketAddr,
+    max_concurrency: u32,
+) -> tokio::task::JoinHandle<()> {
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(
+            std::sync::Arc::new(
+                agent::tls::rustls_client_tls(
+                    &certs.ca,
+                    certs.client_cert.clone(),
+                    certs.client_key.clone_key(),
+                )
+                .unwrap(),
+            ),
+        ))
+        .unwrap()
+        .with_io("0.0.0.0:0")
+        .unwrap()
+        .start()
+        .unwrap();
+    let conn = client
+        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
+        .await
+        .unwrap();
+    // 先拆（与真实 agent 同一形状，见 `agent/src/lib.rs`）：Handle 用来开流发 Register，
+    // acceptor 用来收网关推进来的代理请求流——acceptor 是单消费者，只能拿一次。
+    let (mut handle, mut acceptor) = conn.split();
+
+    // 注册（与真实 agent 同一条路径：开一条双向流、写一帧 Register）
+    let stream = handle.open_bidirectional_stream().await.unwrap();
+    let (mut reg_recv, mut reg_send) = stream.split();
+    write_frame(
+        &mut reg_send,
+        &Frame::Register {
+            agent_id: agent_id.into(),
+            models: vec!["mock-llm".into()],
+            max_concurrency,
+            version: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    reg_send.finish().unwrap();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        FrameReader::new(&mut reg_recv).next(),
+    )
+    .await;
+
+    // 之后持续服务代理流，直到连接被网关关掉（accept 返回错误/None）
+    // e2e-bare-client: 这条 client 只用来把上游的响应**转发完**（mock-llm 的正文停顿是 3s），
+    // 它的存活时间由被测的连接与 mock 决定，不是"一个本该有界的步骤"；加超时反而会让
+    // "旧连接被 drain 期间请求仍在跑"这件事变成超时驱动的假象。
+    let http = reqwest::Client::new();
+    let upstream = format!("http://{upstream}");
+    tokio::spawn(async move {
+        while let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
+            let http = http.clone();
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let _ = agent::stream::handle_stream(stream, http, upstream, false).await;
+            });
+        }
+    })
 }
 
 /// 起一个**裸 QUIC agent**：注册成功后什么都不做——**不读请求流、不回帧、也不发心跳**。

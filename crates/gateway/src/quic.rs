@@ -30,11 +30,15 @@ pub async fn await_accepting(metrics: &Metrics, timeout: Duration) -> bool {
     metrics.quic_accepting() == 1
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn accept_loop(
     mut server: s2n_quic::Server,
     registry: Registry,
     metrics: Metrics,
     stream_ceiling: u32,
+    // 接管/摘除一条连接时，等在途请求收尾的宽限（`Options::evict_close_grace`）。
+    // 与 `stream_ceiling` 一样属于"每调用注入"的配置：注册表自己不存配置。
+    evict_close_grace: std::time::Duration,
     mut shutdown: watch::Receiver<ShutdownPhase>,
 ) {
     let _accepting = metrics.mark_accepting();
@@ -73,7 +77,8 @@ pub async fn accept_loop(
             // gauge 会永久虚高；注册表条目的摘除同理，见 `registry::Registration`。
             let _connection = metrics.mark_agent_connected();
             let handle = async move {
-                if let Err(e) = handle_conn(conn, registry, stream_ceiling).await {
+                if let Err(e) = handle_conn(conn, registry, stream_ceiling, evict_close_grace).await
+                {
                     warn!("agent connection error: {e}");
                 }
             };
@@ -105,6 +110,7 @@ async fn handle_conn(
     conn: Connection,
     registry: Registry,
     stream_ceiling: u32,
+    evict_close_grace: std::time::Duration,
 ) -> anyhow::Result<()> {
     // split 消耗连接，只能一次。Handle: Clone（给 registry 存一份）；
     // StreamAcceptor: 单消费者且不可 Clone（acceptor.rs:182 只有 Debug），按 &mut 传下去。
@@ -117,6 +123,7 @@ async fn handle_conn(
         &registry,
         &mut registration,
         stream_ceiling,
+        evict_close_grace,
     )
     .await
 }
@@ -127,6 +134,7 @@ async fn handle_conn_inner(
     registry: &Registry,
     registration: &mut crate::registry::Registration<'_>,
     stream_ceiling: u32,
+    evict_close_grace: std::time::Duration,
 ) -> anyhow::Result<()> {
     // 来源 IP 是**这条连接的属性**、在连接生命周期内不变，所以取一次就够（不用每帧问一次）。
     // 它来自 socket（由内核对端地址保证），**不是**帧里自报的字段——D1 要的正是这个"不可伪造"
@@ -185,12 +193,16 @@ async fn handle_conn_inner(
                         }
                         // 顺序不能反：`register()` 插表、`note()` 上膛，中间 Drop 是空操作
                         // ——其间不得有可失败或可 `await` 的操作，否则会留下没人摘的条目。
-                        let stable_id = registry.register(
+                        // 接管旧连接时**要宽限**（D3）：旧连接上可能还有"已送达上游、模型正在
+                        // 生成"的在途请求，立刻关掉就是纯损失。宽限期与摘除路径同一个来源。
+                        let stable_id = registry.register_with_grace(
                             id.clone(),
                             peer_ip,
                             models,
                             max_concurrency,
                             handle.clone(),
+                            evict_close_grace,
+                            None,
                         );
                         registration.note(id.clone(), peer_ip, stable_id);
                         let _ = send.finish();
@@ -300,6 +312,7 @@ mod tests {
             Registry::default(),
             metrics.clone(),
             1024,
+            Duration::from_secs(1),
             shutdown_rx,
         ));
 
@@ -335,6 +348,7 @@ mod tests {
             Registry::default(),
             metrics.clone(),
             1024,
+            Duration::from_secs(1),
             shutdown_rx,
         ));
 
