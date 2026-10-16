@@ -22,6 +22,8 @@ pub use entry::{Entry, HeadSilence};
 pub use routing::{AcquireError, Disposition};
 pub use table::{AgentInfo, Registration, RegistryStatus};
 
+pub(crate) use table::MAX_REGISTRATIONS_PER_CONNECTION;
+
 /// 连接身份发号器：给每条注册进来的连接发一个**进程内唯一且永不复用**的编号。
 ///
 /// 为什么不用 `Handle::id()`：那是 s2n-quic 的**端点内部**连接序号，源码注释写的是
@@ -286,16 +288,22 @@ mod tests {
         );
     }
 
-    /// 规格：`note` 被后来的注册**覆盖**——同名重复注册时，只有最后一次的 `stable_id`
-    /// 匹配条目，用旧的 stable_id 摘除是 no-op（`remove_if_same` 会比对）。
+    /// 规格：同名**重新注册**只更新本连接记着的 `stable_id`——旧的那个对应不上当前条目，
+    /// 用旧 stable_id 摘除是 no-op（`remove_if_same` 会比对）。
     #[tokio::test]
-    async fn registration_guard_removes_only_the_last_registration() {
+    async fn registration_guard_refreshes_the_stable_id_of_a_re_registered_id() {
         let reg = Registry::default();
         let mut registration = Registration::new(&reg);
         let first = reg.register("x".into(), vec!["m".into()], 2, test_connection().await);
         registration.note("x".into(), first);
+        assert_eq!(registration.owned_stable_id("x"), Some(first));
         let second = reg.register("x".into(), vec!["m".into()], 2, test_connection().await);
         registration.note("x".into(), second);
+        assert_eq!(
+            registration.owned_stable_id("x"),
+            Some(second),
+            "同名重新注册必须把记着的 stable_id 换成新的"
+        );
         assert_eq!(reg.len(), 1);
 
         drop(registration);
@@ -307,6 +315,117 @@ mod tests {
         stale.note("y".into(), fresh.wrapping_sub(1)); // 一个不存在的 stable_id
         drop(stale);
         assert_eq!(reg.len(), 1, "stable_id 不匹配时不得摘除别人的条目");
+    }
+
+    /// 规格（记录 SL-P2-10）：**断开时摘掉本连接注册过的每一个 id**。
+    ///
+    /// 只记最后一条时，`a1..aN` 里除 `aN` 之外的条目会永久留在表里（本仓库没有 stale 清扫器：
+    /// 心跳过期只是不再可路由），`hlmg_agents` 虚高、`/admin/agents` 出现没有对应进程的幽灵行。
+    ///
+    /// 变异验证：把 `note` 退回"只留最后一个" ⇒ 本用例红（`left: 2, right: 0`）。
+    #[tokio::test]
+    async fn a_connection_removes_every_id_it_registered_when_it_drops() {
+        let reg = Registry::default();
+        let mut registration = Registration::new(&reg);
+        let a1 = reg.register("a1".into(), vec!["m".into()], 2, test_connection().await);
+        registration.note("a1".into(), a1);
+        let a2 = reg.register("a2".into(), vec!["m".into()], 2, test_connection().await);
+        registration.note("a2".into(), a2);
+        assert_eq!(reg.len(), 2);
+
+        drop(registration);
+        assert_eq!(reg.len(), 0, "本连接注册过的两个 id 都必须被摘掉");
+    }
+
+    /// 防误删：本连接记着某个 id，但该 id 的条目**已被新连接接管**时，本连接退出不得摘掉它。
+    ///
+    /// 两条连接都注册了 `a1`：后者的条目属于后者；前者 drop 时按 `stable_id` 比对发现对不上
+    /// ⇒ no-op，活着的条目不受影响（这正是"逐个摘"不能退化成"按 id 无条件删"的原因）。
+    #[tokio::test]
+    async fn an_exit_never_removes_an_id_another_connection_took_over() {
+        let reg = Registry::default();
+        let old = test_connection().await;
+        let new = test_connection().await;
+
+        let mut first_conn = Registration::new(&reg);
+        let old_sid = reg.register("a1".into(), vec!["m".into()], 2, old);
+        first_conn.note("a1".into(), old_sid);
+
+        let mut second_conn = Registration::new(&reg);
+        let new_sid = reg.register("a1".into(), vec!["m".into()], 2, new);
+        second_conn.note("a1".into(), new_sid);
+        assert_eq!(reg.len(), 1, "同名接管后表里仍只有一条");
+
+        // 旧连接退出：它记的 old_sid 已经不对应当前条目 ⇒ 不许摘掉新的那条
+        drop(first_conn);
+        assert_eq!(reg.len(), 1, "接管之后的条目属于新连接，旧连接退出不得摘除");
+        assert_eq!(
+            reg.inner.read().unwrap().get("a1").map(|e| e.stable_id),
+            Some(new_sid)
+        );
+
+        // 新连接退出：这一次才摘掉
+        drop(second_conn);
+        assert_eq!(reg.len(), 0);
+    }
+
+    /// 规格（记录 SL-P2-10 的第 ② 部分）：每条连接的注册数**有上限**，但**刷新同名 id 不占额度**。
+    ///
+    /// 上限的意义：`Register` 帧是对端自己发的，不设限时一条被拿下的连接可以插任意多条带
+    /// `models` 的条目。判定必须在 `register()` **之前**问（调用点在 `quic.rs`），否则被拒的那条
+    /// 已经插表、没人负责摘。
+    ///
+    /// 变异验证：把 `accepts()` 改成恒 `true` ⇒ 本用例在"超限必须拒绝"那几行变红。
+    #[tokio::test]
+    async fn the_per_connection_cap_allows_refresh_but_rejects_new_ids() {
+        let reg = Registry::default();
+        let mut registration = Registration::new(&reg);
+
+        // 还没注册任何 id 时先问一次：必须允许（否则第一条注册就被自己的上限挡住）
+        assert!(registration.accepts("a1"));
+
+        for n in 1..=MAX_REGISTRATIONS_PER_CONNECTION {
+            let id = format!("a{n}");
+            assert!(registration.accepts(&id), "第 {n} 个新 id 必须被接受");
+            let sid = reg.register(id.clone(), vec!["m".into()], 2, test_connection().await);
+            registration.note(id.clone(), sid);
+            // 刷新同名 id 永远允许，且不占新额度
+            assert!(registration.accepts(&id), "同名刷新不该被上限挡住");
+        }
+        assert_eq!(reg.len(), MAX_REGISTRATIONS_PER_CONNECTION);
+
+        assert!(
+            !registration.accepts("one-too-many"),
+            "用满额度之后必须拒绝**新的** agent_id"
+        );
+        // 注意：已注册过的 id **不因满额而被拒**——它走的是覆盖，不占新额度。
+        // （这一支正是"上限"与"刷新"的分界：上限只约束**不同**的 id 数。）
+        assert!(
+            registration.accepts("a1"),
+            "已注册过的 id 必须仍然允许刷新，哪怕额度已满"
+        );
+        // 反过来说：`a1` 是注册过的，刷新它仍然允许
+        let sid = reg.register("a1".into(), vec!["m".into()], 2, test_connection().await);
+        registration.note("a1".into(), sid);
+        assert!(registration.accepts("a1"));
+    }
+
+    /// 心跳的归属判据：**本连接注册过的每个 id** 都能交出 stable_id，别人的不能。
+    ///
+    /// 只比"最后注册的那一个"时，同一条连接上早先注册的 id 的合法心跳会被误判成越权并丢弃
+    /// （或被反过来利用：让越权的心跳替别人的死条目续命）。
+    #[tokio::test]
+    async fn heartbeat_ownership_covers_every_registered_id_of_the_connection() {
+        let reg = Registry::default();
+        let mut registration = Registration::new(&reg);
+        let a1 = reg.register("a1".into(), vec!["m".into()], 2, test_connection().await);
+        registration.note("a1".into(), a1);
+        let a2 = reg.register("a2".into(), vec!["m".into()], 2, test_connection().await);
+        registration.note("a2".into(), a2);
+
+        assert_eq!(registration.owned_stable_id("a1"), Some(a1));
+        assert_eq!(registration.owned_stable_id("a2"), Some(a2));
+        assert_eq!(registration.owned_stable_id("someone-else"), None);
     }
 
     #[tokio::test]

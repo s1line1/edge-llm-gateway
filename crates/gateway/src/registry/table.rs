@@ -39,6 +39,20 @@ pub struct AgentInfo {
     pub healthy: bool,
 }
 
+/// 一条连接**最多**能注册多少个不同的 `agent_id`。
+///
+/// **为什么必须有上限**（记录 SL-P2-10）：`Register` 帧是**对端自己发的**，而控制流循环对它
+/// 的条数没有任何天然限制。一个持 CA 证书的连接（或一个被拿下的 edge 节点）可以连发
+/// `a1..aN`，每条都在表里插一条带 `models: Vec<String>`（单帧上限 `MAX_FRAME` = 64 MiB）的
+/// 条目；断开时若只摘最后一条，其余就是**永不回收的幽灵条目**（本仓库没有 stale 清扫器：
+/// 心跳过期只是不再可路由，条目本身不动），表现为 `hlmg_agents` 虚高、`/admin/agents` 里
+/// 多出一批没有对应进程的行，直到重启。
+///
+/// 4 是**四倍余量**，不是新配置旋钮：正常部署里一条连接只服务一个 agent 进程，重新注册
+/// 同名 id（进程重连/配置刷新）走的是**覆盖**、不占新额度。所以 4 只在"一条连接真的在
+/// 托管多个 id"时才会被碰到。
+pub(crate) const MAX_REGISTRATIONS_PER_CONNECTION: usize = 4;
+
 /// 已注册条目的摘除守卫：连接任务结束时把条目摘掉——**即使任务 panic**。
 ///
 /// 为什么必须用 Drop（评估记录 P2-11）：`quic::handle_conn` 原先在末尾写一句
@@ -46,40 +60,68 @@ pub struct AgentInfo {
 /// 那句不执行，条目就**永久**留在注册表里——而这个仓库**没有 stale 清扫器**（心跳过期只是
 /// 不再可路由），于是 `hlmg_agents` 虚高、`/admin/agents` 里出现幽灵条目，直到重启。
 ///
+/// **记的是"本连接注册过的全部 id"**（不是最后一条，记录 SL-P2-10）：一条连接可以注册多个
+/// `agent_id`（`quic::handle_conn_inner` 的控制流循环收 `Register` 帧不设限），只记最后一条的话
+/// 断开时只摘一条，其余连同 `models` 永久留在表里（`MAX_REGISTRATIONS_PER_CONNECTION` 是
+/// 对它的数量约束，不是替代）。
+///
 /// 用法：`let mut reg = Registration::new(&registry);` … 注册成功后 `reg.note(id, stable_id)`；
-/// 守卫随 `handle_conn` 的栈帧一起 drop。`Option` 为空（从没注册成功）时摘除是 no-op。
+/// 守卫随 `handle_conn` 的栈帧一起 drop。空 `Vec`（从没注册成功）时摘除是 no-op。
 pub struct Registration<'a> {
     registry: &'a Registry,
-    agent: Option<(String, usize)>,
+    /// `(agent_id, stable_id)`，**按 `agent_id` 去重**：同名重新注册 = 覆盖（只有最新那个
+    /// `stable_id` 才匹配当前条目，旧的本来就已经 no-op）。
+    agent: Vec<(String, usize)>,
 }
 
 impl<'a> Registration<'a> {
     pub fn new(registry: &'a Registry) -> Self {
         Self {
             registry,
-            agent: None,
+            agent: Vec::new(),
         }
+    }
+
+    /// 这条连接**还能不能**再注册一个 id：`agent_id` 已在本连接名下（= 重新注册/刷新）时恒真；
+    /// 否则要求还没用满 [`MAX_REGISTRATIONS_PER_CONNECTION`]。
+    ///
+    /// **必须在 `Registry::register` 之前问**（调用点顺序见 `quic.rs`）：注册已经插表之后再
+    /// 拒绝，那条 `Entry` 就没人负责摘了——正是本守卫要防的幽灵条目。
+    pub fn accepts(&self, agent_id: &str) -> bool {
+        self.agent.iter().any(|(id, _)| id == agent_id)
+            || self.agent.len() < MAX_REGISTRATIONS_PER_CONNECTION
     }
 
     /// 记下"这条连接注册成了哪个 agent / stable_id"。
     ///
-    /// 重复注册同名 agent 时**覆盖**：只有最后一次的 `stable_id` 才匹配当前条目，
+    /// 同名重新注册时**覆盖**：只有最后一次的 `stable_id` 才匹配当前条目，
     /// 用旧的 stable_id 摘除是 no-op（`remove_if_same` 会比对）。
     pub fn note(&mut self, agent_id: String, stable_id: usize) {
-        self.agent = Some((agent_id, stable_id));
+        match self.agent.iter_mut().find(|(id, _)| *id == agent_id) {
+            Some(slot) => slot.1 = stable_id,
+            None => self.agent.push((agent_id, stable_id)),
+        }
     }
 
-    /// 本连接注册成的 `(agent_id, stable_id)`；`None` = 还没注册成功。
+    /// 若 `agent_id` 是**本连接**注册的，返回它当前的 `stable_id`；否则 `None`。
     ///
-    /// 心跳要靠它把"这条连接是谁"与"帧里自报的 id"对上——见 [`Registry::heartbeat_if_same`]。
-    pub fn registered(&self) -> Option<(&str, usize)> {
-        self.agent.as_ref().map(|(id, sid)| (id.as_str(), *sid))
+    /// 心跳要靠它把"帧里自报的 id"与"这条连接注册过什么"对上——见
+    /// [`Registry::heartbeat_if_same`]。**必须按每个 id 查**（不能只比最后一条）：一条连接可以
+    /// 注册多个 id，只认最后一条时，其余 id 的心跳会被当成越权而丢弃（或反过来，让越权的心跳
+    /// 替别人的死条目续命）。
+    pub fn owned_stable_id(&self, agent_id: &str) -> Option<usize> {
+        self.agent
+            .iter()
+            .find(|(id, _)| id == agent_id)
+            .map(|(_, sid)| *sid)
     }
 }
 
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
-        if let Some((agent_id, stable_id)) = &self.agent {
+        // 逐个摘：判据仍是 `stable_id` 比对，所以**只摘仍属于本连接的那些**——被新连接接管的
+        // id 在这里是 no-op，不会误删活条目。
+        for (agent_id, stable_id) in &self.agent {
             self.registry.remove_if_same(agent_id, *stable_id);
         }
     }
