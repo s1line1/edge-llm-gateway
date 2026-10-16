@@ -4,22 +4,19 @@
 
 **An edge LLM gateway in Rust: it exposes local models running behind NAT on your home or office network as an OpenAI-compatible API on the public Internet.**
 
+<p align="center">
+  <img src="home-llm-gateway-architecture.svg" alt="Architecture: callers → cloud-gateway (public) → QUIC tunnel → edge-agent (private) → local LLM" width="100%">
+</p>
+
 It solves one specific networking problem: the model runs on a machine behind NAT (dynamic IP, no inbound
 port), and you want to call it from anywhere with a standard OpenAI SDK — **without ever exposing the
 local inference endpoint to the public Internet.**
 
-```
-Client (anywhere)
-   │  HTTPS · OpenAI-compatible API (incl. SSE streaming)
-   ▼
-cloud-gateway (public server)   API-key auth → rate limit → admission → route by model → tunnel frames
-   │  QUIC (UDP, mutual TLS, one connection multiplexed, no head-of-line blocking)
-   ▼
-edge-agent (model host)         dials out + heartbeat + auto-reconnect → proxies to the local LLM
-   │  HTTP
-   ▼
-Local LLM (Ollama / vLLM / llama.cpp)
-```
+<p align="center">
+  <img alt="tests" src="https://img.shields.io/badge/tests-382%20passed-brightgreen">
+  <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
+</p>
 
 **No external tunnel or proxy service required** — no frp, ngrok, nginx or caddy. The tunnel, authentication,
 streaming relay and TLS all live in these three Rust crates.
@@ -346,8 +343,8 @@ fmt · clippy -D warnings · cargo deny · nextest · web-format · web-lint · 
 web-build · toolchain-check · check-records
 ```
 
-> **Current scale (`cargo nextest run --workspace`, measured)**: **368 tests executed and passed (0 skipped)**, of which
-> **69 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
+> **Current scale (`cargo nextest run --workspace`, measured)**: **382 tests executed and passed (0 skipped)**, of which
+> **70 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
 > per commit; trust the actual run output.
 >
 > Two behaviours differ from `cargo test` and are worth knowing: **nextest runs one process per test**,
@@ -373,9 +370,12 @@ make dev && make bench-k6 KEY=<sk-...> VUS=20 DUR=30s
 **The README keeps only two conclusions, because they change how you deploy**:
 
 1. **Gateway memory tracks "in-flight", not "request count"** — provided the verified-identity cache is on
-   (`verified_cache_max`, the default). Setting it to `0` makes every in-flight request cost ~19 MiB, in
-   which case `max_concurrent_requests` must stay under `MemoryMax / 20MB`, or the thing you hit first is
-   an OOM kill rather than a graceful 429.
+   (`verified_cache_max`, the default).
+
+> [!CAUTION]
+> Setting `verified_cache_max` to `0` makes **every in-flight request** cost ~19 MiB (argon2's working
+> memory is memory-hard). Under that setting `max_concurrent_requests` must stay under
+> `MemoryMax / 20MB`, or the thing you hit first is an **OOM kill** rather than a graceful 429.
 2. **When load testing, identify whose bottleneck it is first**: the order is **agent event rate → link
    bandwidth → gateway**. At the 20–100 token/s of a real model none of these are close; the numbers below
    only matter when you "make the model fast" or "use the gateway to relay small non-LLM requests".
@@ -392,19 +392,28 @@ Production deployment (certificate issuance, security groups, systemd / Docker, 
 troubleshooting) is in **[`DEPLOY.md`](DEPLOY.md)**. The essentials:
 
 1. **Gateway on a public server**: allow **UDP 4433** (QUIC tunnel) and **TCP 8443** (HTTPS API) in your
-   security group. UDP is easy to forget — QUIC runs over UDP. **The current version is UDP-only and
-   does not implement a TCP fallback**; if UDP is blocked, allow UDP 4433 for now. A TCP+TLS downgrade
-   is a contingency design only — see [`DESIGN.md`](DESIGN.md) §10.
+   security group.
 2. **Agent on the model host**: set `cloud_addr` to `<public-ip>:4433` and `server_name` to a name in the
    certificate's SAN.
-3. **mTLS is the critical security line**: keep the CA private key to yourself and issue a **separate
-   client certificate per agent**.
-4. Deployment forms: a single static binary (Linux musl / macOS) with systemd units, or Docker Compose
+3. Deployment forms: a single static binary (Linux musl / macOS) with systemd units, or Docker Compose
    (`crates/gateway/Dockerfile` already bakes the dashboard into the image, so you do not build the
    frontend yourself).
-5. **Multiple edges (heterogeneous models)**: give each machine its own `agent-config.yml` declaring its
+4. **Multiple edges (heterogeneous models)**: give each machine its own `agent-config.yml` declaring its
    `models`. A config example and the `agent_id`-must-be-unique trap are in
    [`MODEL_ROUTING.md`](MODEL_ROUTING.md) §7.
+
+> [!IMPORTANT]
+> **Do not allow only TCP — QUIC runs over UDP.** Forgetting **UDP 4433** in the security group is the
+> most common deployment failure: the port looks open, yet the handshake never arrives. **The current
+> version is UDP-only with no TCP fallback**, so a blocked UDP port leaves no way around it (a TCP+TLS
+> downgrade is a contingency design only — see [`DESIGN.md`](DESIGN.md) §10).
+
+> [!WARNING]
+> **mTLS is the critical security line at this boundary.** Keep the CA private key to yourself and issue
+> a **separate client certificate per agent** — any connection holding a CA-issued certificate can
+> register as an agent. Dynamic certificate and trust-root management (the CSR route, adding an agent
+> without restarting the gateway) is **designed but not implemented**; see
+> [`CERT_MANAGEMENT.md`](CERT_MANAGEMENT.md).
 
 > On startup the gateway raises its own `RLIMIT_NOFILE` soft limit to `min(hard, 16384)` — systemd's
 > default of 1024 is uncomfortably close at production levels (768 concurrent connections → fd peak 785).
@@ -428,6 +437,12 @@ scripts/        release packaging · k6 load tests · toolchain consistency chec
 gateway-config.example.yml / agent-config.example.yml   both config templates (all parameters documented)
 deny.toml       cargo-deny policy (dependency licenses / advisories)
 ```
+
+> The architecture diagram referenced above lives at the repository root
+> (`home-llm-gateway-architecture.svg`) and **is tracked**. `diagrams/` holds more detailed
+> multi-language versions (component and architecture diagrams), but that directory is
+> `.gitignore`d and **is not in the repository** — documentation must not reference it, or a
+> fresh clone shows a broken image.
 
 > Config file names are fixed: `gateway-config.yml` for the gateway and `agent-config.yml` for the agent
 > (identical locally and in production; both contain secrets and are gitignored).
