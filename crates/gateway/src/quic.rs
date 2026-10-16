@@ -155,6 +155,22 @@ async fn handle_conn_inner(
                                  otherwise tunnel opens will queue and time out before capacity is reached"
                             );
                         }
+                        // **上限判定必须在 `register()` 之前**（记录 SL-P2-10）：注册已经插表
+                        // 之后再拒绝，那条 `Entry` 就没人负责摘了——正是 `Registration` 要防的
+                        // 幽灵条目（本仓库没有 stale 清扫器）。同名重新注册走覆盖、不占额度。
+                        if !registration.accepts(&id) {
+                            warn!(
+                                agent = %id,
+                                limit = crate::registry::MAX_REGISTRATIONS_PER_CONNECTION,
+                                "connection tried to register more agents than the per-connection cap; \
+                                 closing it (the entries it already owns are removed by the guard)"
+                            );
+                            // 摘除交给 `Registration` 的 Drop（循环退出、栈帧展开时执行），
+                            // 这里只负责让对端察觉到连接没了。
+                            let _ = send.finish();
+                            handle.close(0u32.into());
+                            return Ok(());
+                        }
                         // 顺序不能反：`register()` 插表、`note()` 上膛，中间 Drop 是空操作
                         // ——其间不得有可失败或可 `await` 的操作，否则会留下没人摘的条目。
                         let stable_id =
@@ -173,21 +189,21 @@ async fn handle_conn_inner(
                         // **死掉**的条目永久续命——网关于是持续把请求路由到那台机器，而且日志里
                         // 毫无痕迹（不像顶替会打 `duplicate agent connection`）。
                         // 见 `Registry::heartbeat_if_same`。
-                        match registration.registered() {
-                            Some((own_id, stable_id)) if own_id == id.as_str() => {
+                        //
+                        // 判据是"这个 id **是不是本连接注册过的**"（按每个 id 查），不是"是不是
+                        // 最后注册的那一个"：一条连接可以注册多个 id（见本文件上面的 `accepts`），
+                        // 只认最后一条会把其余 id 的合法心跳误判成越权并丢弃。
+                        match registration.owned_stable_id(&id) {
+                            Some(stable_id) => {
                                 let _ = registry.heartbeat_if_same(&id, stable_id);
                                 debug!(agent = %id, inflight, "heartbeat");
                             }
-                            // 帧里的 id 不是本连接注册的那个：只可能是坏掉的或恶意的对端。
+                            // 帧里的 id 不是本连接注册的任何一个：只可能是坏掉的或恶意的对端。
                             // 静默忽略会让这种越权完全无痕，所以这里必须出声。
-                            Some((own_id, _)) => warn!(
+                            None => warn!(
                                 frame_agent = %id,
-                                connection_agent = %own_id,
-                                "heartbeat names a different agent than this connection registered; ignored"
+                                "heartbeat names an agent this connection never registered; ignored"
                             ),
-                            // 还没注册成功就收到心跳：**容忍**。注册与心跳是两条独立的 QUIC 流，
-                            // 可能乱序到达；改动前这里也是静默忽略（查不到条目即 no-op）。
-                            None => debug!(agent = %id, "heartbeat before registration; ignored"),
                         }
                         let _ = send.finish();
                     }

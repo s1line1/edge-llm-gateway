@@ -267,31 +267,26 @@
       **2026-09-22 决定：本阶段先不做**（上面 ①/②/③ 三个候选与本轮补充的 ④"不给默认值、
       缺失即启动失败"都搁置）。要做时注意两点：网关侧语义**不要动**（见上一条注），
       且 185-193 行那两条回归测试**已随修法撤回、不在树中**，必须按那里的判据重写。
-- [ ] **一条已认证连接可以无界撑大注册表（SL-P2-10；2026-09-23 方案已定，按指示暂缓）**：
-      `registry::Registration` 只记住这条连接**最后一次**注册的 `(agent_id, stable_id)`（`registry.rs` 的
-      `agent: Option<(String, usize)>`），而 `quic::handle_conn_inner` 的控制流循环对 `Register` 帧数
-      **没有任何上限**。于是持有一张 CA 证书的连接（或一个被拿下的 edge 节点）可以注册 `a1..aN`，断开时
-      **只摘掉 `aN`**，其余连同 `models: Vec<String>`（单帧上限 `MAX_FRAME`=64 MiB）**永久**留在表里 ——
-      `hlmg_agents` 虚高、`/admin/agents` 出现幽灵条目，要重启才清（本仓库**没有 stale 清扫器**：
-      心跳过期只是不再可路由，条目本身不动）。
-      **已定修法（当时跑通过，含两处变异验证；按指示撤回、未提交）**：
-      ① `Registration.agent` 改成 `Vec<(String, usize)>`（**按 `agent_id` 去重**，同名只留最后一次的
-      `stable_id`），Drop 时逐个 `remove_if_same` ⇒ 断开摘掉**本连接注册的全部**；判据仍是 `stable_id`
-      比对，所以**只摘仍属于本连接的那些**（被新连接接管的 id 是 no-op，不会误删活条目）；
-      ② 内部常量 `MAX_REGISTRATIONS_PER_CONNECTION = 4`（**不是新配置旋钮**；正常部署一条连接只服务一个
-      agent 进程，4 是四倍余量）＋ `quic::handle_conn_inner` 在 **`register()` 之前**问
-      `registration.accepts(&id)`，超限即 `warn!` + `handle.close()`（顺序要紧：注册已插表之后再拒绝，
-      那条 `Entry` 就没人负责摘了）。
-      **重做时要补的测试**（当时写过、已随代码撤回）：`a_connection_removes_every_id_it_registered_when_it_drops`
-      （把 `note()` 变异回『只留最后一个』⇒ 红：`left: 2, right: 0`）、
+- [x] **一条已认证连接可以无界撑大注册表（SL-P2-10；2026-09-23 方案已定，按指示暂缓）**：
+      **2026-10-16 已实施**：① `Registration.agent` 改为 `Vec<(String, usize)>`（按 `agent_id`
+      去重，同名只更新 `stable_id`），`Drop` 逐个 `remove_if_same` ⇒ 断开时摘掉本连接注册的
+      **全部** id，判据仍是 `stable_id` 比对（被接管的 id 是 no-op）；
+      ② `MAX_REGISTRATIONS_PER_CONNECTION = 4`（仍**不是**配置旋钮）＋ `quic::handle_conn_inner`
+      在 **`register()` 之前**问 `registration.accepts(&id)`，超限即 `warn!` + `close()`；
+      ③ 记录里那条"`registered()` 要变成查表、心跳必须逐条判断"的要求落在了
+      `Registration::owned_stable_id(&id)`（心跳分支改为按每个 id 查，不再只比最后一个）；
+      `registered()` 随之删除（已无"最后一次"这个概念）。
+      落点：`crates/gateway/src/registry/table.rs`（`Registration` 与上限常量）、
+      `crates/gateway/src/quic.rs`（`Register` / `Heartbeat` 两个分支）。
+      **测试**：`a_connection_removes_every_id_it_registered_when_it_drops`、
       `an_exit_never_removes_an_id_another_connection_took_over`、
-      `the_per_connection_cap_allows_refresh_but_rejects_new_ids`（把 `accepts()` 变异成恒 true ⇒ 红）。
-      **未做**：记录建议的第三条 —— 周期 stale 清扫器；它只能摘『连接已经不在』的条目（否则会摘掉活着但
+      `the_per_connection_cap_allows_refresh_but_rejects_new_ids`、
+      `heartbeat_ownership_covers_every_registered_id_of_the_connection`
+      （另有 `registration_guard_refreshes_the_stable_id_of_a_re_registered_id` 保住旧语义）。
+      两处变异验证都做过：`note` 退回"只留最后一个" ⇒ 红（`left: 1, right: 0`）；`accepts()`
+      改成恒 true ⇒ 红。
+      **仍未做**：记录建议的第三条 —— 周期 stale 清扫器；它只能摘『连接已经不在』的条目（否则会摘掉活着但
       心跳慢的 agent），需要单独设计，属兜底而非主要修复。
-      **重做本条时注意**（2026-10-09，`922e228`）：`Registration` 现在多了 `registered()`；
-      `agent` 改成 `Vec` 之后 `registered()` 要变成**查表**，而且**心跳校验必须按
-      `(agent_id, stable_id)` 逐条判断**——否则一条持多 id 的连接只能给**最后一个** id 发
-      有效心跳，正好抵消本条修法①的效果。
 - [x] **进程级优雅关闭（网关侧已补齐 drain）**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），
       收到后打 INFO 日志 → 调用 `Gateway::shutdown()` / `Agent::shutdown()` 退出；
       覆盖 systemd stop、Ctrl+C、harness job_kill 场景（对应 OPTIMIZATION.md A1 ✅）。
@@ -1502,7 +1497,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       落在 [1000, 1024) 时会被判**死**（`inflight < effective` 为假以外的分支）而不是"忙"，
       连续 3 次即摘除 → 全量 503。
 - [ ] **`S2-19` `待核` `run_loop_handles_clean_disconnect` 的夹具到不了它声称的 Ok 分支**：
-      用的是把 acceptor 丢掉的 `test_server`（`agent/src/lib.rs:1022-1028`），register 永远等不到
+      用的是把 acceptor 丢掉的 `test_server`（`agent/src/tests.rs:361` 的 `test_server`），register 永远等不到
       半关 ⇒ 走的是 Err 分支；断言只有"900ms 后任务还活着"，把 Ok 分支删掉也不会红。
 - [ ] **`S2-20` `待核` `TODO` 的 R2 描述与实现不符**：R2 说读帧"按声明长度直接分配 64 MiB"，
       但那条 `read_frame` 已在 R3 删除，唯一路径 `FrameReader` 只把声明值记进 `want`、缓冲区随
@@ -1612,7 +1607,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 ### B. 引擎指标（KV Cache / 队列）参与路由 ⛔
 
-- **现状（代码事实）**：`pick()`（`crates/gateway/src/registry.rs:346-383`）的候选排序是
+- **现状（代码事实）**：`pick()`（`crates/gateway/src/registry/routing.rs:38-75`）的候选排序是
   **精确声明 model 优先 → `inflight` 最少 → 心跳最新**，其中唯一的"负载"信号是**网关自己数的
   在途请求数**（`Entry.inflight`）。协议里留了位置但**恒为 0**：`Frame::Heartbeat { inflight }`
   的构造点写死 `inflight: 0`（`crates/agent/src/lib.rs:573-575`，`TODO.md:759` 已登记该空洞）。
@@ -1641,7 +1636,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 - **现状（代码事实）**：路由意义上的"健康"只有两条——心跳不 stale（`agent_stale_secs`）
   与隧道可用；**上游引擎自己死没死完全不参与路由**。上游不可达时 agent 回 `Frame::Error{code:502}`
-  （有专门规格：502 且消息**不含内网地址/端口**，`crates/agent/src/lib.rs:2108-2190`），
+  （有专门规格：502 且消息**不含内网地址/端口**，`crates/agent/src/tests.rs:1482`（`an_unreachable_upstream_reports_a_generic_502_and_a_contextual_error`）），
   网关把该状态码透传给客户端（`proxy/head.rs:126`，空流/隧道读失败另回落 502，
   `proxy/head.rs:90,133`）——但**后续请求照旧路由到同一个副本**，直到有人手动改配置。
 - **要做**：① 按**错误分类**做**副本级短熔断**（连接拒绝 / 握手失败 / 5xx 分档，与业务 4xx
@@ -1781,7 +1776,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       **用量 flush 不动**——它已经是真 upsert（`usage.rs:233` 的 `ON CONFLICT(key_id) DO UPDATE`）；
       所以端口有**两个**写操作：`insert`（冲突即错）与 `upsert_batch`（幂等），**刻意不合并**。
       另两处：`u64` 时间戳映射到 PG `bigint` 是**收窄**，`as i64` 现散在多处
-      （`storage/mod.rs:395`、`storage/usage.rs:246-250`），应收敛到一处类型映射；
+      （`storage/mod.rs:344`、`storage/usage.rs:246-250`），应收敛到一处类型映射；
       还有一条不要带错结论——放弃"每请求写库"的那个 **~190 QPS** 是被**单连接 + Mutex** 摁住的，
       不是被数据库摁住的，换带连接池的服务器库后**必须重测**。
 
@@ -1838,13 +1833,13 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       原样（`crates/agent/src/stream.rs:38`、`:240`，**不改写 `model`**）——所以第二个模型无处可去。
       **为什么只有 agent 侧要改**：`Register.models` 本来就是**一组**模型名
       （`crates/proto/src/frame.rs:35`），已经能表达"多台后端的并集"；网关按 `model` 选 node
-      （`crates/gateway/src/registry.rs:346` 的 `pick`：精确优先 → 通配兜底 → 取 `inflight`
+      （`crates/gateway/src/registry/routing.rs:38` 的 `pick`：精确优先 → 通配兜底 → 取 `inflight`
       最小者），node 内部怎么分它看不见、也不需要看见 ⇒ **协议 / 网关 / 注册表 / 准入 /
       `/v1/models` 聚合全部零改动**（`Heartbeat.inflight` 那个空洞也不必为它而补：网关拿到它
       只打一条 debug 日志，`crates/gateway/src/quic.rs:179`）。
       **改动形状**：`upstream` 允许是**一组** `{origin, models}`（字符串继续合法，向后兼容）；
       agent 按请求 `model` 筛候选 → 取在途最少 → 转发；**本地熔断**沿用「同一原因连续 N 次」
-      的既有纪律（同 `crates/gateway/src/registry.rs:531` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），
+      的既有纪律（同 `crates/gateway/src/registry/table.rs:191` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），
       但**判据是连接级失败，不是上游 404**——404 的意思是"这个模型不存在"，误当"后端坏"会熔断
       一个健康后端。
       **本机闸门按后端各一个**（今天是**一个全局** `Semaphore`，`crates/agent/src/lib.rs:280`

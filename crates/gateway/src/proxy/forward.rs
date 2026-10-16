@@ -59,7 +59,8 @@ pub(super) enum SendOutcome {
 /// `Gateway::shutdown` 早返回了（并集报告 H5）。
 const SHUTDOWN_EVENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// 响应转发结束的方式。**九个出口各自的处置不同**，以前它们只是散落的 `return`——
+/// 响应转发结束的方式。**十个出口各自的处置不同**（九个变体，`ClientGone` 在两处返回），
+/// 以前它们只是散落的 `return`——
 /// 日志能看出差别，返回值看不出来。显式化之后：调用方拿到一个可匹配的结论，
 /// 而第 9 步要修的那个缺口（客户端断开却因上游静默而未察觉）就落在 `ClientGone` 上。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +110,8 @@ impl ForwardEnd {
 
 /// 转发任务的收尾守卫（复扫 B3）。
 ///
-/// **为什么需要一个 Drop 守卫**：`forward_body` 有九个**返回**出口，而 panic 是第十个——它不走
+/// **为什么需要一个 Drop 守卫**：`forward_body` 有十个**返回**出口（九个变体），而 panic 是另
+/// 一条路——它不走
 /// 任何一条返回路径。`tx` 会随栈展开被 drop，于是 `rx` 干净地结束，客户端拿到一份**看似完整的
 /// 200 截断体**（HTTP 层看不出少了东西），而 `record_forward_end` 只在正常返回后调用 ⇒ 指标里
 /// 连一个样本都没有，排查时完全没有痕迹。
@@ -163,7 +165,7 @@ impl Drop for ForwardGuard {
              is not mistaken for a complete one"
         );
         // 推一个**错误项**：`Body::from_stream` 见到错误项会掐断响应（连接中断），而不是正常收尾
-        // ——这正是"截断体不许看起来完整"所需要的信号，与其它九个出口用的是同一个通道。
+        // ——这正是"截断体不许看起来完整"所需要的信号，与其它那些正常出口用的是同一个通道。
         //
         // 用 `try_send`：Drop 里不能 await。通道满 = 客户端不读，那种情形另有 `client_stalled`
         // 与 `io_stall` 兜底，这里塞不进去不算丢信号。

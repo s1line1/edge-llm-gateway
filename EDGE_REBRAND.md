@@ -30,7 +30,7 @@
 | 文件 | 位置 |
 |---|---|
 | `crates/proto/src/frame.rs:1` | "网关与家端 agent 之间" → "网关与 edge-agent 之间" |
-| `crates/gateway/src/registry.rs:1` | "家端 agent 注册表" → "edge-agent 注册表" |
+| `crates/gateway/src/registry/mod.rs:1` | "家端 agent 注册表" → "edge-agent 注册表" |
 | `crates/gateway/src/quic.rs:1` | "接受家端 agent 连接" → "接受 edge-agent 连接" |
 | `crates/gateway/src/tls.rs:109-116` | "校验家端 agent 的客户端证书" → "校验 edge-agent"（原在 `:15`；**该注释已被 `6c16f8e` 拆 s2n-quic 时移除**，等价的 mTLS 说明现见此处）|
 | `crates/gateway/src/storage/mod.rs:14` | "家庭网关低 QPS 下" → "edge 网关低 QPS 下" |
