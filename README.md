@@ -4,21 +4,18 @@
 
 **一个 Rust 实现的边缘 LLM 网关：把内网/家庭网络里的本地模型，安全地暴露成公网上的 OpenAI 兼容 API。**
 
+<p align="center">
+  <img src="home-llm-gateway-architecture.svg" alt="架构：调用方 → cloud-gateway（公网）→ QUIC 隧道 → edge-agent（内网）→ 本地 LLM" width="100%">
+</p>
+
 它解决的是一个具体的网络问题：模型跑在家里或内网的机器上（NAT 后、动态 IP、没有公网入口），而你希望在
 任何地方用标准的 OpenAI SDK 调它，同时**不把本地推理端点直接暴露到公网**。
 
-```
-客户端（任何地方）
-   │  HTTPS · OpenAI 兼容 API（含 SSE 流式）
-   ▼
-cloud-gateway（公网服务器）   API Key 认证 → 限流 → 准入 → 按 model 路由 → 隧道帧
-   │  QUIC（UDP，mTLS 双向认证，一条连接多路复用，无队头阻塞）
-   ▼
-edge-agent（模型所在机器）    主动拨号 + 心跳 + 断线重连 → 转发给本地 LLM
-   │  HTTP
-   ▼
-本地 LLM（Ollama / vLLM / llama.cpp）
-```
+<p align="center">
+  <img alt="测试" src="https://img.shields.io/badge/tests-382%20passed-brightgreen">
+  <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
+</p>
 
 **不依赖外部隧道/代理服务**：无需 frp / ngrok / nginx / caddy。隧道、认证、流式转发、TLS 全在这三个
 Rust crate 里。
@@ -305,8 +302,8 @@ fmt · clippy -D warnings · cargo deny · nextest · web-format · web-lint · 
 web-build · toolchain-check · check-records
 ```
 
-> **当前规模（`cargo nextest run --workspace` 实测）**：**368 个被执行且通过的测试（0 skipped）**，其中
-> **69 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
+> **当前规模（`cargo nextest run --workspace` 实测）**：**382 个被执行且通过的测试（0 skipped）**，其中
+> **70 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
 >
 > 两点与 `cargo test` 不同的行为要知道：**nextest 每条测试一个进程**，所以 `serial_test` 的
 > `#[serial]`（进程内锁）在它下面失效——e2e 的串行改由 `.config/nextest.toml` 的 `test-group`
@@ -330,8 +327,11 @@ make dev && make bench-k6 KEY=<sk-...> VUS=20 DUR=30s
 **README 只保留两条结论，因为它们会改变你的部署决策**：
 
 1. **网关内存跟「在途」走，不跟「请求数」走**——前提是默认开启的身份校验缓存（`verified_cache_max`）。
-   把它设成 `0` 会让每个在途请求吃约 19 MiB，此时 `max_concurrent_requests` 必须收在
-   `MemoryMax / 20MB` 之下，否则先撞的是 OOM 而不是优雅的 429。
+
+> [!CAUTION]
+> 把 `verified_cache_max` 设成 `0` 会让**每个在途请求**吃约 19 MiB（argon2 的工作内存是内存硬的）。
+> 那种配置下 `max_concurrent_requests` 必须收在 `MemoryMax / 20MB` 之下，否则先撞的是 **OOM**，
+> 而不是优雅的 429。
 2. **压测时先分清瓶颈在谁身上**：判断顺序是 **agent 的事件速率 → 链路带宽 → 网关**。
    真实模型 20–100 token/s 下这些都远未到顶；只有在"把模型换快"或"拿网关转发非 LLM 小请求"时，
    下面的数字才有意义。
@@ -347,13 +347,21 @@ make dev && make bench-k6 KEY=<sk-...> VUS=20 DUR=30s
 要点：
 
 1. **网关放公网服务器**：安全组放行 **UDP 4433**（QUIC 隧道）与 **TCP 8443**（HTTPS API）。
-   UDP 容易漏——QUIC 走 UDP；**当前版本只有 UDP 传输、未实现 TCP 降级**。若 UDP 被封，目前需要放行 UDP 4433；TCP+TLS 降级只是备选设计，见 [`DESIGN.md`](DESIGN.md) §10。
 2. **agent 放模型所在机器**：`cloud_addr` 填 `<公网IP>:4433`，`server_name` 填证书 SAN 中的域名。
-3. **mTLS 是关键安全线**：CA 私钥自己保管，**每个 agent 单独签发**客户端证书。
-4. 部署形态：单静态二进制（Linux musl / macOS）+ systemd 单元，或 Docker Compose
+3. 部署形态：单静态二进制（Linux musl / macOS）+ systemd 单元，或 Docker Compose
    （`crates/gateway/Dockerfile` 已把 Dashboard 编进镜像，无需自建前端）。
-5. **多台 edge（异构模型）**：各写一份 `agent-config.yml` 声明自己的 `models` 即可，
+4. **多台 edge（异构模型）**：各写一份 `agent-config.yml` 声明自己的 `models` 即可，
    配置示例与 `agent_id` 必须唯一的那个陷阱见 [`MODEL_ROUTING.md`](MODEL_ROUTING.md) §7。
+
+> [!IMPORTANT]
+> **别只放行 TCP，QUIC 走的是 UDP。** 安全组里漏掉 **UDP 4433** 是最常见的部署失败：
+> 端口看起来"开着"，握手却永远不来。**当前版本只有 UDP 传输，没有 TCP 降级**——UDP 被封时
+> 没有退路（TCP+TLS 降级只是备选设计，见 [`DESIGN.md`](DESIGN.md) §10）。
+
+> [!WARNING]
+> **mTLS 是这道边界的关键安全线。** CA 私钥自己保管，**每个 agent 单独签发**客户端证书——
+> 任何持有 CA 签发证书的连接都能注册为 agent。证书与信任根的动态管理（CSR 路线、加 agent
+> 不重启网关）是**设计未实现**，见 [`CERT_MANAGEMENT.md`](CERT_MANAGEMENT.md)。
 
 > 网关启动时会自己把 `RLIMIT_NOFILE` 的 soft 抬到 `min(hard, 16384)`——systemd 默认的 1024
 > 在生产水位（768 并发连接 → fd 峰值 785）上是贴脸的。理由与 unit 的分工见 `DESIGN.md` §14。
@@ -375,6 +383,10 @@ scripts/        release 打包 · k6 压测 · 工具链一致性检查 · git p
 gateway-config.example.yml / agent-config.example.yml   两份配置模板（含全部参数注释）
 deny.toml       cargo-deny 策略（依赖许可证 / 公告）
 ```
+
+> README 里引用的架构图是仓库根目录的 `home-llm-gateway-architecture.svg`（**已进版本库**）。
+> `diagrams/` 下有更细的多语言版（组件图 / 架构图 × 中英），但该目录被 `.gitignore` 排除、
+> **不在仓库里**——所以文档不能引用它（否则克隆下来是坏图）。需要引用时先把它加进版本库。
 
 > 配置文件命名固定：网关 `gateway-config.yml`、agent `agent-config.yml`（本地与生产一致，
 > 均含密钥类信息，已 gitignore）。
