@@ -611,8 +611,6 @@ pub struct Admission {
     counted: bool,
 }
 
-impl Admission {}
-
 impl Drop for Admission {
     fn drop(&mut self) {
         match self.domain {

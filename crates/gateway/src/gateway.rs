@@ -277,7 +277,7 @@ impl Gateway {
     /// HTTP 连接任务；客户端停读时它会 park 在写 socket 上直到 `client_stall`（`io_stall`），
     /// 与转发任务是否退出无关。`await_end_event_window` 到点仍 >0 时会 WARN 说明这一点。
     ///
-    /// ⚠️ `registry.rs::close_when_drained` 是"摘除单个 agent 时等它在途请求收尾"，
+    /// ⚠️ `crate::evict_close::defer_close` 是"摘除单个 agent 时等它在途请求收尾"，
     /// **不是进程退出路径**，别直接复用到这里。
     pub async fn shutdown(self) {
         // ① 进入 Draining：公网入口停止 accept；在途请求继续正常跑。
