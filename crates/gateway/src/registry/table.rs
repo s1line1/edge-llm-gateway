@@ -76,6 +76,13 @@ pub(crate) fn normalize_socket_addr(addr: SocketAddr) -> IpAddr {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentInfo {
     pub agent_id: String,
+    /// 来源 IP（已归一、**不含端口**，见 [`AgentKey`]）。
+    ///
+    /// 为什么要有它：`agent_id` 在 D1 之后**不再唯一**——同一个 id 从两个来源 IP 连进来是
+    /// 两个并存节点，只有 `ip` 能把它们区分开（`/admin/agents` 与 Dashboard 都靠它）。
+    /// JSON 里是字符串（`"203.0.113.7"` / `"::1"`）：仓库没有其它 `IpAddr` 序列化先例，
+    /// 而网关是归一化的唯一来源，消费方只需展示、不需要重新解析。
+    pub ip: String,
     pub models: Vec<String>,
     pub max_concurrency: u32,
     /// 当前在途请求数。
@@ -390,10 +397,13 @@ impl Registry {
         read_or_recover(&self.inner).is_empty()
     }
 
-    /// 返回全部已注册 agent 的明细快照（按 agent_id 排序）。
+    /// 返回全部已注册 agent 的明细快照（按 `(agent_id, ip)` 排序）。
     ///
     /// `stale_after` 决定每条的 `healthy`（与选路同一个判据，见 [`AgentInfo::healthy`]）；
     /// 调用方传 `AppState::agent_stale_after`。
+    ///
+    /// 排序键含 `ip`（而不只是 `agent_id`）：同名两个节点并存时，只按 id 排的相对次序是
+    /// **未定义**的，而稳定序被前端 key、测试断言与人眼比对共同依赖。
     pub fn snapshot(&self, stale_after: Duration) -> Vec<AgentInfo> {
         let inner = read_or_recover(&self.inner);
         let now = now_millis();
@@ -404,6 +414,7 @@ impl Registry {
                 AgentInfo {
                     // 取键里的那份（键与 `Entry` 同值，但键在 map 迭代里天然可用）
                     agent_id: k.agent_id.clone(),
+                    ip: k.peer_ip.to_string(),
                     models: e.models.clone(),
                     max_concurrency: e.max_concurrency,
                     inflight: e.inflight.load(Ordering::Relaxed),
@@ -412,9 +423,8 @@ impl Registry {
                 }
             })
             .collect();
-        // 排序键含 IP：同名两个节点并存时，只按 agent_id 排会让相对次序**不稳定**，
-        // 而稳定序是前端 key、测试断言与人眼比对都依赖的。
-        out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        // 稳定序：先 id 后 ip（两者都是字符串序，确定性够用，不引入 IP 数值序的额外语义）。
+        out.sort_by(|a, b| (&a.agent_id, &a.ip).cmp(&(&b.agent_id, &b.ip)));
         out
     }
 

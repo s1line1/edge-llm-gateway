@@ -50,6 +50,16 @@ export type HealthStatus = { ok: boolean; text: string };
  */
 export interface AgentInfo {
   agent_id: string;
+  /**
+   * 来源 IP（已归一、不含端口，如 `"203.0.113.7"` / `"::1"`）。
+   *
+   * **可选**：本次改动之前的旧网关不返回它，页面必须降级——只显示 `agent_id`，且**不能**
+   * 因为它是 `undefined` 就崩，也不能把 `undefined` 渲染成文本。
+   *
+   * 为什么必须有它：`agent_id` 不再是唯一键——同一个 id 从两个来源 IP 连进来是**两个并存的
+   * 节点**（各自独立路由），只有 `ip` 能把它们区分开；同名的多行也因此要靠它做 React key。
+   */
+  ip?: string;
   models: string[];
   max_concurrency: number;
   /** 当前在途请求数。 */

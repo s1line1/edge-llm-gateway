@@ -412,6 +412,52 @@ mod tests {
         assert_eq!(reg.len(), 0);
     }
 
+    /// 契约（`contracts/admin-agents.md`）：同名不同来源时快照返回**两行**，各自带自己的
+    /// `ip`，且顺序**稳定**（按 `(agent_id, ip)`）。
+    ///
+    /// 前端 `key` 与测试断言都依赖这个稳定序；顺序不稳时同名两行会在渲染层来回换位。
+    #[tokio::test]
+    async fn snapshot_lists_same_id_different_ip_as_two_stable_rows() {
+        let reg = Registry::default();
+        // 故意先用"较大"的 IP 注册，验证输出是按 (id, ip) 排过序的，而不是插入序
+        reg.register(
+            "edge".into(),
+            OTHER_IP,
+            vec!["m".into()],
+            2,
+            test_connection().await,
+        );
+        reg.register(
+            "edge".into(),
+            IP,
+            vec!["m".into()],
+            2,
+            test_connection().await,
+        );
+
+        let snap = reg.snapshot(Duration::from_secs(10));
+        assert_eq!(snap.len(), 2, "同名不同来源必须各占一行");
+        let rows: Vec<(&str, &str)> = snap
+            .iter()
+            .map(|i| (i.agent_id.as_str(), i.ip.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("edge", "127.0.0.1"), ("edge", "127.0.0.2")],
+            "两行同名，按 (agent_id, ip) 稳定升序"
+        );
+        // 再取一次：顺序必须一致（稳定序而不是"这次恰好这样"）
+        let again: Vec<String> = reg
+            .snapshot(Duration::from_secs(10))
+            .into_iter()
+            .map(|i| i.ip)
+            .collect();
+        assert_eq!(
+            again,
+            vec!["127.0.0.1".to_string(), "127.0.0.2".to_string()]
+        );
+    }
+
     /// 规格（D1，**本特性的主判据**）：身份是 `(agent_id, peer_ip)`——同名**不同来源**是
     /// **两个并存的节点**，同名**同来源**才是接管。
     ///
@@ -1164,6 +1210,10 @@ mod tests {
         let snap = reg.snapshot(Duration::from_secs(10));
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].agent_id, "home-1");
+        assert_eq!(
+            snap[0].ip, "127.0.0.1",
+            "契约：/admin/agents 每行带来源 IP（已归一、不含端口）"
+        );
         assert_eq!(
             snap[0].models,
             vec!["qwen2.5".to_string(), "llama3".to_string()]
