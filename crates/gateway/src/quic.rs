@@ -128,6 +128,18 @@ async fn handle_conn_inner(
     registration: &mut crate::registry::Registration<'_>,
     stream_ceiling: u32,
 ) -> anyhow::Result<()> {
+    // 来源 IP 是**这条连接的属性**、在连接生命周期内不变，所以取一次就够（不用每帧问一次）。
+    // 它来自 socket（由内核对端地址保证），**不是**帧里自报的字段——D1 要的正是这个"不可伪造"
+    // 的那一半。取不到就没有可信的来源，注册将成为无身份条目，所以**直接关掉这条连接**：
+    // agent 会看到断开并退避重连，比"注册被静默忽略、心跳也没人认"更容易定位。
+    let peer_ip = match handle.remote_addr() {
+        Ok(addr) => crate::registry::normalize_socket_addr(addr),
+        Err(e) => {
+            warn!(error = %e, "cannot read the peer address; closing the connection");
+            handle.close(0u32.into());
+            return Ok(());
+        }
+    };
     loop {
         match acceptor.accept_bidirectional_stream().await {
             Ok(Some(stream)) => {
@@ -158,7 +170,7 @@ async fn handle_conn_inner(
                         // **上限判定必须在 `register()` 之前**（记录 SL-P2-10）：注册已经插表
                         // 之后再拒绝，那条 `Entry` 就没人负责摘了——正是 `Registration` 要防的
                         // 幽灵条目（本仓库没有 stale 清扫器）。同名重新注册走覆盖、不占额度。
-                        if !registration.accepts(&id) {
+                        if !registration.accepts(&id, peer_ip) {
                             warn!(
                                 agent = %id,
                                 limit = crate::registry::MAX_REGISTRATIONS_PER_CONNECTION,
@@ -173,11 +185,16 @@ async fn handle_conn_inner(
                         }
                         // 顺序不能反：`register()` 插表、`note()` 上膛，中间 Drop 是空操作
                         // ——其间不得有可失败或可 `await` 的操作，否则会留下没人摘的条目。
-                        let stable_id =
-                            registry.register(id.clone(), models, max_concurrency, handle.clone());
-                        registration.note(id.clone(), stable_id);
+                        let stable_id = registry.register(
+                            id.clone(),
+                            peer_ip,
+                            models,
+                            max_concurrency,
+                            handle.clone(),
+                        );
+                        registration.note(id.clone(), peer_ip, stable_id);
                         let _ = send.finish();
-                        info!(agent = %id, "agent registered");
+                        info!(agent = %id, ip = %peer_ip, "agent registered");
                     }
                     Some(Frame::Heartbeat {
                         agent_id: id,
@@ -193,15 +210,16 @@ async fn handle_conn_inner(
                         // 判据是"这个 id **是不是本连接注册过的**"（按每个 id 查），不是"是不是
                         // 最后注册的那一个"：一条连接可以注册多个 id（见本文件上面的 `accepts`），
                         // 只认最后一条会把其余 id 的合法心跳误判成越权并丢弃。
-                        match registration.owned_stable_id(&id) {
+                        match registration.owned_stable_id(&id, peer_ip) {
                             Some(stable_id) => {
-                                let _ = registry.heartbeat_if_same(&id, stable_id);
-                                debug!(agent = %id, inflight, "heartbeat");
+                                let _ = registry.heartbeat_if_same(&id, peer_ip, stable_id);
+                                debug!(agent = %id, ip = %peer_ip, inflight, "heartbeat");
                             }
                             // 帧里的 id 不是本连接注册的任何一个：只可能是坏掉的或恶意的对端。
                             // 静默忽略会让这种越权完全无痕，所以这里必须出声。
                             None => warn!(
                                 frame_agent = %id,
+                                ip = %peer_ip,
                                 "heartbeat names an agent this connection never registered; ignored"
                             ),
                         }

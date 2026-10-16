@@ -23,6 +23,9 @@ pub use routing::{AcquireError, Disposition};
 pub use table::{AgentInfo, Registration, RegistryStatus};
 
 pub(crate) use table::MAX_REGISTRATIONS_PER_CONNECTION;
+/// 注册表的键类型（crate 内可见，**不是公开 API**）：对外只经 `/admin/agents` 的 `ip`
+/// 字符串暴露来源。`quic.rs` 要用它做心跳查找。
+pub(crate) use table::{normalize_socket_addr, AgentKey};
 
 /// 连接身份发号器：给每条注册进来的连接发一个**进程内唯一且永不复用**的编号。
 ///
@@ -34,7 +37,10 @@ pub(crate) use table::MAX_REGISTRATIONS_PER_CONNECTION;
 /// 注册表要的是"同一进程内、对一条连接稳定、且不复用"的编号（复用同样会导致误删），自己发号最稳。
 static NEXT_CONN_ID: AtomicUsize = AtomicUsize::new(1);
 
-/// `agent_id → Entry` 的注册表，外加准入（`try_acquire*`）与隧道失败的判定/记账。
+/// `(agent_id, peer_ip) → Entry` 的注册表，外加准入（`try_acquire*`）与隧道失败的判定/记账。
+///
+/// **键是"节点身份"而不是"id"**（2026-10-16 D1）：同一个 `agent_id` 从不同来源 IP 注册时是
+/// **两个并存的节点**，各自独立路由；只有 `(agent_id, 同一个 IP)` 再次注册才是接管。
 ///
 /// **两条锁纪律**（都是事故换来的，改动这里的任何方法前先看一眼）：
 /// - **写锁下只碰 map 与原子量**：不 `spawn`、不调传输句柄。`tokio::spawn` 若在守卫内 panic，
@@ -44,7 +50,7 @@ static NEXT_CONN_ID: AtomicUsize = AtomicUsize::new(1);
 ///   不该与正在选路的读路径互斥。
 #[derive(Clone, Default)]
 pub struct Registry {
-    inner: Arc<RwLock<HashMap<String, Entry>>>,
+    inner: Arc<RwLock<HashMap<AgentKey, Entry>>>,
 }
 
 /// Drop 时自动归还并发槽位。
@@ -65,11 +71,17 @@ mod tests {
     use crate::registry::routing::pick;
     use rcgen::{CertificateParams, KeyPair};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::net::IpAddr;
     use std::time::Duration;
 
     /// 摘除宽限：单测不关心具体时长（那由 `Options::evict_close_grace` 决定，默认 15s），
     /// 给一个固定值即可。
     const GRACE: Duration = Duration::from_secs(5);
+
+    /// 单测里的默认来源 IP。绝大多数用例只关心"键正确"，来源是哪台机器无所谓；
+    /// 需要"同名不同来源"的用例（见 `same_id_from_two_ips_is_two_nodes`）自己传第二个 IP。
+    const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+    const OTHER_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
 
     /// 建一对本地 s2n-quic 端点，返回**客户端连接句柄**（无 mTLS，只为构造 Handle）。
     ///
@@ -159,7 +171,7 @@ mod tests {
         assert!(reg.inner.is_poisoned(), "前提：锁中毒了");
 
         let conn = test_connection().await;
-        reg.register("home-1".into(), vec!["m".into()], 2, conn);
+        reg.register("home-1".into(), IP, vec!["m".into()], 2, conn);
         assert_eq!(reg.len(), 1, "中毒后仍应能注册");
         let (_entry, _slot) = reg
             .try_acquire(Duration::from_secs(10), "m")
@@ -175,10 +187,23 @@ mod tests {
     async fn pick_orders_exact_over_wildcard_then_lightest() {
         let reg = Registry::default();
         let stale = Duration::from_secs(10);
-        reg.register("wild".into(), vec!["*".into()], 8, test_connection().await);
-        let exact = reg.register("exact".into(), vec!["m".into()], 8, test_connection().await);
+        reg.register(
+            "wild".into(),
+            IP,
+            vec!["*".into()],
+            8,
+            test_connection().await,
+        );
+        let exact = reg.register(
+            "exact".into(),
+            IP,
+            vec!["m".into()],
+            8,
+            test_connection().await,
+        );
         let busy = reg.register(
             "exact-busy".into(),
+            IP,
             vec!["m".into()],
             8,
             test_connection().await,
@@ -231,6 +256,7 @@ mod tests {
         let reg = Registry::default();
         reg.register(
             "only-m".into(),
+            IP,
             vec!["m".into()],
             8,
             test_connection().await,
@@ -262,11 +288,12 @@ mod tests {
             let mut registration = Registration::new(&reg);
             let stable_id = reg.register(
                 "home-1".into(),
+                IP,
                 vec!["m".into()],
                 2,
                 test_connection().await,
             );
-            registration.note("home-1".into(), stable_id);
+            registration.note("home-1".into(), IP, stable_id);
             assert_eq!(reg.len(), 1);
         }
         assert_eq!(reg.len(), 0, "守卫 drop 必须摘掉条目");
@@ -275,8 +302,8 @@ mod tests {
         let conn = test_connection().await;
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut registration = Registration::new(&reg);
-            let stable_id = reg.register("home-2".into(), vec!["m".into()], 2, conn.clone());
-            registration.note("home-2".into(), stable_id);
+            let stable_id = reg.register("home-2".into(), IP, vec!["m".into()], 2, conn.clone());
+            registration.note("home-2".into(), IP, stable_id);
             assert_eq!(reg.len(), 1);
             panic!("connection task blew up");
         }));
@@ -294,13 +321,13 @@ mod tests {
     async fn registration_guard_refreshes_the_stable_id_of_a_re_registered_id() {
         let reg = Registry::default();
         let mut registration = Registration::new(&reg);
-        let first = reg.register("x".into(), vec!["m".into()], 2, test_connection().await);
-        registration.note("x".into(), first);
-        assert_eq!(registration.owned_stable_id("x"), Some(first));
-        let second = reg.register("x".into(), vec!["m".into()], 2, test_connection().await);
-        registration.note("x".into(), second);
+        let first = reg.register("x".into(), IP, vec!["m".into()], 2, test_connection().await);
+        registration.note("x".into(), IP, first);
+        assert_eq!(registration.owned_stable_id("x", IP), Some(first));
+        let second = reg.register("x".into(), IP, vec!["m".into()], 2, test_connection().await);
+        registration.note("x".into(), IP, second);
         assert_eq!(
-            registration.owned_stable_id("x"),
+            registration.owned_stable_id("x", IP),
             Some(second),
             "同名重新注册必须把记着的 stable_id 换成新的"
         );
@@ -311,8 +338,8 @@ mod tests {
 
         // 反向：只记着旧 stable_id 时，摘除不许误删新条目
         let mut stale = Registration::new(&reg);
-        let fresh = reg.register("y".into(), vec!["m".into()], 2, test_connection().await);
-        stale.note("y".into(), fresh.wrapping_sub(1)); // 一个不存在的 stable_id
+        let fresh = reg.register("y".into(), IP, vec!["m".into()], 2, test_connection().await);
+        stale.note("y".into(), IP, fresh.wrapping_sub(1)); // 一个不存在的 stable_id
         drop(stale);
         assert_eq!(reg.len(), 1, "stable_id 不匹配时不得摘除别人的条目");
     }
@@ -327,10 +354,22 @@ mod tests {
     async fn a_connection_removes_every_id_it_registered_when_it_drops() {
         let reg = Registry::default();
         let mut registration = Registration::new(&reg);
-        let a1 = reg.register("a1".into(), vec!["m".into()], 2, test_connection().await);
-        registration.note("a1".into(), a1);
-        let a2 = reg.register("a2".into(), vec!["m".into()], 2, test_connection().await);
-        registration.note("a2".into(), a2);
+        let a1 = reg.register(
+            "a1".into(),
+            IP,
+            vec!["m".into()],
+            2,
+            test_connection().await,
+        );
+        registration.note("a1".into(), IP, a1);
+        let a2 = reg.register(
+            "a2".into(),
+            IP,
+            vec!["m".into()],
+            2,
+            test_connection().await,
+        );
+        registration.note("a2".into(), IP, a2);
         assert_eq!(reg.len(), 2);
 
         drop(registration);
@@ -348,25 +387,172 @@ mod tests {
         let new = test_connection().await;
 
         let mut first_conn = Registration::new(&reg);
-        let old_sid = reg.register("a1".into(), vec!["m".into()], 2, old);
-        first_conn.note("a1".into(), old_sid);
+        let old_sid = reg.register("a1".into(), IP, vec!["m".into()], 2, old);
+        first_conn.note("a1".into(), IP, old_sid);
 
         let mut second_conn = Registration::new(&reg);
-        let new_sid = reg.register("a1".into(), vec!["m".into()], 2, new);
-        second_conn.note("a1".into(), new_sid);
+        let new_sid = reg.register("a1".into(), IP, vec!["m".into()], 2, new);
+        second_conn.note("a1".into(), IP, new_sid);
         assert_eq!(reg.len(), 1, "同名接管后表里仍只有一条");
 
         // 旧连接退出：它记的 old_sid 已经不对应当前条目 ⇒ 不许摘掉新的那条
         drop(first_conn);
         assert_eq!(reg.len(), 1, "接管之后的条目属于新连接，旧连接退出不得摘除");
         assert_eq!(
-            reg.inner.read().unwrap().get("a1").map(|e| e.stable_id),
+            reg.inner
+                .read()
+                .unwrap()
+                .get(&AgentKey::new("a1", IP))
+                .map(|e| e.stable_id),
             Some(new_sid)
         );
 
         // 新连接退出：这一次才摘掉
         drop(second_conn);
         assert_eq!(reg.len(), 0);
+    }
+
+    /// 规格（D1，**本特性的主判据**）：身份是 `(agent_id, peer_ip)`——同名**不同来源**是
+    /// **两个并存的节点**，同名**同来源**才是接管。
+    ///
+    /// 为什么这条是主判据：真实双源（两个不同的 socket 源地址）在 e2e 里要双栈监听才造得出来
+    /// （见 `specs/agent-node-identity/research.md` R3 的实测），而"注册表按不按组合键区分"是
+    /// 纯逻辑——在这里直接喂两个 `IpAddr` 就能钉死，且能变异验证。
+    ///
+    /// 变异验证：把 `AgentKey` 的 `peer_ip` 从 `Hash`/`Eq` 里去掉（或固定成常量）⇒ 本用例红
+    /// （第二条注册会顶掉第一条，`len()` 变成 1）。
+    #[tokio::test]
+    async fn same_id_from_two_ips_is_two_nodes_and_same_ip_takes_over() {
+        let reg = Registry::default();
+
+        // ① 同名、两个不同来源：两条并存
+        let mut first = Registration::new(&reg);
+        let a1 = reg.register(
+            "edge".into(),
+            IP,
+            vec!["m".into()],
+            2,
+            test_connection().await,
+        );
+        first.note("edge".into(), IP, a1);
+        let mut second = Registration::new(&reg);
+        let a2 = reg.register(
+            "edge".into(),
+            OTHER_IP,
+            vec!["m".into()],
+            2,
+            test_connection().await,
+        );
+        second.note("edge".into(), OTHER_IP, a2);
+        assert_eq!(reg.len(), 2, "同名不同来源必须是两个并存的节点");
+        assert_ne!(a1, a2, "两条连接各有自己的 stable_id");
+
+        // ② 心跳只刷新**自己那一条**：给 first 发心跳，second 的新鲜度不受影响
+        let before = reg
+            .snapshot(Duration::from_secs(10))
+            .into_iter()
+            .find(|i| i.agent_id == "edge")
+            .map(|i| i.last_seen_secs_ago);
+        assert!(before.is_some());
+        assert!(
+            reg.heartbeat_if_same("edge", IP, a1),
+            "first 的心跳必须落在自己那条上"
+        );
+        assert!(
+            !reg.heartbeat_if_same("edge", IP, a2),
+            "用 first 的来源 IP 去刷 second 的 stable_id 必须失败（键对不上）"
+        );
+        assert!(
+            reg.heartbeat_if_same("edge", OTHER_IP, a2),
+            "second 的心跳也必须落在自己那条上"
+        );
+
+        // ③ 摘除互相独立：first 断开只摘掉 first 那条
+        drop(first);
+        assert_eq!(reg.len(), 1, "只摘掉本连接那一条，另一条不受影响");
+        assert!(
+            reg.heartbeat_if_same("edge", OTHER_IP, a2),
+            "second 仍然活着"
+        );
+        drop(second);
+        assert_eq!(reg.len(), 0);
+
+        // ④ 同名**同来源** = 接管：表里仍只有一条，且属于后注册的那条连接
+        let mut third = Registration::new(&reg);
+        let b1 = reg.register(
+            "edge".into(),
+            IP,
+            vec!["m".into()],
+            2,
+            test_connection().await,
+        );
+        third.note("edge".into(), IP, b1);
+        let mut fourth = Registration::new(&reg);
+        let b2 = reg.register(
+            "edge".into(),
+            IP,
+            vec!["m".into()],
+            2,
+            test_connection().await,
+        );
+        fourth.note("edge".into(), IP, b2);
+        assert_eq!(reg.len(), 1, "同一个 (id, ip) 只能有一条：接管而不是追加");
+        assert_eq!(
+            reg.inner
+                .read()
+                .unwrap()
+                .get(&AgentKey::new("edge", IP))
+                .map(|e| e.stable_id),
+            Some(b2),
+            "条目应属于后注册的那条连接"
+        );
+        // 旧连接退出不得误摘新条目（stable_id 对不上）
+        drop(third);
+        assert_eq!(reg.len(), 1);
+        drop(fourth);
+        assert_eq!(reg.len(), 0);
+    }
+
+    /// 规格（R4）：IP 归一——剥端口、v4-mapped IPv6 折叠成 IPv4、其余 IPv6 原样。
+    ///
+    /// 变异验证：去掉 v4-mapped 那一支 ⇒ 第 ② 条断言红；不剥端口 ⇒ 第 ① 条断言红
+    /// （同一台机器换源端口会被当成新节点，接管永不触发）。
+    #[test]
+    fn peer_ip_is_normalised_port_stripped_and_v4_mapped_folded() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        // ① 剥端口：同 IP 不同端口 → 同一个键
+        let a = super::table::normalize_socket_addr(SocketAddr::from((
+            Ipv4Addr::new(203, 0, 113, 7),
+            51234,
+        )));
+        let b = super::table::normalize_socket_addr(SocketAddr::from((
+            Ipv4Addr::new(203, 0, 113, 7),
+            60000,
+        )));
+        assert_eq!(a, b, "端口不参与身份：换源端口必须仍是同一个节点");
+        assert_eq!(a, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
+
+        // ② v4-mapped IPv6 → IPv4（双栈 socket 对 v4 对端就是这么报的）
+        let mapped = super::table::normalize_socket_addr(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0207)),
+            51234,
+        ));
+        assert_eq!(
+            mapped,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+            "v4-mapped 必须折叠成 IPv4，否则同一台机器在双栈下会被当成两个节点"
+        );
+
+        // ③ 其余 IPv6 原样保留
+        let v6 = super::table::normalize_socket_addr(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            51234,
+        ));
+        assert_eq!(
+            v6,
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+        );
     }
 
     /// 规格（记录 SL-P2-10 的第 ② 部分）：每条连接的注册数**有上限**，但**刷新同名 id 不占额度**。
@@ -382,32 +568,38 @@ mod tests {
         let mut registration = Registration::new(&reg);
 
         // 还没注册任何 id 时先问一次：必须允许（否则第一条注册就被自己的上限挡住）
-        assert!(registration.accepts("a1"));
+        assert!(registration.accepts("a1", IP));
 
         for n in 1..=MAX_REGISTRATIONS_PER_CONNECTION {
             let id = format!("a{n}");
-            assert!(registration.accepts(&id), "第 {n} 个新 id 必须被接受");
-            let sid = reg.register(id.clone(), vec!["m".into()], 2, test_connection().await);
-            registration.note(id.clone(), sid);
+            assert!(registration.accepts(&id, IP), "第 {n} 个新 id 必须被接受");
+            let sid = reg.register(id.clone(), IP, vec!["m".into()], 2, test_connection().await);
+            registration.note(id.clone(), IP, sid);
             // 刷新同名 id 永远允许，且不占新额度
-            assert!(registration.accepts(&id), "同名刷新不该被上限挡住");
+            assert!(registration.accepts(&id, IP), "同名刷新不该被上限挡住");
         }
         assert_eq!(reg.len(), MAX_REGISTRATIONS_PER_CONNECTION);
 
         assert!(
-            !registration.accepts("one-too-many"),
+            !registration.accepts("one-too-many", IP),
             "用满额度之后必须拒绝**新的** agent_id"
         );
         // 注意：已注册过的 id **不因满额而被拒**——它走的是覆盖，不占新额度。
         // （这一支正是"上限"与"刷新"的分界：上限只约束**不同**的 id 数。）
         assert!(
-            registration.accepts("a1"),
+            registration.accepts("a1", IP),
             "已注册过的 id 必须仍然允许刷新，哪怕额度已满"
         );
         // 反过来说：`a1` 是注册过的，刷新它仍然允许
-        let sid = reg.register("a1".into(), vec!["m".into()], 2, test_connection().await);
-        registration.note("a1".into(), sid);
-        assert!(registration.accepts("a1"));
+        let sid = reg.register(
+            "a1".into(),
+            IP,
+            vec!["m".into()],
+            2,
+            test_connection().await,
+        );
+        registration.note("a1".into(), IP, sid);
+        assert!(registration.accepts("a1", IP));
     }
 
     /// 心跳的归属判据：**本连接注册过的每个 id** 都能交出 stable_id，别人的不能。
@@ -418,27 +610,45 @@ mod tests {
     async fn heartbeat_ownership_covers_every_registered_id_of_the_connection() {
         let reg = Registry::default();
         let mut registration = Registration::new(&reg);
-        let a1 = reg.register("a1".into(), vec!["m".into()], 2, test_connection().await);
-        registration.note("a1".into(), a1);
-        let a2 = reg.register("a2".into(), vec!["m".into()], 2, test_connection().await);
-        registration.note("a2".into(), a2);
+        let a1 = reg.register(
+            "a1".into(),
+            IP,
+            vec!["m".into()],
+            2,
+            test_connection().await,
+        );
+        registration.note("a1".into(), IP, a1);
+        let a2 = reg.register(
+            "a2".into(),
+            IP,
+            vec!["m".into()],
+            2,
+            test_connection().await,
+        );
+        registration.note("a2".into(), IP, a2);
 
-        assert_eq!(registration.owned_stable_id("a1"), Some(a1));
-        assert_eq!(registration.owned_stable_id("a2"), Some(a2));
-        assert_eq!(registration.owned_stable_id("someone-else"), None);
+        assert_eq!(registration.owned_stable_id("a1", IP), Some(a1));
+        assert_eq!(registration.owned_stable_id("a2", IP), Some(a2));
+        assert_eq!(registration.owned_stable_id("someone-else", IP), None);
     }
 
     #[tokio::test]
     async fn register_duplicate_replaces_and_len() {
         let reg = Registry::default();
         let c1 = test_connection().await;
-        let id1 = reg.register("home-1".into(), vec!["m".into()], 2, c1.clone());
+        let id1 = reg.register("home-1".into(), IP, vec!["m".into()], 2, c1.clone());
         assert_eq!(reg.len(), 1);
         // 同名重复注册：旧连接被关闭，条目替换为新连接，长度仍为 1
         let c2 = test_connection().await;
-        let id2 = reg.register("home-1".into(), vec!["m".into()], 2, c2.clone());
+        let id2 = reg.register("home-1".into(), IP, vec!["m".into()], 2, c2.clone());
         assert_eq!(reg.len(), 1);
-        let entry = reg.inner.read().unwrap().get("home-1").cloned().unwrap();
+        let entry = reg
+            .inner
+            .read()
+            .unwrap()
+            .get(&AgentKey::new("home-1", IP))
+            .cloned()
+            .unwrap();
         assert_ne!(id1, id2, "每次注册都必须拿到新的 stable_id");
         assert_eq!(entry.stable_id, id2, "条目应属于后注册的那条连接");
     }
@@ -448,16 +658,16 @@ mod tests {
         let reg = Registry::default();
         let c1 = test_connection().await;
         let c2 = test_connection().await;
-        let id1 = reg.register("x".into(), vec![], 4, c1.clone());
-        let id2 = reg.register("x".into(), vec![], 4, c2.clone()); // 条目换成 c2，c1 被关
-                                                                   // 用旧连接的 stable_id 移除 → 不删除（条目现在属于 c2）
-        reg.remove_if_same("x", id1);
+        let id1 = reg.register("x".into(), IP, vec![], 4, c1.clone());
+        let id2 = reg.register("x".into(), IP, vec![], 4, c2.clone()); // 条目换成 c2，c1 被关
+                                                                       // 用旧连接的 stable_id 移除 → 不删除（条目现在属于 c2）
+        reg.remove_if_same("x", IP, id1);
         assert_eq!(reg.len(), 1);
         // 用当前连接的 stable_id 移除 → 删除
-        reg.remove_if_same("x", id2);
+        reg.remove_if_same("x", IP, id2);
         assert_eq!(reg.len(), 0);
         // 对不存在的 agent 移除 → 无害
-        reg.remove_if_same("ghost", id2);
+        reg.remove_if_same("ghost", IP, id2);
     }
 
     /// 契约：**摘除时若还有别的在途请求，不得立刻关闭连接**。
@@ -475,7 +685,7 @@ mod tests {
         // 情形一：还有别的在途请求（这里手工把 inflight 顶到 3）
         let reg = Registry::default();
         let conn = test_connection().await;
-        let id = reg.register("busy".into(), vec!["*".into()], 8, conn.clone());
+        let id = reg.register("busy".into(), IP, vec!["*".into()], 8, conn.clone());
         let (_e, g1) = reg.try_acquire(stale, "m").unwrap();
         let (_e2, g2) = reg.try_acquire(stale, "m").unwrap();
         let (_e3, g3) = reg.try_acquire(stale, "m").unwrap();
@@ -499,7 +709,7 @@ mod tests {
         // 情形二：只剩当前请求 → 立即关闭
         let reg2 = Registry::default();
         let conn2 = test_connection().await;
-        let id2 = reg2.register("idle".into(), vec!["*".into()], 8, conn2.clone());
+        let id2 = reg2.register("idle".into(), IP, vec!["*".into()], 8, conn2.clone());
         let (_e4, _g4) = reg2.try_acquire(stale, "m").unwrap();
         assert!(matches!(
             reg2.evict(id2, EvictCause::OpenTimeout, GRACE),
@@ -524,8 +734,8 @@ mod tests {
         let reg = Registry::default();
         let c1 = test_connection().await;
         let c2 = test_connection().await;
-        let id1 = reg.register("a".into(), vec!["*".into()], 4, c1.clone());
-        let id2 = reg.register("b".into(), vec!["*".into()], 4, c2.clone());
+        let id1 = reg.register("a".into(), IP, vec!["*".into()], 4, c1.clone());
+        let id2 = reg.register("b".into(), IP, vec!["*".into()], 4, c2.clone());
         let stale = Duration::from_secs(10);
 
         // 不排除任何连接：两次选取都会命中某个候选（不关心是哪个）
@@ -564,7 +774,7 @@ mod tests {
     async fn tunnel_timeouts_evict_only_after_consecutive_failures() {
         let reg = Registry::default();
         let conn = test_connection().await;
-        let id = reg.register("t".into(), vec!["*".into()], 4, conn.clone());
+        let id = reg.register("t".into(), IP, vec!["*".into()], 4, conn.clone());
 
         // 前两次超时：条目保留
         assert!(matches!(
@@ -611,7 +821,7 @@ mod tests {
     async fn strike_counters_are_independent_per_cause() {
         let reg = Registry::default();
         let conn = test_connection().await;
-        let id = reg.register("t".into(), vec!["*".into()], 4, conn.clone());
+        let id = reg.register("t".into(), IP, vec!["*".into()], 4, conn.clone());
 
         // 两种失败各记两次：各自都还差一次，谁都不该摘除
         for expected in 1..=2 {
@@ -660,8 +870,8 @@ mod tests {
         let reg = Registry::default();
         let c1 = test_connection().await;
         let c2 = test_connection().await;
-        let fresh = reg.register("fresh".into(), vec!["*".into()], 4, c1.clone());
-        reg.register("stale".into(), vec!["*".into()], 4, c2.clone());
+        let fresh = reg.register("fresh".into(), IP, vec!["*".into()], 4, c1.clone());
+        reg.register("stale".into(), IP, vec!["*".into()], 4, c2.clone());
 
         let stale_after = Duration::from_millis(30);
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -677,7 +887,7 @@ mod tests {
         ));
 
         // 一条心跳恢复 → 只有它可路由
-        assert!(reg.heartbeat_if_same("fresh", fresh));
+        assert!(reg.heartbeat_if_same("fresh", IP, fresh));
         assert_eq!(reg.len(), 2);
         assert_eq!(reg.healthy_count(stale_after), 1);
         assert_eq!(reg.status(stale_after).healthy, 1);
@@ -694,7 +904,7 @@ mod tests {
     async fn heartbeat_refreshes_stale_entry() {
         let reg = Registry::default();
         let conn = test_connection().await;
-        let h = reg.register("h".into(), vec!["*".into()], 4, conn.clone());
+        let h = reg.register("h".into(), IP, vec!["*".into()], 4, conn.clone());
         // 30ms 后仍按 10ms 判定失联
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(matches!(
@@ -702,15 +912,15 @@ mod tests {
             Err(AcquireError::NoAgent)
         ));
         // 心跳刷新 last_seen → 恢复可用
-        assert!(reg.heartbeat_if_same("h", h));
+        assert!(reg.heartbeat_if_same("h", IP, h));
         assert!(reg
             .try_acquire(Duration::from_millis(100), "qwen2.5")
             .is_ok());
         // 对不存在的 agent 心跳 → 无害
-        assert!(!reg.heartbeat_if_same("ghost", 0));
+        assert!(!reg.heartbeat_if_same("ghost", IP, 0));
 
         // 别的连接的 stable_id → 也不刷新（这就是本次修的那条：帧里的 id 不足以证明"你是谁"）
-        assert!(!reg.heartbeat_if_same("h", h.wrapping_add(1)));
+        assert!(!reg.heartbeat_if_same("h", IP, h.wrapping_add(1)));
     }
 
     /// 规格（2026-10-07 修复）：**心跳只对"本连接注册的那条条目"生效**。
@@ -723,8 +933,8 @@ mod tests {
         let reg = Registry::default();
         let c1 = test_connection().await;
         let c2 = test_connection().await;
-        let victim = reg.register("victim".into(), vec!["*".into()], 4, c1.clone());
-        let attacker = reg.register("attacker".into(), vec!["*".into()], 4, c2.clone());
+        let victim = reg.register("victim".into(), IP, vec!["*".into()], 4, c1.clone());
+        let attacker = reg.register("attacker".into(), IP, vec!["*".into()], 4, c2.clone());
         assert_ne!(victim, attacker, "前提：两条连接拿到不同的 stable_id");
 
         let stale_after = Duration::from_millis(10);
@@ -733,14 +943,14 @@ mod tests {
 
         // 攻击者用自己的连接、发 victim 的 id 的心跳 → **不得**刷新（stable_id 对不上）
         assert!(
-            !reg.heartbeat_if_same("victim", attacker),
+            !reg.heartbeat_if_same("victim", IP, attacker),
             "另一条连接的 stable_id 不该刷新 victim"
         );
         assert_eq!(reg.healthy_count(stale_after), 0, "victim 应仍是 stale");
 
         // victim 自己的连接发心跳 → 刷新
         assert!(
-            reg.heartbeat_if_same("victim", victim),
+            reg.heartbeat_if_same("victim", IP, victim),
             "本连接的 stable_id 应当刷新"
         );
         assert_eq!(reg.healthy_count(stale_after), 1, "victim 恢复可路由");
@@ -751,8 +961,8 @@ mod tests {
         let reg = Registry::default();
         let c1 = test_connection().await;
         let c2 = test_connection().await;
-        reg.register("a".into(), vec!["*".into()], 1, c1.clone());
-        reg.register("b".into(), vec!["*".into()], 1, c2.clone());
+        reg.register("a".into(), IP, vec!["*".into()], 1, c1.clone());
+        reg.register("b".into(), IP, vec!["*".into()], 1, c2.clone());
 
         // 两个容量各 1 的 agent：连续两个请求应命中不同 agent
         let (e1, s1) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
@@ -781,7 +991,7 @@ mod tests {
     async fn max_concurrency_zero_always_acquires_and_still_counts_inflight() {
         let reg = Registry::default();
         let conn = test_connection().await;
-        reg.register("z".into(), vec!["*".into()], 0, conn.clone()); // 0 = 不限
+        reg.register("z".into(), IP, vec!["*".into()], 0, conn.clone()); // 0 = 不限
 
         // ① 只减不加 → 下溢：拿 5 次再**全部归还**，计数必须回到 0。
         //    在未修的实现里这里会读到 4294967295（`AtomicU32` 回绕），正是 P1-3 记录的形态。
@@ -832,13 +1042,20 @@ mod tests {
         let c3 = test_connection().await;
         reg.register(
             "qwen-edge".into(),
+            IP,
             vec!["qwen2.5".into()],
             1, // 容量 1：打满后验证回落通配
             c1.clone(),
         );
-        reg.register("llama-edge".into(), vec!["llama3".into()], 4, c2.clone());
+        reg.register(
+            "llama-edge".into(),
+            IP,
+            vec!["llama3".into()],
+            4,
+            c2.clone(),
+        );
         // 通配 edge：任何模型都可路由到它
-        reg.register("wildcard-edge".into(), vec!["*".into()], 4, c3.clone());
+        reg.register("wildcard-edge".into(), IP, vec!["*".into()], 4, c3.clone());
 
         // qwen2.5 → 精确声明的 qwen-edge 优先于仅通配的 wildcard-edge，
         // 绝不能是 llama-edge
@@ -848,7 +1065,7 @@ mod tests {
             inner
                 .iter()
                 .find(|(_, v)| v.stable_id == e.stable_id)
-                .map(|(id, _)| id.clone())
+                .map(|(k, _)| k.agent_id.clone())
                 .unwrap()
         };
         assert_eq!(id, "qwen-edge", "exact model match must win over wildcard");
@@ -861,7 +1078,7 @@ mod tests {
             inner
                 .iter()
                 .find(|(_, v)| v.stable_id == e.stable_id)
-                .map(|(id, _)| id.clone())
+                .map(|(k, _)| k.agent_id.clone())
                 .unwrap()
         };
         assert_eq!(id, "llama-edge", "exact model match must win over wildcard");
@@ -884,8 +1101,20 @@ mod tests {
         // 无通配 agent：所有健康 agent 都无法服务 mistral-7b
         let c1 = test_connection().await;
         let c2 = test_connection().await;
-        reg.register("qwen-edge".into(), vec!["qwen2.5".into()], 4, c1.clone());
-        reg.register("llama-edge".into(), vec!["llama3".into()], 4, c2.clone());
+        reg.register(
+            "qwen-edge".into(),
+            IP,
+            vec!["qwen2.5".into()],
+            4,
+            c1.clone(),
+        );
+        reg.register(
+            "llama-edge".into(),
+            IP,
+            vec!["llama3".into()],
+            4,
+            c2.clone(),
+        );
         assert!(matches!(
             reg.try_acquire(Duration::from_secs(10), "mistral-7b"),
             Err(AcquireError::NoModel)
@@ -899,12 +1128,14 @@ mod tests {
         let c2 = test_connection().await;
         reg.register(
             "edge-a".into(),
+            IP,
             vec!["qwen2.5".into(), "llama3".into()],
             4,
             c1.clone(),
         );
         reg.register(
             "edge-b".into(),
+            IP,
             vec!["llama3".into(), "*".into()],
             4,
             c2.clone(),
@@ -925,6 +1156,7 @@ mod tests {
         let conn = test_connection().await;
         reg.register(
             "home-1".into(),
+            IP,
             vec!["qwen2.5".into(), "llama3".into()],
             2,
             conn.clone(),
@@ -962,7 +1194,7 @@ mod tests {
 
         // 按 agent_id 排序、空注册表为空
         let conn2 = test_connection().await;
-        reg.register("agent-a".into(), vec![], 4, conn2.clone());
+        reg.register("agent-a".into(), IP, vec![], 4, conn2.clone());
         let snap = reg.snapshot(Duration::from_secs(10));
         assert_eq!(snap.len(), 2);
         assert_eq!(snap[0].agent_id, "agent-a");
@@ -984,7 +1216,7 @@ mod tests {
     async fn open_timeout_is_fatal_only_when_the_connection_is_not_at_capacity() {
         let reg = Registry::default();
         let conn = test_connection().await;
-        reg.register("busy".into(), vec!["*".into()], 1, conn.clone());
+        reg.register("busy".into(), IP, vec!["*".into()], 1, conn.clone());
         let (entry, guard) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
 
         // 在途 1 > 0：没到这条连接的上限（max_concurrency = 1 时 1 就是满）
@@ -1004,7 +1236,7 @@ mod tests {
 
         // 声明不限并发（max_concurrency = 0）时，上限就是端点流额度
         let conn2 = test_connection().await;
-        reg.register("unbounded".into(), vec!["*".into()], 0, conn2);
+        reg.register("unbounded".into(), IP, vec!["*".into()], 0, conn2);
         let (entry2, _g2) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
         assert_eq!(entry2.agent_id, "unbounded");
         entry2.inflight.store(3, Ordering::Relaxed);
@@ -1021,7 +1253,7 @@ mod tests {
         // 配置不一致（agent 声明 256 > 端点额度 100）：以更小的那个为准，
         // 否则"忙"会被判成"死"，又回到摘除健康 agent 的老路。
         let conn3 = test_connection().await;
-        reg.register("over-declared".into(), vec!["*".into()], 256, conn3);
+        reg.register("over-declared".into(), IP, vec!["*".into()], 256, conn3);
         let (entry3, _g3) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
         assert_eq!(entry3.agent_id, "over-declared");
         entry3.inflight.store(99, Ordering::Relaxed);
@@ -1045,7 +1277,7 @@ mod tests {
     async fn head_timeout_is_fatal_only_after_a_window_of_total_silence() {
         let reg = Registry::default();
         let conn = test_connection().await;
-        reg.register("alive".into(), vec!["*".into()], 4, conn);
+        reg.register("alive".into(), IP, vec!["*".into()], 4, conn);
         let (entry, _guard) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
         // 本用例只考第一层：`stuck_after` 给 0（对端活着也延长不了），对端也**从未心跳**。
         let only_window = |window: Duration| HeadSilence {
@@ -1098,7 +1330,7 @@ mod tests {
     async fn head_silence_is_tolerated_while_the_peer_keeps_heartbeating() {
         let reg = Registry::default();
         let conn = test_connection().await;
-        let alive_id = reg.register("slow-but-alive".into(), vec!["*".into()], 4, conn);
+        let alive_id = reg.register("slow-but-alive".into(), IP, vec!["*".into()], 4, conn);
         let (entry, _guard) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
 
         // 先让它"回过一次响应头"，然后沉默 50ms（把窗口压到 1ms 来跨过边界，同上面的技巧）。
@@ -1116,7 +1348,7 @@ mod tests {
         );
 
         // ② 收到心跳 → 对端还活着 → 沉默没超过 stuck_after → **不判死**（H2 要的就是这一格）
-        assert!(reg.heartbeat_if_same("slow-but-alive", alive_id));
+        assert!(reg.heartbeat_if_same("slow-but-alive", IP, alive_id));
         let alive = HeadSilence {
             window: Duration::from_millis(1),
             peer_alive_window: Duration::from_secs(15),

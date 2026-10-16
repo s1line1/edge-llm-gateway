@@ -97,15 +97,20 @@ impl Registry {
         // 关闭连接与 spawn 调度一律留到锁外——`tokio::spawn` 若在守卫内 panic，守卫会在
         // unwind 中释放 → 锁**永久中毒**，之后每一次 register/heartbeat/选路都跟着 panic
         // （评估 §5 H3）。这条纪律对 `register` 同样适用。
-        let (agent_id, entry, n, inflight) = {
+        #[allow(clippy::type_complexity)]
+        let (_key, agent_id, peer_ip, entry, n, inflight) = {
             let mut inner = write_or_recover(&self.inner);
             let hit = inner
                 .iter()
                 .find(|(_, e)| e.stable_id == stable_id)
                 .map(|(k, e)| (k.clone(), e.clone()));
-            let Some((agent_id, entry)) = hit else {
+            let Some((key, entry)) = hit else {
                 return EvictOutcome::NotFound;
             };
+            // 日志里说的是**节点身份**（id + 来源 IP）：同名两个节点并存时，只打 id 无法区分
+            // 是哪一条被摘除。
+            let agent_id = key.agent_id.clone();
+            let peer_ip = key.peer_ip;
             let strikes = match cause {
                 EvictCause::OpenTimeout => &entry.open_timeouts,
                 EvictCause::HeadTimeout => &entry.head_timeouts,
@@ -115,6 +120,7 @@ impl Registry {
             if n < Self::TUNNEL_TIMEOUTS_BEFORE_EVICT {
                 warn!(
                     agent = %agent_id,
+                    ip = %peer_ip,
                     consecutive = n,
                     threshold = Self::TUNNEL_TIMEOUTS_BEFORE_EVICT,
                     cause = ?cause,
@@ -124,9 +130,9 @@ impl Registry {
             }
 
             // ① 先移出路由：后续请求不会再选中它（这一步与关闭时机无关）。
-            inner.remove(&agent_id);
+            inner.remove(&key);
             let inflight = entry.inflight.load(Ordering::Relaxed);
-            (agent_id, entry, n, inflight)
+            (key, agent_id, peer_ip, entry, n, inflight)
         };
 
         // ② 再决定何时关闭连接。**不能立刻关**：这条连接上往往还有别的在途请求，
@@ -144,6 +150,7 @@ impl Registry {
             entry.conn.close(0u32.into());
             warn!(
                 agent = %agent_id,
+                ip = %peer_ip,
                 consecutive = n,
                 cause = ?cause,
                 "agent evicted (repeated tunnel failures); closing connection so one side notices"
@@ -152,6 +159,7 @@ impl Registry {
         } else {
             warn!(
                 agent = %agent_id,
+                ip = %peer_ip,
                 consecutive = n,
                 inflight,
                 grace_secs = close_grace.as_secs(),

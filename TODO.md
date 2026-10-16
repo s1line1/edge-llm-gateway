@@ -1836,10 +1836,10 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       （`crates/gateway/src/registry/routing.rs:38` 的 `pick`：精确优先 → 通配兜底 → 取 `inflight`
       最小者），node 内部怎么分它看不见、也不需要看见 ⇒ **协议 / 网关 / 注册表 / 准入 /
       `/v1/models` 聚合全部零改动**（`Heartbeat.inflight` 那个空洞也不必为它而补：网关拿到它
-      只打一条 debug 日志，`crates/gateway/src/quic.rs:179`）。
+      只打一条 debug 日志，`crates/gateway/src/quic.rs:216`）。
       **改动形状**：`upstream` 允许是**一组** `{origin, models}`（字符串继续合法，向后兼容）；
       agent 按请求 `model` 筛候选 → 取在途最少 → 转发；**本地熔断**沿用「同一原因连续 N 次」
-      的既有纪律（同 `crates/gateway/src/registry/table.rs:191` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），
+      的既有纪律（同 `crates/gateway/src/registry/table.rs:317` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），
       但**判据是连接级失败，不是上游 404**——404 的意思是"这个模型不存在"，误当"后端坏"会熔断
       一个健康后端。
       **本机闸门按后端各一个**（今天是**一个全局** `Semaphore`，`crates/agent/src/lib.rs:280`
