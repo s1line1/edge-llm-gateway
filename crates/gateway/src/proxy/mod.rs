@@ -98,13 +98,15 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     // 读请求体：停滞/超限/读失败各自有明确状态码，且**都会归还准入票据**（随本函数返回而
     // Drop）——这正是修掉"槽位永久泄漏"的地方。
     let body =
-        match read_body_with_stall(req.into_body(), state.client_stall, MAX_REQUEST_BODY).await {
+        match read_body_with_stall(req.into_body(), state.policy.client_stall, MAX_REQUEST_BODY)
+            .await
+        {
             BodyRead::Body(b) => b,
             BodyRead::Stalled => {
                 state.metrics.record_client_stall("request-body");
                 warn!(
                 request_id,
-                stall_ms = state.client_stall.as_millis(),
+                stall_ms = state.policy.client_stall.as_millis(),
                 "client stalled while sending the request body; dropping the request and its slot"
             );
                 return error_response(
@@ -180,9 +182,9 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     // slot 守卫随任务结束释放，期间该请求计入 agent 在途并发。
     // usage 收集：提取上游 usage；无 usage（估算/取消/断流）→ 估算降级。
     let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(32);
-    let idle = state.timeout;
-    let op_timeout = state.tunnel_op_timeout;
-    let state_client_stall = state.client_stall;
+    let idle = state.policy.request_timeout;
+    let op_timeout = state.policy.tunnel_op_timeout;
+    let state_client_stall = state.policy.client_stall;
     let metrics = state.metrics.clone();
     let store = state.store.clone();
     // 关闭阶段的接收端：`Terminating` 时这条流要带一个明确事件收尾（见 `forward.rs`）。

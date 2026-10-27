@@ -232,7 +232,7 @@ pub struct FrameReader<R> {
 
 - 帧的 body/chunk 字段**从第一天就用 `Bytes`**，不用 `Vec<u8>`；
 - 解出载荷后用 `buf.split_to(n)` 切分，而不是 `to_vec()` 再让反序列化分配一次；
-- 现有项目 `Bytes::from(chunk.clone())`（`proxy/mod.rs:419`）是**纯浪费**——
+- 现有项目 `Bytes::from(chunk.clone())`（`proxy/mod.rs`，基线 `745e8e8`）是**纯浪费**——
   `chunk` 已是解构出的所有权值，直接 `Bytes::from(chunk)` 即可
   （注意别破坏后面 `usage.observe(&chunk)` 的顺序）；
 - agent 侧 `bytes.to_vec()`（从 reqwest 的 `Bytes` 拷进 `Vec`）同样可免。

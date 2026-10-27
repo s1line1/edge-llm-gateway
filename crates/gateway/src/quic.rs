@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use crate::registry::Registry;
-use crate::state::{self, ShutdownPhase};
+use crate::shutdown::{self, ShutdownPhase};
 
 /// `stream_ceiling` = 每条连接允许的在途隧道流数（见 `Options::max_open_tunnel_streams`）。
 /// 它只用于**注册时的一致性告警**：agent 声明的 `max_concurrency` 超过这个额度时，网关侧
@@ -48,7 +48,7 @@ pub async fn accept_loop(
         // （见 `Gateway::shutdown`）。这里 `return` 而不是 `break`：下面那条 `error!` 说的是
         // "端点失效"这种真实故障，drop 关停走这里，不该被报成故障。
         let accepted = tokio::select! {
-            _ = state::until_gateway_is_gone(&mut shutdown) => {
+            _ = shutdown::wait_closed(&mut shutdown) => {
                 debug!("the gateway is gone; the tunnel entry stops accepting new agents");
                 return;
             }
@@ -60,7 +60,7 @@ pub async fn accept_loop(
         let registry = registry.clone();
         let metrics = metrics.clone();
         // 每条 agent 连接一个接收端：网关对象被 drop（通道关闭）时放弃这条连接。
-        // 与 HTTP 入口同一个信号，见 `state::until_gateway_is_gone`。
+        // 与 HTTP 入口同一个信号，见 `shutdown::wait_closed`。
         let mut conn_shutdown = shutdown.clone();
 
         let remote = match conn.remote_addr() {
@@ -85,7 +85,7 @@ pub async fn accept_loop(
             tokio::select! {
                 // 硬停（复扫 D5）：`drop(Gateway)` 之后不再服务这条 agent 连接。注册表条目与
                 // `hlmg_agents` 随上面两处守卫在本任务结束时收尾。
-                _ = state::until_gateway_is_gone(&mut conn_shutdown) => {
+                _ = shutdown::wait_closed(&mut conn_shutdown) => {
                     debug!(%remote, "gateway dropped; closing an agent connection");
                 }
                 _ = handle => {}

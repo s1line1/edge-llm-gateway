@@ -298,7 +298,7 @@ mod tests {
     async fn concurrent_request_limit_rejects_with_429() {
         // max_concurrent_requests=1：先人为占住 1 个在途 → 第二个请求 429
         let mut state = test_state(None);
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let metrics = state.metrics.clone();
         let router = app(state);
 
@@ -359,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn healthz_is_exempt_from_the_admission_gate() {
         let mut state = test_state(None);
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let metrics = state.metrics.clone();
         let router = app(state);
 
@@ -509,7 +509,7 @@ mod tests {
     async fn an_aborted_request_is_counted_so_the_zombie_identity_holds() {
         let mut state = test_state(None);
         state.admin_token = Some("admin".into());
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let router = app(state.clone());
 
         // 5ms 放弃 vs `/admin/keys` 里的真 argon2（10–30ms，本模块不装 CheapArgon2）：
@@ -555,7 +555,7 @@ mod tests {
     async fn aborted_request_does_not_leak_concurrency_slot() {
         let mut state = test_state(None);
         state.admin_token = Some("admin".into());
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let router = app(state);
 
         // /admin/keys 的 handler 会 parked 在 spawn_blocking(argon2)（约 10-30ms），

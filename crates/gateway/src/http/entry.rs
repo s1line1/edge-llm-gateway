@@ -33,7 +33,7 @@ use tracing::{debug, info, warn};
 use crate::{
     io_stall,
     metrics::Metrics,
-    state::{self, ShutdownPhase},
+    shutdown::{self, ShutdownPhase},
 };
 
 /// accept 失败后的首次退避。
@@ -218,7 +218,7 @@ async fn serve_entry<S>(
         let acceptor = acceptor.clone();
         let app = app.clone();
         // 每条连接一个接收端（`clone()`，不动 accept 循环自己那个）：网关对象被 drop 时
-        // 硬停这条连接。见 `state::until_gateway_is_gone`——**只认通道关闭**，阶段推进不算。
+        // 硬停这条连接。见 `shutdown::wait_closed`——**只认通道关闭**，阶段推进不算。
         let mut conn_shutdown = shutdown.clone();
         tokio::spawn(async move {
             // 额度随这个任务存活：响应写完 / 停滞超时 / 握手失败才归还。
@@ -247,7 +247,7 @@ async fn serve_entry<S>(
             tokio::select! {
                 // 硬停（复扫 D5）：`drop(Gateway)` 之后这条连接没有继续存在的理由。
                 // 覆盖握手阶段——否则半开连接同样要挂到 `client_stall`（默认 60s）。
-                _ = state::until_gateway_is_gone(&mut conn_shutdown) => {
+                _ = shutdown::wait_closed(&mut conn_shutdown) => {
                     debug!(%peer, "gateway dropped; closing an accepted connection");
                 }
                 _ = serve => {}

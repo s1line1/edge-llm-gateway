@@ -26,7 +26,7 @@ use proto::{io::FrameReader, Frame};
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
-use crate::state::ShutdownPhase;
+use crate::shutdown::ShutdownPhase;
 
 use super::tunnel::tunnel_cancel;
 use super::usage::UsageCollector;

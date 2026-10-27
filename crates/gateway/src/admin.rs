@@ -205,7 +205,7 @@ pub async fn delete_key(
 
 /// 列出在线 agent 明细（注册表快照，按 agent_id 排序）。
 pub async fn list_agents(State(state): State<AppState>) -> Json<Vec<crate::registry::AgentInfo>> {
-    Json(state.registry.snapshot(state.agent_stale_after))
+    Json(state.registry.snapshot(state.policy.agent_stale_after))
 }
 
 #[cfg(test)]
@@ -224,7 +224,7 @@ mod tests {
             head_timeout: Duration::from_secs(5),
             ..Options::default()
         };
-        AppState::new(
+        AppState::new_for_test(
             Registry::default(),
             Storage::new(None),
             Metrics::default(),
@@ -241,7 +241,7 @@ mod tests {
             head_timeout: Duration::from_secs(5),
             ..Options::default()
         };
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Registry::default(),
             Storage::new(Some(path.clone())),
             Metrics::default(),
@@ -410,7 +410,7 @@ mod tests {
             head_timeout: Duration::from_secs(5),
             ..Options::default()
         };
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Registry::default(),
             Storage::new(None),
             Metrics::default(),
@@ -546,7 +546,7 @@ mod tests {
             admin_token: Some("  admin-token  ".into()),
             ..Options::default()
         };
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Registry::default(),
             Storage::new(None),
             Metrics::default(),

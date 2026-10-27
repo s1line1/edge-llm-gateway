@@ -62,9 +62,10 @@ pub(super) async fn open_and_send(
     let mut last_failure: Option<String> = None;
 
     let (entry, slot, recv, send) = loop {
-        let acquired = state
-            .registry
-            .try_acquire_excluding(state.agent_stale_after, model, &tried);
+        let acquired =
+            state
+                .registry
+                .try_acquire_excluding(state.policy.agent_stale_after, model, &tried);
         let (mut entry, slot) = match acquired {
             Ok(x) => x,
             // 三种拒绝**必须分开记录**：它们的运维含义完全不同，而客户端看到的
@@ -76,7 +77,7 @@ pub(super) async fn open_and_send(
                 | AcquireError::AtCapacity
                 | AcquireError::AllExcluded),
             ) => {
-                let st = state.registry.status(state.agent_stale_after);
+                let st = state.registry.status(state.policy.agent_stale_after);
                 let (why, status, message) = rejection_response(reason, st.registered);
                 state.metrics.record_agent_rejection(why);
                 warn!(
@@ -84,7 +85,7 @@ pub(super) async fn open_and_send(
                     reason = why,
                     registered = st.registered,
                     healthy = st.healthy,
-                    stale_after_secs = state.agent_stale_after.as_secs(),
+                    stale_after_secs = state.policy.agent_stale_after.as_secs(),
                     oldest_last_seen_secs = st.oldest_last_seen_ago.map(|d| d.as_secs()),
                     "no agent to route to"
                 );
@@ -107,7 +108,7 @@ pub(super) async fn open_and_send(
         // 记下本次选中的连接：重试时不会再选它（否则重试没有意义）。
         tried.push(entry.stable_id());
 
-        let stream = match open_tunnel(&mut entry, state.tunnel_op_timeout).await {
+        let stream = match open_tunnel(&mut entry, state.policy.tunnel_op_timeout).await {
             Ok(s) => s,
             Err(failure) => {
                 // 开流超时有两种成因，**不能用同一个动作处置**：
@@ -129,14 +130,14 @@ pub(super) async fn open_and_send(
                 let disposition = match &failure {
                     OpenFailure::TimedOut => state.registry.report_open_timeout(
                         &entry,
-                        state.max_open_tunnel_streams,
-                        state.evict_close_grace,
+                        state.policy.max_open_tunnel_streams,
+                        state.policy.evict_close_grace,
                     ),
                     // 直接失败：连接确实不能用了，没有"忙"这一说。
                     OpenFailure::Failed(_) => {
                         state
                             .registry
-                            .report_open_failed(&entry, state.evict_close_grace);
+                            .report_open_failed(&entry, state.policy.evict_close_grace);
                         Disposition::Fatal
                     }
                 };
@@ -149,15 +150,15 @@ pub(super) async fn open_and_send(
                         agent = %entry.agent_id(),
                         inflight = entry.inflight(),
                         max_concurrency = entry.max_concurrency(),
-                        stream_ceiling = state.max_open_tunnel_streams,
-                        timeout_ms = state.tunnel_op_timeout.as_millis(),
+                        stream_ceiling = state.policy.max_open_tunnel_streams,
+                        timeout_ms = state.policy.tunnel_op_timeout.as_millis(),
                         "tunnel open timed out while agent is at capacity; not evicting, trying another agent"
                     );
                 } else {
                     state.metrics.record_tunnel_open_timeout("dead");
                     warn!(
                         agent = %entry.agent_id(),
-                        timeout_ms = state.tunnel_op_timeout.as_millis(),
+                        timeout_ms = state.policy.tunnel_op_timeout.as_millis(),
                         "tunnel open timed out; evicting agent"
                     );
                     // 条目已由上面的 report_* 记过一笔（连续次数足够时才会真摘），
@@ -200,7 +201,7 @@ pub(super) async fn open_and_send(
         if let Err(failure) = tunnel_write(
             &mut send,
             request,
-            state.tunnel_op_timeout,
+            state.policy.tunnel_op_timeout,
             request_id,
             entry.agent_id(),
         )
@@ -213,7 +214,7 @@ pub(super) async fn open_and_send(
             if failure.is_tunnel_broken() {
                 state
                     .registry
-                    .report_write_failed(&entry, state.evict_close_grace);
+                    .report_write_failed(&entry, state.policy.evict_close_grace);
             }
             let e = failure.message();
             if tried.len() >= MAX_TUNNEL_ATTEMPTS {

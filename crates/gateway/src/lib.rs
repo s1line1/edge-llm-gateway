@@ -22,6 +22,7 @@ pub mod quic;
 pub mod ratelimit;
 pub mod registry;
 mod request_id;
+mod shutdown;
 pub mod state;
 pub mod storage;
 mod sync;

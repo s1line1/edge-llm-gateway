@@ -114,7 +114,7 @@ pub(super) async fn admission_middleware(
     // /metrics 是第三种（复扫 A8）：自己的域 + 自己的上限，且**只领额度、不算一次请求**
     // （`try_enter_uncounted`）——它不走 id/访问日志/状态码那条链，记账会让
     // `request_count − Σ状态码 − aborted` 每次抓取各漂移 +1。
-    let (domain, limit) = admission_domain(&path, state.max_concurrent_requests);
+    let (domain, limit) = admission_domain(&path, state.policy.max_concurrent_requests);
     let ticket = if domain == AdmissionDomain::Scrape {
         state.metrics.try_enter_uncounted(limit, domain)
     } else {
@@ -181,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn a_gate_rejection_still_echoes_the_client_request_id() {
         let mut state = test_state(None);
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let metrics = state.metrics.clone();
         let router = app(state);
 
@@ -256,7 +256,7 @@ mod tests {
         use tower::ServiceExt;
 
         let mut state = test_state(None);
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let metrics = state.metrics.clone();
         let router = app(state);
 

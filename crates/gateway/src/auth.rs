@@ -143,7 +143,7 @@ mod tests {
         };
         let store = Storage::new(None);
         let created = store.create("p2-19".into()).expect("建 key 应当成功");
-        let state = AppState::new(Registry::default(), store, Metrics::default(), &opts);
+        let state = AppState::new_for_test(Registry::default(), store, Metrics::default(), &opts);
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -234,7 +234,7 @@ mod tests {
     async fn the_bearer_scheme_is_case_insensitive_and_spacing_tolerant() {
         let store = Storage::new(None);
         let created = store.create("p3-17".into()).expect("建 key 应当成功");
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Registry::default(),
             store,
             Metrics::default(),
@@ -270,7 +270,7 @@ mod tests {
     async fn a_non_bearer_scheme_is_still_rejected() {
         let store = Storage::new(None);
         let created = store.create("p3-17-neg".into()).expect("建 key 应当成功");
-        let state = AppState::new(
+        let state = AppState::new_for_test(
             Registry::default(),
             store,
             Metrics::default(),

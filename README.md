@@ -12,7 +12,7 @@
 任何地方用标准的 OpenAI SDK 调它，同时**不把本地推理端点直接暴露到公网**。
 
 <p align="center">
-  <img alt="测试" src="https://img.shields.io/badge/tests-384%20passed-brightgreen">
+  <img alt="测试" src="https://img.shields.io/badge/tests-387%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -302,7 +302,7 @@ fmt · clippy -D warnings · cargo deny · nextest · web-format · web-lint · 
 web-build · toolchain-check · check-records
 ```
 
-> **当前规模（`cargo nextest run --workspace` 实测）**：**384 个被执行且通过的测试（0 skipped）**，其中
+> **当前规模（`cargo nextest run --workspace` 实测）**：**387 个被执行且通过的测试（0 skipped）**，其中
 > **70 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
 >
 > 两点与 `cargo test` 不同的行为要知道：**nextest 每条测试一个进程**，所以 `serial_test` 的

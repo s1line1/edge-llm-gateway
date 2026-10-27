@@ -22,7 +22,7 @@ pub(super) fn test_state(ui: Option<PathBuf>) -> AppState {
         ui_dir: ui,
         ..Options::default()
     };
-    let state = AppState::new(
+    let state = AppState::new_for_test(
         Registry::default(),
         Storage::new(None),
         Metrics::default(),

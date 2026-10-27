@@ -54,8 +54,9 @@ crates/proto/src/headers.rs  逐跳头过滤（gateway/agent 共享）
 **跟着一条 SSE 请求走完全程**，按此顺序：
 
 ```
-① gateway/src/main.rs → config.rs → gateway.rs
-   配置加载（config.rs）→ Gateway::start 组装（HTTP + QUIC + keystore + registry + 优雅关闭）
+① gateway/src/main.rs → config.rs → gateway.rs → shutdown.rs
+   配置加载（config.rs）→ Gateway::start 组装（HTTP + QUIC + keystore + registry + 优雅关闭）；
+   关闭阶段（唯一发送端、单向推进、排空/收尾窗口）在 shutdown.rs
 ② gateway/src/http/mod.rs
    路由、中间件、SPA fallback（/v1/* 怎么进到 proxy）
 ③ gateway/src/proxy/mod.rs            ★ 最重要
