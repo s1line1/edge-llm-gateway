@@ -7,52 +7,12 @@
 //! 读写路径全部由 `storage/mod.rs`（凭据）与 `storage/usage.rs`（账本）持有；
 //! 本模块只提供表定义与装载/迁移函数，不持有任何状态。
 
-use std::{collections::HashMap, path::PathBuf};
+use std::collections::HashMap;
 
 use rusqlite::Connection;
 
 use super::hash::{hash_argon2, lookup_of};
 use super::KeyRecord;
-
-/// 把库文件**及其 WAL 侧车**权限收紧到 `0600`（评估 §7 步骤 6 / P3-7；复扫 C2-1）。
-///
-/// 库文件是按调用方 umask 创建的（常见 0644），而它通常放在 `/etc/home-llm-gateway/`
-/// 下（`DEPLOY.md` 的目录清单）。库里只有 argon2 哈希与 sha256 lookup，属纵深防御；
-/// 但升级/拷贝过来的旧库往往仍是宽权限，所以**每次打开都收紧一次**。
-///
-/// **为什么连 `-wal`/`-shm` 一起收**：`-wal` 里是还没 checkpoint 回主库的页，与主库同级
-/// 敏感；而侧车平时是 0600 **只是因为** SQLite 建它时继承了主库刚设好的 mode——它们自己
-/// 从来没被 `chmod` 过。于是"从别处拷贝/迁移过来的旧库"会带着 0644 的侧车进来，而 SQLite
-/// 打开时会**复用**一份还含有效帧的 WAL（不是删掉重建），宽权限就留了下来。所以三个路径都
-/// 显式收一遍：已存在的当场收口，之后 SQLite 新建的侧车继续继承已经收好的主库 mode。
-///
-/// 失败只告警：只读挂载或某些文件系统不支持 `chmod` 不该让网关起不来。
-#[cfg(unix)]
-pub(super) fn tighten_db_to_owner(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    // 主库 + 两个 SQLite 侧车：`-wal`（预写日志）、`-shm`（共享内存索引）。
-    let mut targets = vec![path.to_path_buf()];
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar = path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        targets.push(PathBuf::from(sidecar));
-    }
-    for target in targets {
-        match std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)) {
-            Ok(()) => {}
-            // 侧车不一定存在（WAL 尚未启用，或已 checkpoint 清理过）——这不是错误。
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(
-                path = %target.display(),
-                "sqlite: cannot tighten to 0600 (non-fatal): {e}"
-            ),
-        }
-    }
-}
-
-/// 非 unix 平台没有 `0600` 这个语义（Windows 的 ACL 不按位表示），保持原样。
-#[cfg(not(unix))]
-pub(super) fn tighten_db_to_owner(_path: &std::path::Path) {}
 
 pub(super) const API_KEY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS api_keys (
     id TEXT PRIMARY KEY,

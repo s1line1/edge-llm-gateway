@@ -12,6 +12,7 @@ use crate::registry::routing::pick;
 use rcgen::{CertificateParams, KeyPair};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::IpAddr;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// 测试用的日志捕获：断言"这一条 warn 到底有没有打"。

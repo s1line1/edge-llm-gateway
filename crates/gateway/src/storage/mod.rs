@@ -45,12 +45,10 @@ pub use usage::{KeyUsageInfo, UsageDelta};
 use crate::storage::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
 use crate::sync::{lock_or_recover, read_or_recover, write_or_recover};
 
+mod db;
 mod schema;
 
-use schema::{
-    load_keys, migrate_legacy_keys, table_has_column, tighten_db_to_owner, API_KEY_SCHEMA,
-    USAGE_SCHEMA,
-};
+use schema::load_keys;
 
 #[derive(Clone)]
 pub struct Storage {
@@ -168,76 +166,10 @@ impl Storage {
     /// **吊销不依赖它**（版本/记录消失的校验在缓存之前），TTL 只决定"多久之后重新付一次
     /// argon2 的钱"。
     pub fn with_verified(file: Option<PathBuf>, max: usize, ttl: Duration) -> Self {
-        // `file` 为 None ⇒ 保持 None（内存模式是合法配置，不是故障）
-        let mut persistence: Option<Result<(), String>> = file.as_ref().map(|_| Ok(()));
-        let db = match &file {
-            Some(path) => match Connection::open(path) {
-                Ok(mut conn) => {
-                    // ① 权限先收紧：主库（刚被创建，或已存在）与**遗留的** `-wal`/`-shm`
-                    //    都以 0600 收口，不靠运维记得 `chmod`（见 `tighten_db_to_owner`）。
-                    tighten_db_to_owner(path);
-                    // ② 顺带做的持久化设置：WAL + synchronous=NORMAL。
-                    // 落库已经改成"按周期批量"，提交次数从每请求一次降到每周期一次；
-                    // 这两条让剩下的那几次提交不必每次都 fsync 主库（云端实测每次
-                    // 同步提交约 3.5ms）。journal_mode 是持久属性，设一次即可；
-                    // 失败只告警（例如文件系统不支持 WAL），不影响功能。
-                    if let Err(e) = conn.pragma_update(None, "journal_mode", "WAL") {
-                        tracing::warn!("sqlite: enable WAL failed (non-fatal): {e}");
-                    }
-                    if let Err(e) = conn.pragma_update(None, "synchronous", "NORMAL") {
-                        tracing::warn!("sqlite: set synchronous=NORMAL failed (non-fatal): {e}");
-                    }
-                    let init = (|| {
-                        conn.execute_batch(API_KEY_SCHEMA)?;
-                        conn.execute_batch(USAGE_SCHEMA)?;
-                        // 老库（无 cred_version 列）→ 补列；新库上 API_KEY_SCHEMA 已建好，这里跳过。
-                        if !table_has_column(&conn, "api_keys", "cred_version")? {
-                            conn.execute_batch(
-                                "ALTER TABLE api_keys ADD COLUMN cred_version INTEGER NOT NULL DEFAULT 1",
-                            )?;
-                        }
-                        Ok::<_, rusqlite::Error>(())
-                    })();
-                    match init {
-                        Ok(()) => {
-                            // 旧版库（明文 key 表，无 lookup 列）→ 无损迁移为 argon2 哈希
-                            match migrate_legacy_keys(&mut conn) {
-                                Ok(0) => {}
-                                Ok(n) => tracing::info!(
-                                    count = n,
-                                    "migrated legacy plaintext keys to argon2 hashes"
-                                ),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "keys db migration failed: {e}; using empty store"
-                                    );
-                                    persistence = Some(Err(format!(
-                                        "cannot migrate the legacy keys db {}: {e}",
-                                        path.display()
-                                    )));
-                                }
-                            }
-                            Some(conn)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "keys db {:?} init failed: {e}; using memory only",
-                                path
-                            );
-                            persistence =
-                                Some(Err(format!("cannot initialise {}: {e}", path.display())));
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("keys db {:?} open failed: {e}; using memory only", path);
-                    persistence = Some(Err(format!("cannot open {}: {e}", path.display())));
-                    None
-                }
-            },
-            None => None,
-        };
+        // 打开/收紧/建表/迁移都在 `db::open` 里；这里只把结果装进 `Storage`。
+        let opened = db::open(file.as_deref());
+        let mut persistence = opened.persistence;
+        let db = opened.conn;
         let runtime = match &db {
             Some(conn) => match load_keys(conn) {
                 Ok(map) => map,

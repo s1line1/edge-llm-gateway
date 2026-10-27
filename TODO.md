@@ -994,7 +994,7 @@
 - [ ] **R10 总时长上限**：`timeout_secs`（120s）是响应体**逐帧空闲**超时，没有整请求总时限
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
 - [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
-      （`crates/gateway/src/metrics/mod.rs:529-533`）——"p99 变差"从求和值里看不出来。
+      （`crates/gateway/src/metrics/render.rs:119-124`）——"p99 变差"从求和值里看不出来。
 - [x] **R12 healthz 深度检查（2026-09-22 完成）**：`/healthz` 现在是真探针——
       **200 ⇔ 隧道入口仍在接受新 agent**（`hlmg_quic_accepting`），否则 `503` + `status:"degraded"`
       + `detail`（处置：重启网关）；body 改成 JSON，同时报 `agents.registered` /

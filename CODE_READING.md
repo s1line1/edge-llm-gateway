@@ -76,13 +76,14 @@ crates/proto/src/headers.rs  逐跳头过滤（gateway/agent 共享）
 ### 第 3 步：支撑模块（治理逻辑，1 小时）
 
 ```
-gateway/src/registry/    agent 注册表（table/entry/routing/eviction/admission 分工）
+gateway/src/registry/    agent 注册表（table/entry/routing/eviction/admission/keys 分工）
                           模型过滤/精确优先排序 + SlotGuard 并发占位（admission control）
-gateway/src/storage/       SQLite 存储 + argon2 哈希 + sha256 lookup 快速索引（+ hash.rs 哈希原语）
+gateway/src/storage/       SQLite 存储（db 打开/迁移 + schema + usage/verified）+ argon2 哈希
+                          + sha256 lookup 快速索引（+ hash.rs 哈希原语）
 gateway/src/admin.rs        Admin API（key 管理 + agents 列表 + usage 查询）
 gateway/src/usage_meter.rs        per-key token 用量提取 / 无 usage 时估算（纯函数，由 proxy 调用）
 gateway/src/ratelimit.rs    令牌桶
-gateway/src/metrics/mod.rs      Prometheus 指标（HTTP 层 + 隧道层）
+gateway/src/metrics/        Prometheus 指标：计数器/准入票据/文本渲染分工（mod/admission/render）
 gateway/src/error.rs        GatewayError（thiserror；anyhow 仍用于 config/quic/tls 与 agent 侧）
 gateway/src/tls.rs          mTLS 配置（动态信任根方向见 TODO P1 多 CA 方案）
 ```

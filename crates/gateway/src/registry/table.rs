@@ -1,11 +1,12 @@
-//! 注册表本身：`agent_id → Entry` 的增删查、快照、并发占位，以及绑定在连接上的摘除守卫。
+//! 注册表本身：`(agent_id, peer_ip) → Entry` 的增删查与快照，以及绑定在连接上的摘除守卫。
 //!
-//! 本模块只回答「谁在表里、它新鲜吗、还有额度吗」；**选路规则**在 [`super::routing`]、
-//! **失败记账与摘除**在 [`super::eviction`]——三者的变更理由不同（表几乎不变，路由随模型
-//! 匹配需求变，摘除策略随事故证据变）。
+//! 本模块只回答「谁在表里、它新鲜吗」；**选路规则**在 [`super::routing`]、**并发占位**在
+//! [`super::admission`]、**失败记账与摘除**在 [`super::eviction`]、**节点身份**在
+//! [`super::keys`]——各自的变更理由不同（表几乎不变，路由随模型匹配需求变，准入随并发
+//! 策略变，摘除策略随事故证据变）。
 
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
@@ -17,60 +18,9 @@ use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use super::entry::{is_fresh, now_millis, since_millis, Entry, NEVER};
-use super::routing::{pick, AcquireError};
-use super::{Registry, SlotGuard, NEXT_CONN_ID};
+use super::keys::{normalize_ip, AgentKey};
+use super::{Registry, NEXT_CONN_ID};
 use crate::sync::{read_or_recover, write_or_recover};
-
-/// 一个 agent-node 的身份：对端自报的 `agent_id` + **socket 上看到的来源 IP**。
-///
-/// **为什么键要含 IP**（2026-10-16 决策 D1）：原来键只有 `agent_id`，于是两台机器用同一个
-/// `agent_id` 时会互相顶替（后注册的立刻关掉先注册的），而"同一台机器重连"与"另一台机器
-/// 冒用同名"在网关看来完全一样。加上来源 IP 之后：**同 `(id, ip)` = 同一节点重连（接管）**，
-/// **同 `id` 不同 `ip` = 两个并存的节点**（各自独立路由）。
-///
-/// **不含端口**：每次重连源端口都会变，把它放进键等于让接管永不触发——注册表只增不减，
-/// 正是刚修完的幽灵条目换个入口重现。
-/// **IP 已归一**（[`normalize_ip`]）：v4-mapped IPv6 折叠成 IPv4，否则双栈监听下同一台
-/// 机器会因为"v4 连接看到 `127.0.0.1`、双栈连接看到 `::ffff:127.0.0.1`"被当成两个节点。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct AgentKey {
-    pub(crate) agent_id: String,
-    pub(crate) peer_ip: IpAddr,
-}
-
-impl AgentKey {
-    pub(crate) fn new(agent_id: &str, peer_ip: IpAddr) -> Self {
-        Self {
-            agent_id: agent_id.to_string(),
-            peer_ip: normalize_ip(peer_ip),
-        }
-    }
-}
-
-/// 把 socket 看到的对端地址归一成"裸 IP"。
-///
-/// 两步，各自都有非做不可的理由：
-/// 1. **剥端口**：重连必换源端口，带端口 = 接管永不触发（见 [`AgentKey`]）。
-/// 2. **v4-mapped IPv6 折叠**：双栈 socket（绑 `::`）对 IPv4 对端报的是
-///    `::ffff:a.b.c.d`。不折叠时同一台机器在"v4 监听"与"双栈监听"下拿到两个不同的 IP，
-///    于是被当成**两个并存节点**（D1 的误判形态，而不是安全退化）。
-///
-/// 归一**只此一处**：`/admin/agents` 的 `ip` 字符串也走它，避免"键里归一、展示里没归一"
-/// 的劈叉。纯函数，好单测。
-pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6(v6),
-        },
-        v4 => v4,
-    }
-}
-
-/// 从 `SocketAddr` 取归一后的 IP（注册与心跳的唯一入口）。
-pub(crate) fn normalize_socket_addr(addr: SocketAddr) -> IpAddr {
-    normalize_ip(addr.ip())
-}
 
 /// agent 明细快照（供 /admin/agents 管理接口序列化）。
 #[derive(Debug, Clone, Serialize)]
@@ -549,76 +499,6 @@ impl Registry {
         out.sort();
         out.dedup();
         out
-    }
-}
-
-impl Registry {
-    /// 在**能服务指定模型**的健康 agent 中挑选一个并原子占用并发槽位；
-    /// 返回的 [`SlotGuard`] 期间该请求计入在途数。
-    ///
-    /// 模型匹配语义：agent 声明的 `models` 含 `"*"`（全匹配/兜底）或含 `model`。
-    /// 优先级：**精确声明该模型者优先于仅 `*` 通配者**（通配是兜底，不抢单）；
-    /// 同级内按负载最轻优先，同等负载取最近心跳者（多 agent 均衡）。
-    ///
-    /// **生产路径走的是 [`Self::try_acquire_excluding`]**：`routing.rs` 总要把"刚失败的那条
-    /// 连接"排除掉（否则重试没有意义），所以本方法在 `crates/gateway/src` 里没有调用者。
-    /// 它是**单测的便利入口**（24 处调用，省掉一个 `&[]`），因此收进 `#[cfg(test)]`：
-    /// 不进非测试构建，也不占 `Registry` 的公开 API（评估 §7 步骤 6 的"死 API"清理）。
-    #[cfg(test)]
-    pub fn try_acquire(
-        &self,
-        stale_after: Duration,
-        model: &str,
-    ) -> Result<(Entry, SlotGuard), AcquireError> {
-        self.try_acquire_excluding(stale_after, model, &[])
-    }
-
-    /// 同 `try_acquire`（测试便利入口，见下），但**跳过 `exclude` 里列出的连接**（按 `stable_id`）。
-    ///
-    /// 用于"换一个 agent 重试"：刚失败的那条连接不该再被选中（否则重试没有意义）。
-    pub fn try_acquire_excluding(
-        &self,
-        stale_after: Duration,
-        model: &str,
-        exclude: &[usize],
-    ) -> Result<(Entry, SlotGuard), AcquireError> {
-        let inner = read_or_recover(&self.inner);
-        // 规则全在 [`pick`] 里（纯函数）：这里只负责"按序号占位、占不到就换下一个"。
-        let candidates = pick(inner.values(), now_millis(), stale_after, model, exclude)?;
-        for candidate in candidates {
-            let entry = candidate.clone();
-            // `max_concurrency == 0` = 不限：**不做上限判定**，但自增必须照做。
-            // `inflight` 不只是准入闸门，它同时是另外三处的输入：开流超时的忙/死判据
-            // （[`Entry::open_timeout_is_fatal`]，`0` 时以端点流额度为上限）、摘除时
-            // "是否还有别人在途"（[`Registry::evict`] 的 `inflight <= 1`）、以及下面
-            // `sort_by_key` 的负载排序键。
-            //
-            // 曾经写成 `entry.max_concurrency == 0 || …fetch_update(…)`：短路使"不增"，
-            // 而 `SlotGuard::drop` 仍然"减" → `AtomicU32` 下溢回绕成 4294967295。
-            // 后果是开流判据对该连接永久失效、每次摘除都白等满宽限期、这台 agent 永远排
-            // 最后、`/admin/agents` 显示天文数字。回归测试：
-            // `max_concurrency_zero_always_acquires_and_still_counts_inflight`。
-            //
-            // 用 `try_update` 而不是 `fetch_update`：后者在 nightly 1.100.0 起被标记为
-            // `deprecated: renamed to try_update for consistency`（纯改名，签名与返回值
-            // 语义一致），`try_update` 在 stable 1.97.1 就有（见 `TODO.md` 的那条）。
-            let acquired = if entry.max_concurrency == 0 {
-                let _ = entry.inflight.fetch_add(1, Ordering::Relaxed);
-                true
-            } else {
-                entry
-                    .inflight
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        (n < entry.max_concurrency).then_some(n + 1)
-                    })
-                    .is_ok()
-            };
-            if acquired {
-                let guard = SlotGuard(entry.inflight.clone());
-                return Ok((entry, guard));
-            }
-        }
-        Err(AcquireError::AtCapacity)
     }
 }
 

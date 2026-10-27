@@ -177,11 +177,11 @@ fn peer_ip_is_normalised_port_stripped_and_v4_mapped_folded() {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     // ① 剥端口：同 IP 不同端口 → 同一个键
-    let a = super::table::normalize_socket_addr(SocketAddr::from((
+    let a = super::keys::normalize_socket_addr(SocketAddr::from((
         Ipv4Addr::new(203, 0, 113, 7),
         51234,
     )));
-    let b = super::table::normalize_socket_addr(SocketAddr::from((
+    let b = super::keys::normalize_socket_addr(SocketAddr::from((
         Ipv4Addr::new(203, 0, 113, 7),
         60000,
     )));
@@ -189,7 +189,7 @@ fn peer_ip_is_normalised_port_stripped_and_v4_mapped_folded() {
     assert_eq!(a, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
 
     // ② v4-mapped IPv6 → IPv4（双栈 socket 对 v4 对端就是这么报的）
-    let mapped = super::table::normalize_socket_addr(SocketAddr::new(
+    let mapped = super::keys::normalize_socket_addr(SocketAddr::new(
         IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0207)),
         51234,
     ));
@@ -200,7 +200,7 @@ fn peer_ip_is_normalised_port_stripped_and_v4_mapped_folded() {
     );
 
     // ③ 其余 IPv6 原样保留
-    let v6 = super::table::normalize_socket_addr(SocketAddr::new(
+    let v6 = super::keys::normalize_socket_addr(SocketAddr::new(
         IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
         51234,
     ));

@@ -1,20 +1,20 @@
 //! edge-agent 注册表：`agent_id → 连接 + 健康状态 + 并发占位`。
 //!
-//! **本文件只做组合**：类型与策略按变更理由分在四个子模块里——
-//! `entry`（条目与健康判据）、`routing`（选路规则）、`table`（表的增删查、快照与并发占位）、
-//! `eviction`（失败记账与摘除）——它们都是私有模块，公开路径仍是 `crate::registry::*`：
-//! 下面的 `pub use` 逐个把子模块里的名字提到本模块，调用方一处都不用改。
+//! **本文件只做组合**：类型与策略按变更理由分在子模块里——
+//! `entry`（条目与健康判据）、`routing`（选路规则）、`table`（表的增删查与快照）、
+//! `eviction`（失败记账与摘除）、`admission`（并发占位与 `SlotGuard`）、`keys`（节点身份与
+//! IP 归一）——它们都是私有模块，公开路径仍是 `crate::registry::*`：下面的 `pub use`
+//! 逐个把子模块里的名字提到本模块，调用方一处都不用改。
 
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
-        Arc, RwLock,
-    },
+    sync::{atomic::AtomicUsize, Arc, RwLock},
 };
 
+mod admission;
 mod entry;
 mod eviction;
+mod keys;
 mod routing;
 mod table;
 
@@ -22,10 +22,10 @@ pub use entry::{Entry, HeadSilence};
 pub use routing::{AcquireError, Disposition};
 pub use table::{AgentInfo, Registration, RegistryStatus};
 
-pub(crate) use table::MAX_REGISTRATIONS_PER_CONNECTION;
 /// 注册表的键类型（crate 内可见，**不是公开 API**）：对外只经 `/admin/agents` 的 `ip`
 /// 字符串暴露来源。`quic.rs` 要用它做心跳查找。
-pub(crate) use table::{normalize_socket_addr, AgentKey};
+pub(crate) use keys::{normalize_socket_addr, AgentKey};
+pub(crate) use table::MAX_REGISTRATIONS_PER_CONNECTION;
 
 /// 连接身份发号器：给每条注册进来的连接发一个**进程内唯一且永不复用**的编号。
 ///
@@ -53,14 +53,7 @@ pub struct Registry {
     inner: Arc<RwLock<HashMap<AgentKey, Entry>>>,
 }
 
-/// Drop 时自动归还并发槽位。
-pub struct SlotGuard(Arc<AtomicU32>);
-
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
+pub use admission::SlotGuard;
 
 #[cfg(test)]
 mod tests;

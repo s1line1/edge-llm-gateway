@@ -3,6 +3,8 @@
 //! 通过 `use super::*;` 拿到 `tests/mod.rs` 的共享导入。
 
 use super::*;
+
+use crate::storage::schema::table_has_column;
 #[test]
 fn corrupt_keys_db_ignored() {
     // 文件存在但不是合法 SQLite → 警告并当作空库
