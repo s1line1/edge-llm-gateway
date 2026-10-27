@@ -59,7 +59,7 @@ pub(super) enum SendOutcome {
 /// `Gateway::shutdown` 早返回了（并集报告 H5）。
 const SHUTDOWN_EVENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// 响应转发结束的方式。**十个出口各自的处置不同**（九个变体，`ClientGone` 在两处返回），
+/// 响应转发结束的方式。**十一个出口各自的处置不同**（十个变体，`ClientGone` 在两处返回），
 /// 以前它们只是散落的 `return`——
 /// 日志能看出差别，返回值看不出来。显式化之后：调用方拿到一个可匹配的结论，
 /// 而第 9 步要修的那个缺口（客户端断开却因上游静默而未察觉）就落在 `ClientGone` 上。
@@ -113,7 +113,7 @@ impl ForwardEnd {
 
 /// 转发任务的收尾守卫（复扫 B3）。
 ///
-/// **为什么需要一个 Drop 守卫**：`forward_body` 有十个**返回**出口（九个变体），而 panic 是另
+/// **为什么需要一个 Drop 守卫**：`forward_body` 有十一个**返回**出口（十个变体），而 panic 是另
 /// 一条路——它不走
 /// 任何一条返回路径。`tx` 会随栈展开被 drop，于是 `rx` 干净地结束，客户端拿到一份**看似完整的
 /// 200 截断体**（HTTP 层看不出少了东西），而 `record_forward_end` 只在正常返回后调用 ⇒ 指标里
