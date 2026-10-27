@@ -27,14 +27,13 @@ use std::{
 };
 
 use rusqlite::Connection;
-use serde::Serialize;
 
 // `now_secs` 只用于 `last_used_at`，与凭据表里的 `created_at` 同源（都在 `super::hash`）。
 use super::hash::now_secs;
 use crate::sync::{lock_or_recover, read_or_recover, write_or_recover};
 
-/// 每 key 的用量明细（/admin/usage 序列化用）。
-#[derive(Debug, Clone, Serialize)]
+/// 每 key 的用量明细（`/admin/usage` 组装 JSON 时用；这里不直接 derive Serialize）。
+#[derive(Debug, Clone)]
 pub struct KeyUsageInfo {
     pub key_id: String,
     /// key 名称快照（吊销后仍可审计名称）。

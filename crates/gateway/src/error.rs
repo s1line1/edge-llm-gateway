@@ -27,6 +27,7 @@ pub enum GatewayError {
     #[error("QUIC 端点启动失败: {0}")]
     QuicStart(#[from] s2n_quic::provider::StartError),
 
+    /// `listen.rs` 用 `?` 转换 s2n-quic 的 `Infallible`（该类型不可构造，因此分支不会发生）。
     #[error("不可达（Infallible 不可构造）")]
     Infallible(#[from] std::convert::Infallible),
 }
@@ -41,9 +42,4 @@ impl From<&str> for GatewayError {
     fn from(s: &str) -> Self {
         GatewayError::Other(s.to_string())
     }
-}
-
-/// 便捷构造（用于 config 校验等带上下文的错误）。
-pub fn config_err(msg: impl Into<String>) -> GatewayError {
-    GatewayError::Config(msg.into())
 }

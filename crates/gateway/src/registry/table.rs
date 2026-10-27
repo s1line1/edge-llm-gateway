@@ -158,7 +158,8 @@ impl Registry {
     ///
     /// `peer_ip` 是 **socket 上看到的**对端地址（调用方传 `Handle::remote_addr()` 的 IP），
     /// 不是帧里自报的——自报字段没有可信度。它经 [`normalize_ip`] 归一后参与键。
-    pub fn register(
+    #[cfg(test)]
+    pub(crate) fn register(
         &self,
         agent_id: String,
         peer_ip: IpAddr,
@@ -245,7 +246,6 @@ impl Registry {
                     conn,
                     stable_id,
                     agent_id,
-                    peer_ip,
                     models,
                     max_concurrency,
                     inflight,

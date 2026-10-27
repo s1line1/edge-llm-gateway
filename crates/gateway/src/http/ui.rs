@@ -16,6 +16,17 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::state::AppState;
 
+/// `Accept` 里是否明确接受 HTML（浏览器导航）。
+///
+/// 与 `api::metrics_route` 共用：`/metrics` 的浏览器访问要回 SPA，而 Prometheus 抓取
+/// （`Accept: */*`）必须回文本——两处必须用同一条判据。
+pub(super) fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"))
+}
+
 /// SPA fallback：浏览器导航（Accept: text/html）→ index.html；静态资源
 /// （带扩展名路径，如 /assets/*.js）→ 文件，**未命中就是 404**；其余（API 类未注册路径）→ 404。
 pub(super) async fn ui_fallback(
@@ -28,17 +39,8 @@ pub(super) async fn ui_fallback(
         .ui
         .as_ref()
         .expect("ui_fallback registered only when ui_dir is set");
-    let wants_html = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|a| a.contains("text/html"))
-        .unwrap_or(false);
-    let has_extension = uri
-        .path()
-        .rsplit('/')
-        .next()
-        .map(|seg| seg.contains('.'))
-        .unwrap_or(false);
+    let wants_html = wants_html(&headers);
+    let has_extension = crate::ui::looks_like_asset(uri.path());
     if !wants_html && !has_extension {
         // 统一错误格式：以前这里手搓的是 `type: "not_found"`，与 proxy 的
         // `not_found_error` 不是同一个语义名（同一个网关两种 404）。

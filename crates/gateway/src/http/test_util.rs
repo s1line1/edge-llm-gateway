@@ -1,6 +1,6 @@
 //! `http` 各子模块测试共用的辅助（只在 `cfg(test)` 下编译）。
 //!
-//! 单独成文件是因为测试随被测代码分散到了 `api.rs` / `ui.rs` / `middleware.rs`，
+//! 单独成文件是因为测试随被测代码分散到了 `api.rs` / `ui.rs` / `admission.rs` / `observability.rs`，
 //! 而"造一个测试用 `AppState`"是它们共同的前提。
 
 use std::path::PathBuf;

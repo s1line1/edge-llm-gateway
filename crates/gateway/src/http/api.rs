@@ -16,6 +16,8 @@ use serde_json::json;
 
 use crate::{auth, state::AppState};
 
+use super::ui::wants_html;
+
 /// 存活探针：状态码回答**唯一一个"探针还答得上、但实例已经没用"**的问题——
 /// 隧道入口是否还在接受新 agent（`hlmg_quic_accepting`）。
 ///
@@ -88,12 +90,7 @@ pub(super) async fn models_route(State(state): State<AppState>, headers: HeaderM
 /// 浏览器直接访问/刷新（`Accept: text/html`）时返回 SPA 页面，让前端路由渲染指标页；
 /// Prometheus 抓取与前端解析（`Accept: */*`）仍拿到文本。
 pub(super) async fn metrics_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let wants_html = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|a| a.contains("text/html"))
-        .unwrap_or(false);
-    if wants_html {
+    if wants_html(&headers) {
         // 走 `AppState` 里的缓存读（按 mtime 校验）：以前这里每次请求同步
         // `std::fs::read_to_string`，是在 async 上下文里做阻塞 I/O。
         if let Some(index) = &state.ui_index {

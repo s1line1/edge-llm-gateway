@@ -53,7 +53,7 @@ pub struct Registry {
     inner: Arc<RwLock<HashMap<AgentKey, Entry>>>,
 }
 
-pub use admission::SlotGuard;
+pub(crate) use admission::SlotGuard;
 
 #[cfg(test)]
 mod tests;

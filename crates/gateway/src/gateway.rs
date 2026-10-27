@@ -217,7 +217,7 @@ impl Gateway {
     /// 注册表里的条目数（**含心跳已过期、连接还没关的**）。
     ///
     /// 要"现在能被路由"的数量用 [`Self::healthy_agent_count`]：排查"所有请求 503"时
-    /// 两者必须分开看（见 `registry.rs` 的 `len` / `healthy_count`）。
+    /// 两者必须分开看（见 `registry/table.rs` 的 `len` / `healthy_count`）。
     pub fn agent_count(&self) -> usize {
         self.registry.len()
     }
@@ -376,9 +376,9 @@ impl Drop for Gateway {
     /// 订阅者看到关闭通道消失。tokio 里 drop `JoinHandle` 只是 **detach**，任务会继续跑
     /// （并集报告 §5-H2 实测：drop 之后端口仍可 connect），所以两件事都要做。
     ///
-    /// **通道消失是各派生任务共同的那个硬停信号**（复扫 D5）。发送端只有本结构持有
-    /// （`Gateway::start` 从 `AppState` 把它 `take()` 走了，见 `AppState::shutdown_sender`），
-    /// 所以本结构被 drop ⇒ 每个接收端的 `changed()` 得到 `Err`：
+    /// **通道消失是各派生任务共同的那个硬停信号**（复扫 D5）。发送端只由本结构的
+    /// `shutdown::Controller` 持有（`AppState` 只有接收端），所以本结构被 drop ⇒
+    /// 每个接收端的 `changed()` 得到 `Err`：
     /// - **在途转发任务**（`proxy/forward.rs`）把 `has_changed().is_err()` 当 `Terminating`，
     ///   于是给客户端写一个明确的"不完整"事件再收尾，而不是被硬切；
     /// - **每条 HTTP 连接任务**（`http/entry.rs`）在 `select!` 里等它，醒来即丢连接——

@@ -11,7 +11,6 @@
 use super::Registry;
 
 use std::{
-    net::IpAddr,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
@@ -37,12 +36,6 @@ pub struct Entry {
     /// 而隧道写超时后需要按 stable_id 把这条坏连接摘掉（内部走 `Registry::evict`），
     /// 所以 id 必须随条目一起带出来。
     pub(super) agent_id: String,
-    /// 这条连接在 socket 上看到的**来源 IP**（已归一，见 [`super::table::normalize_ip`]）。
-    ///
-    /// 与键 `(agent_id, peer_ip)` 里的那一份**同值**：键不参与 `Entry` 的克隆，而日志、
-    /// `/admin/agents` 与"IP 变动"判据都要在只有 `Entry` 的地方说出"它从哪来"，所以值里
-    /// 自带一份。**不含端口**：端口每次重连都会变，带上它会让接管永不触发。
-    pub(super) peer_ip: IpAddr,
     pub(super) models: Vec<String>,
     pub(super) max_concurrency: u32,
     /// 当前在途请求数（admission control）。
@@ -164,11 +157,6 @@ impl Entry {
     /// 注册时声明的 agent_id。
     pub fn agent_id(&self) -> &str {
         &self.agent_id
-    }
-
-    /// 这条连接看到的来源 IP（已归一、不含端口）。给日志与 `/admin/agents` 用。
-    pub fn peer_ip(&self) -> IpAddr {
-        self.peer_ip
     }
 
     /// agent 声明的并发上限（`0` = 不限）。只用于日志/展示。

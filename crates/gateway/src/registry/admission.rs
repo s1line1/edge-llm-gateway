@@ -17,7 +17,7 @@ use super::Registry;
 use crate::sync::read_or_recover;
 
 /// Drop 时自动归还并发槽位。
-pub struct SlotGuard(Arc<AtomicU32>);
+pub(crate) struct SlotGuard(Arc<AtomicU32>);
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
@@ -38,7 +38,7 @@ impl Registry {
     /// 它是**单测的便利入口**（24 处调用，省掉一个 `&[]`），因此收进 `#[cfg(test)]`：
     /// 不进非测试构建，也不占 `Registry` 的公开 API（评估 §7 步骤 6 的"死 API"清理）。
     #[cfg(test)]
-    pub fn try_acquire(
+    pub(crate) fn try_acquire(
         &self,
         stale_after: Duration,
         model: &str,
@@ -49,7 +49,7 @@ impl Registry {
     /// 同 `try_acquire`（测试便利入口，见下），但**跳过 `exclude` 里列出的连接**（按 `stable_id`）。
     ///
     /// 用于"换一个 agent 重试"：刚失败的那条连接不该再被选中（否则重试没有意义）。
-    pub fn try_acquire_excluding(
+    pub(crate) fn try_acquire_excluding(
         &self,
         stale_after: Duration,
         model: &str,
