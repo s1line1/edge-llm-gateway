@@ -1,12 +1,21 @@
-// API Keys 管理页：创建 / 列表 / 吊销 / 复制明文（登录由全局 RequireAuth 保证）。
+// API Keys：签发、查看与吊销调用方凭据。明文只在创建时出现一次。
 
-import { useCallback, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useState } from "react";
 
 import { createKey, deleteKey, listKeys } from "../api/client";
 import type { CreatedKey, KeyUsage } from "../api/types";
+import { Icon } from "../components/icons";
+import {
+  Badge,
+  Button,
+  EmptyState,
+  IconButton,
+  PageHeader,
+  Panel,
+  PanelHead,
+} from "../components/ui";
 import { useAdminToken } from "../hooks/useAdminToken";
-import { Button, Card, EmptyState } from "../components/ui";
 
 export default function Keys() {
   const token = useAdminToken();
@@ -14,6 +23,8 @@ export default function Keys() {
 
   const [name, setName] = useState("");
   const [created, setCreated] = useState<CreatedKey | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [search, setSearch] = useState("");
 
   const keysQuery = useQuery({
     queryKey: ["admin", "keys"],
@@ -36,20 +47,16 @@ export default function Keys() {
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "keys"] }),
   });
 
-  const [copied, setCopied] = useState(false);
-
   const copy = useCallback(async (text: string) => {
-    // 1) 现代 Clipboard API（仅 HTTPS/localhost 安全上下文可用）
     if (navigator.clipboard?.writeText) {
       try {
         await navigator.clipboard.writeText(text);
         setCopied(true);
         return;
       } catch {
-        // 权限拒绝等 → 走降级
+        // Permission denied: fall through to the legacy path.
       }
     }
-    // 2) 隐藏 textarea + execCommand('copy')：明文 HTTP 部署下可用
     try {
       const ta = document.createElement("textarea");
       ta.value = text;
@@ -65,135 +72,221 @@ export default function Keys() {
         return;
       }
     } catch {
-      // execCommand 不可用 → 弹窗手动复制
+      // Legacy clipboard unavailable: prompt for manual copy.
     }
     window.prompt("复制 API Key（剪贴板不可用，请手动复制）：", text);
   }, []);
 
+  const keys = (keysQuery.data ?? []).filter((k) => {
+    const needle = search.trim().toLowerCase();
+    if (!needle) return true;
+    return `${k.name} ${k.id} ${k.tenant_name ?? k.tenant_id ?? "default"}`
+      .toLowerCase()
+      .includes(needle);
+  });
+
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-lg font-semibold">API Keys 管理</h2>
-        <p className="text-sm text-slate-500">
-          所有 Key 持久化在网关 SQLite，仅存 argon2 哈希；明文只在创建时返回一次
-        </p>
+      <PageHeader
+        index="03"
+        eyebrow="CONTROL / CREDENTIALS"
+        title="API Keys"
+        description="每个客户端一枚独立凭据。Key 持久化在网关 SQLite，只保存 argon2 哈希，明文只在创建时返回一次。"
+        actions={
+          <>
+            <Badge tone="cyan">{keysQuery.data?.length ?? "—"} ISSUED</Badge>
+            <IconButton
+              icon="refresh"
+              label="刷新 Key 列表"
+              onClick={() => void keysQuery.refetch()}
+            />
+          </>
+        }
+      />
+
+      <div className="grid items-start gap-4 lg:grid-cols-[1.35fr_1fr]">
+        <Panel>
+          <PanelHead
+            eyebrow="ISSUE"
+            title="创建新 Key"
+            description="为每个客户端（DSH / Codex / 脚本）单独创建，便于独立吊销与计量。"
+          />
+          <div className="panel-body">
+            <form
+              className="flex flex-col gap-2 sm:flex-row"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (name.trim()) createMutation.mutate(name.trim());
+              }}
+            >
+              <label className="flex-1">
+                <span className="sr-only">Key 用途</span>
+                <input
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  maxLength={64}
+                  placeholder="用途，如 dsh-client"
+                  className="input"
+                />
+              </label>
+              <Button type="submit" disabled={!name.trim() || createMutation.isPending}>
+                <Icon name="plus" size={13} />
+                {createMutation.isPending ? "创建中…" : "创建 Key"}
+              </Button>
+            </form>
+            {createMutation.isError && (
+              <p className="mt-2 font-mono text-[10px] text-coral">
+                {createMutation.error.message}
+              </p>
+            )}
+
+            {created && (
+              <div className="mt-4 rounded-lg border border-signal/25 bg-signal/6 p-3">
+                <div className="flex items-center gap-2 text-[11px] font-medium text-signal">
+                  <Icon name="shield" size={13} />
+                  创建成功——明文仅显示这一次：
+                </div>
+                <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <code className="min-w-0 flex-1 break-all rounded border border-line bg-ink-950/60 px-2.5 py-2 font-mono text-[10px] leading-relaxed text-paper">
+                    {created.key}
+                  </code>
+                  <Button
+                    variant="secondary"
+                    onClick={() => {
+                      void copy(created.key);
+                      setTimeout(() => setCopied(false), 2000);
+                    }}
+                  >
+                    <Icon name={copied ? "check" : "copy"} size={12} />
+                    {copied ? "已复制" : "复制"}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        </Panel>
+
+        <Panel>
+          <PanelHead eyebrow="POLICY" title="凭据策略" description="网关不会替你保管明文。" />
+          <div className="panel-body space-y-3">
+            {[
+              ["STORAGE", "SQLite · argon2id hash"],
+              ["LOOKUP", "sha256 index · verified cache"],
+              ["REVOKE", "immediate · no TTL wait"],
+              ["SCOPE", "tenant-scoped routing"],
+            ].map(([label, value]) => (
+              <div
+                key={label}
+                className="flex items-start justify-between gap-3 border-b border-line-soft pb-3 last:border-0 last:pb-0"
+              >
+                <span className="font-mono text-[9px] tracking-[0.1em] text-mist-dim">{label}</span>
+                <span className="text-right font-mono text-[10px] text-mist">{value}</span>
+              </div>
+            ))}
+            <p className="pt-1 text-[10px] leading-relaxed text-mist-dim">
+              调用方凭据只留在客户端与网关之间，不会随隧道转发到上游模型。
+            </p>
+          </div>
+        </Panel>
       </div>
 
-      <Card title="创建新 Key" subtitle="为每个客户端（DSH / Codex / 脚本）单独创建">
-        <form
-          className="flex max-w-md gap-2"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (name.trim()) createMutation.mutate(name.trim());
-          }}
-        >
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            maxLength={64}
-            placeholder="用途，如 dsh-client"
-            className="flex-1 rounded-lg border border-slate-300 px-3 py-1.5 text-sm focus:border-slate-500 focus:outline-none"
-          />
-          <Button type="submit" disabled={!name.trim() || createMutation.isPending}>
-            {createMutation.isPending ? "创建中…" : "创建 Key"}
-          </Button>
-        </form>
-        {createMutation.isError && (
-          <p className="mt-2 text-xs text-rose-600">{createMutation.error.message}</p>
-        )}
-        {created && (
-          <div className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm">
-            <p className="font-medium text-emerald-800">创建成功——明文仅显示这一次：</p>
-            <div className="mt-1.5 flex items-center gap-2">
-              <code className="flex-1 break-all rounded bg-white px-2 py-1 font-mono text-xs">
-                {created.key}
-              </code>
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  void copy(created.key);
-                  setTimeout(() => setCopied(false), 2000);
-                }}
-              >
-                {copied ? "已复制 ✓" : "复制"}
-              </Button>
-            </div>
-          </div>
-        )}
-      </Card>
-
-      <Card title="已有 Keys" subtitle="吊销立即生效，不可恢复">
-        {deleteMutation.isError && (
-          <p className="mb-2 text-xs text-rose-600">
-            吊销失败：{deleteMutation.error.message}（这条 Key 仍然有效）
-          </p>
-        )}
-        {keysQuery.isPending ? (
-          <EmptyState text="加载中…" />
-        ) : keysQuery.isError ? (
-          <EmptyState text={`加载失败：${keysQuery.error.message}`} />
-        ) : keysQuery.data.length === 0 ? (
-          <EmptyState text="暂无动态 Key，先在上方创建一个" />
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
-              <thead>
-                <tr className="border-b border-slate-100 text-xs text-slate-500">
-                  <th className="pb-2 pr-4 font-medium">名称</th>
-                  <th className="pb-2 pr-4 font-medium">ID</th>
-                  <th className="pb-2 pr-4 font-medium">前缀</th>
-                  <th className="pb-2 pr-4 font-medium">用量（token）</th>
-                  <th className="pb-2 pr-4 font-medium">请求数</th>
-                  <th className="pb-2 pr-4 font-medium">创建时间</th>
-                  <th className="pb-2 pr-4 font-medium">状态</th>
-                  <th className="pb-2 font-medium" />
-                </tr>
-              </thead>
-              <tbody>
-                {keysQuery.data.map((k) => (
-                  <tr key={k.id} className="border-b border-slate-50 last:border-0">
-                    <td className="py-2.5 pr-4 font-medium text-slate-800">{k.name}</td>
-                    <td className="py-2.5 pr-4 font-mono text-xs text-slate-500">{k.id}</td>
-                    <td className="py-2.5 pr-4 font-mono text-xs text-slate-500">{k.prefix}</td>
-                    <td className="py-2.5 pr-4 text-slate-600">{formatTokens(k.usage)}</td>
-                    <td className="py-2.5 pr-4 text-slate-600">{k.usage.requests}</td>
-                    <td className="py-2.5 pr-4 text-slate-600">
-                      {new Date(k.created_at * 1000).toLocaleString()}
-                    </td>
-                    <td className="py-2.5 pr-4">
-                      <span
-                        className={`rounded-full px-2 py-0.5 text-xs font-medium ${k.enabled ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}
-                      >
-                        {k.enabled ? "启用" : "禁用"}
-                      </span>
-                    </td>
-                    <td className="py-2.5 text-right">
-                      <Button
-                        variant="danger"
-                        disabled={deleteMutation.isPending}
-                        onClick={() => {
-                          if (confirm(`吊销 Key「${k.name}」（${k.id}）？立即生效，不可恢复。`)) {
-                            deleteMutation.mutate(k.id);
-                          }
-                        }}
-                      >
-                        吊销
-                      </Button>
-                    </td>
+      <Panel>
+        <PanelHead
+          title="已有 Keys"
+          description="吊销立即生效，不可恢复"
+          right={
+            <label className="flex w-44 items-center gap-2 rounded-md border border-line bg-ink-950/45 px-2.5 py-1.5">
+              <Icon name="search" size={12} className="text-mist-dim" />
+              <span className="sr-only">搜索 Key</span>
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="搜索 name / id"
+                className="min-w-0 flex-1 bg-transparent font-mono text-[10px] text-paper outline-none placeholder:text-mist-dim"
+              />
+            </label>
+          }
+        />
+        <div className="panel-body">
+          {deleteMutation.isError && (
+            <p className="mb-3 rounded border border-coral/25 bg-coral/6 px-3 py-2 font-mono text-[10px] text-coral">
+              吊销失败：{deleteMutation.error.message}（这条 Key 仍然有效）
+            </p>
+          )}
+          {keysQuery.isPending ? (
+            <EmptyState title="加载中…" detail="正在读取凭据列表。" />
+          ) : keysQuery.isError ? (
+            <EmptyState title={`加载失败：${keysQuery.error.message}`} />
+          ) : (keysQuery.data ?? []).length === 0 ? (
+            <EmptyState
+              title="暂无动态 Key，先在上方创建一个"
+              detail="创建后把明文配置到客户端的 API key 字段。"
+              icon="key"
+            />
+          ) : keys.length === 0 ? (
+            <EmptyState title="没有匹配的 Key" detail="调整搜索词。" icon="search" />
+          ) : (
+            <div className="-mx-4 overflow-x-auto sm:mx-0">
+              <table className="data-table min-w-[860px]">
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>Tenant</th>
+                    <th>ID</th>
+                    <th>前缀</th>
+                    <th>用量（token）</th>
+                    <th>请求数</th>
+                    <th>创建时间</th>
+                    <th>状态</th>
+                    <th className="text-right">操作</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Card>
+                </thead>
+                <tbody>
+                  {keys.map((k) => (
+                    <tr key={k.id}>
+                      <td className="font-medium text-paper">{k.name}</td>
+                      <td>
+                        <Badge tone="cyan">{k.tenant_name ?? k.tenant_id ?? "default"}</Badge>
+                      </td>
+                      <td className="font-mono text-[10px] text-mist">{k.id}</td>
+                      <td className="font-mono text-[10px] text-mist">{k.prefix}</td>
+                      <td className="text-mist">{formatTokens(k.usage)}</td>
+                      <td className="font-mono tabular-nums text-mist">{k.usage.requests}</td>
+                      <td className="whitespace-nowrap text-[11px] text-mist">
+                        {new Date(k.created_at * 1000).toLocaleString()}
+                      </td>
+                      <td>
+                        <Badge tone={k.enabled ? "ok" : "default"}>
+                          {k.enabled ? "启用" : "禁用"}
+                        </Badge>
+                      </td>
+                      <td className="text-right">
+                        <Button
+                          variant="danger"
+                          disabled={deleteMutation.isPending}
+                          onClick={() => {
+                            if (confirm(`吊销 Key「${k.name}」（${k.id}）？立即生效，不可恢复。`)) {
+                              deleteMutation.mutate(k.id);
+                            }
+                          }}
+                        >
+                          吊销
+                        </Button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </Panel>
     </div>
   );
 }
 
-/** 用量列展示：主显总 token（大数易读），prompt/completion 明细放悬停提示。 */
 function formatTokens(u: KeyUsage) {
-  if (u.requests === 0) return <span className="text-slate-300">—</span>;
+  if (u.requests === 0) return <span className="text-mist-dim">—</span>;
   const est =
     u.estimated_requests > 0
       ? `（其中 ${u.estimated_requests} 次请求上游未提供 usage，按估算降级）`
@@ -205,7 +298,7 @@ function formatTokens(u: KeyUsage) {
     >
       {u.total_tokens.toLocaleString()}
       {u.estimated_requests > 0 && (
-        <span className="ml-1 text-amber-500" title="上游未提供 usage，按估算降级">
+        <span className="ml-1 text-amber" title="上游未提供 usage，按估算降级">
           ~
         </span>
       )}

@@ -16,6 +16,9 @@ export interface KeyUsage {
 export interface ApiKey {
   id: string;
   name: string;
+  /** 所属 tenant；旧网关不返回时按 default 展示。 */
+  tenant_id?: string;
+  tenant_name?: string;
   created_at: number;
   enabled: boolean;
   prefix: string;
@@ -26,6 +29,8 @@ export interface ApiKey {
 /** /admin/usage 的单条记录（含已吊销 key 的历史，可审计）。 */
 export interface UsageRecord {
   key_id: string;
+  /** 所属 tenant；旧数据迁入 default。 */
+  tenant_id?: string;
   name: string;
   prompt_tokens: number;
   completion_tokens: number;
@@ -50,6 +55,9 @@ export type HealthStatus = { ok: boolean; text: string };
  */
 export interface AgentInfo {
   agent_id: string;
+  /** 所属 tenant；旧网关不返回时按 default 展示。 */
+  tenant_id?: string;
+  tenant_name?: string;
   /**
    * 来源 IP（已归一、不含端口，如 `"203.0.113.7"` / `"::1"`）。
    *
