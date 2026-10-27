@@ -65,8 +65,10 @@ const SHUTDOWN_EVENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 /// 而第 9 步要修的那个缺口（客户端断开却因上游静默而未察觉）就落在 `ClientGone` 上。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ForwardEnd {
-    /// 上游正常结束（收到 `ProxyResponseEnd`）。
+    /// 上游正常结束（收到 `ProxyResponseEnd { ok: true }`）。
     UpstreamEnd,
+    /// 上游发了 `ProxyResponseEnd { ok: false }`：响应体不完整，已向客户端发明确信号。
+    UpstreamTruncated,
     /// 上游自己报错（`Frame::Error`），已把错误送给客户端。
     UpstreamError,
     /// 上游未发 End 就关了流。
@@ -96,6 +98,7 @@ impl ForwardEnd {
     pub(super) fn label(&self) -> &'static str {
         match self {
             ForwardEnd::UpstreamEnd => "upstream_end",
+            ForwardEnd::UpstreamTruncated => "upstream_truncated",
             ForwardEnd::UpstreamError => "upstream_error",
             ForwardEnd::UpstreamClosed => "upstream_closed",
             ForwardEnd::TunnelError => "tunnel_error",
@@ -181,6 +184,24 @@ impl Drop for ForwardGuard {
 /// **必须与正常完成可区分**：`data: [DONE]` 是 OpenAI 的"正常结束"标记，用它收尾等于
 /// 谎报"模型答完了"——客户端会把残缺结果当完整结果记账/计费。所以这里发一个明确的 error 事件。
 const SHUTDOWN_SSE_EVENT: &[u8] = b"event: error\ndata: {\"error\":{\"message\":\"gateway is shutting down; this response is incomplete\",\"type\":\"server_error\"}}\n\n";
+
+/// 上游流中途出错（`ProxyResponseEnd { ok: false }`）时写给 SSE 客户端的终止事件。
+///
+/// 与 [`SHUTDOWN_SSE_EVENT`] 同一条原则：**绝不能**用 `[DONE]` 收尾；这里必须让客户端
+/// 看出"模型没有答完"。非 SSE 走 [`upstream_end_signal`] 的错误项，由响应体层中止。
+const TRUNCATED_SSE_EVENT: &[u8] = b"event: error\ndata: {\"error\":{\"message\":\"upstream ended the response early; this response is incomplete\",\"type\":\"server_error\"}}\n\n";
+
+/// `ok=false` 时给客户端的那一项；`ok=true` 返回 `None`（正常收尾，不额外发送）。
+pub(super) fn upstream_end_signal(ok: bool, is_stream: bool) -> Option<Result<Bytes, String>> {
+    if ok {
+        return None;
+    }
+    Some(if is_stream {
+        Ok(Bytes::from_static(TRUNCATED_SSE_EVENT))
+    } else {
+        Err("upstream ended the response early; this response is incomplete".into())
+    })
+}
 
 /// 带停滞超时地往客户端送一块。
 ///
@@ -432,10 +453,18 @@ where
                 usage.observe(&chunk);
                 metrics.add_bytes_out(chunk.len());
             }
-            Ok(Ok(Some(Frame::ProxyResponseEnd { .. }))) => {
+            Ok(Ok(Some(Frame::ProxyResponseEnd { ok, .. }))) => {
+                if let Some(item) = upstream_end_signal(ok, is_stream) {
+                    let _ =
+                        send_to_client_or_shutdown(&tx, item, client_stall, &mut shutdown).await;
+                }
                 let _ = send.finish();
                 usage.finish();
-                return ForwardEnd::UpstreamEnd;
+                return if ok {
+                    ForwardEnd::UpstreamEnd
+                } else {
+                    ForwardEnd::UpstreamTruncated
+                };
             }
             Ok(Ok(Some(Frame::Error { code, message, .. }))) => {
                 let _ = send_to_client_or_shutdown(
@@ -549,6 +578,29 @@ mod tests {
         );
     }
 
+    /// 规格（S2-1）：`ok=false` 不能被当成正常结束。
+    #[test]
+    fn upstream_end_signal_distinguishes_truncation_from_completion() {
+        assert!(upstream_end_signal(true, false).is_none());
+        assert!(upstream_end_signal(true, true).is_none());
+
+        let err = upstream_end_signal(false, false)
+            .expect("non-SSE truncation must produce an item")
+            .expect_err("non-SSE truncation must be an error item");
+        assert!(err.contains("incomplete"), "{err}");
+
+        let bytes = upstream_end_signal(false, true)
+            .expect("SSE truncation must produce an item")
+            .expect("SSE truncation must be a normal item");
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("incomplete"), "{text}");
+        assert!(
+            !text.contains("[DONE]"),
+            "must not claim normal completion: {text}"
+        );
+    }
+
     /// 规格（记录 P2-14）：**每条退出路径都要有自己的指标标签**，且互不相同。
     ///
     /// 标签就是 `hlmg_forward_ends_total{kind=...}` 的取值，混在一起就分不出"客户端走了"
@@ -557,6 +609,7 @@ mod tests {
     fn every_forward_end_has_its_own_label() {
         let all = [
             ForwardEnd::UpstreamEnd,
+            ForwardEnd::UpstreamTruncated,
             ForwardEnd::UpstreamError,
             ForwardEnd::UpstreamClosed,
             ForwardEnd::TunnelError,

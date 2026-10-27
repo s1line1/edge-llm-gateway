@@ -172,3 +172,84 @@ pub async fn spawn_raw_agent(
         std::future::pending::<()>().await;
     });
 }
+
+/// 起一个**会回截断响应**的裸 agent：注册后对每条代理流回
+/// `ProxyResponseHead(text/event-stream)` → 一个 body chunk → `ProxyResponseEnd { ok: false }`。
+///
+/// 用来端到端钉住 S2-1：网关收到 `ok=false` 时必须让客户端看到 `event: error`，且**不能**
+/// 出现 `[DONE]`。这与 [`spawn_serving_agent`] 的区别是：这里不跑真实上游，只按帧脚本回包。
+pub async fn spawn_truncating_agent(gw: &Gateway, certs: &TestCerts, agent_id: &str) {
+    let client_config = agent::tls::rustls_client_tls(
+        &certs.ca,
+        certs.client_cert.clone(),
+        certs.client_key.clone_key(),
+    )
+    .unwrap();
+    let conn = test_support::tunnel::connect(gw.quic_addr, "localhost", client_config, "0.0.0.0:0")
+        .await
+        .unwrap();
+    let (mut handle, mut acceptor) = conn.split();
+
+    let stream = handle.open_bidirectional_stream().await.unwrap();
+    let (mut reg_recv, mut reg_send) = stream.split();
+    write_frame(
+        &mut reg_send,
+        &Frame::Register {
+            agent_id: agent_id.into(),
+            models: vec!["mock-llm".into()],
+            max_concurrency: 4,
+            version: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    reg_send.finish().unwrap();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        FrameReader::new(&mut reg_recv).next(),
+    )
+    .await;
+    wait_for_agents(gw, 1, Duration::from_secs(5)).await;
+
+    tokio::spawn(async move {
+        let _handle = handle;
+        while let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
+            tokio::spawn(async move {
+                let (mut recv, mut send) = stream.split();
+                let Ok(Some(Frame::ProxyRequest { request_id, .. })) =
+                    FrameReader::new(&mut recv).next().await
+                else {
+                    return;
+                };
+                let _ = write_frame(
+                    &mut send,
+                    &Frame::ProxyResponseHead {
+                        request_id,
+                        status: 200,
+                        headers: vec![("content-type".into(), "text/event-stream".into())],
+                    },
+                )
+                .await;
+                let _ = write_frame(
+                    &mut send,
+                    &Frame::ProxyResponseBody {
+                        request_id,
+                        chunk: axum::body::Bytes::from_static(
+                            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                        ),
+                    },
+                )
+                .await;
+                let _ = write_frame(
+                    &mut send,
+                    &Frame::ProxyResponseEnd {
+                        request_id,
+                        ok: false,
+                    },
+                )
+                .await;
+                let _ = send.finish();
+            });
+        }
+    });
+}

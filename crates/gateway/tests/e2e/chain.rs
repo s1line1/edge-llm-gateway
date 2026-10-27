@@ -993,3 +993,68 @@ async fn e2e_an_oversized_response_chunk_is_refused() {
 
     gw.shutdown().await;
 }
+
+/// 规格（S2-1）：上游 body 流中途出错时，agent 发 `ProxyResponseEnd { ok: false }`；
+/// 网关必须让 SSE 客户端看到 `event: error`，且**绝不能**发 `[DONE]`。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_truncated_sse_is_not_reported_as_complete() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let TestGateway {
+        gw,
+        certs,
+        key,
+        base,
+        ..
+    } = start_gateway(|_| {}).await;
+    spawn_truncating_agent(&gw, &certs, "truncating").await;
+
+    let client = test_client();
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({
+            "model": "mock-llm",
+            "stream": true,
+            "messages": [{"role": "user", "content": "truncate"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "head must already be committed");
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("event: error"), "missing error event: {body}");
+    assert!(
+        body.contains("incomplete"),
+        "missing incomplete reason: {body}"
+    );
+    assert!(
+        !body.contains("[DONE]"),
+        "must not claim normal completion: {body}"
+    );
+
+    // 记录 SEC-002：截断必须有独立标签，且不能记成 upstream_end。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let text = loop {
+        let text = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if text.contains("hlmg_forward_ends_total{kind=\"upstream_truncated\"}")
+            || tokio::time::Instant::now() >= deadline
+        {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        text.contains("hlmg_forward_ends_total{kind=\"upstream_truncated\"}"),
+        "missing upstream_truncated label:\n{text}"
+    );
+
+    gw.shutdown().await;
+}
