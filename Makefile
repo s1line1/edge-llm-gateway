@@ -22,10 +22,10 @@ LIMIT ?= 20
 # e2e 测试条数（接线守卫）：`.config/nextest.toml` 用 filter='binary(e2e)' 把 e2e 限成
 # 一次一条。改测试文件名/二进制名/拆分 `tests/e2e` 都会让这个 filter 匹配不到，串行化
 # **静默**失效（进程级 `#[serial]` 在 nextest 下本来就失效）。改条数时同步改这里。
-E2E_TEST_COUNT ?= 71
+E2E_TEST_COUNT ?= 73
 
 .PHONY: help setup certs certs-required web-install web-build web-dev build build-debug fmt clippy check test bench bench-k6 \
-        bench-admission bench-admission-local release release-strict check-records check-e2e-wiring \
+        bench-admission bench-admission-local release release-strict check-rust check-records check-e2e-wiring \
         run-gateway run-agent run-mock dev dev-ui logs stop clean \
 		docker-gateway-up docker-gateway-down
 
@@ -96,7 +96,9 @@ check-e2e-wiring: ## e2e 接线守卫（必须仍是单个 `e2e` 二进制、70 
 	fi; \
 	echo "e2e wiring ok: $$count tests in binary(e2e)"
 
-check: fmt clippy deny nextest check-e2e-wiring web-format web-lint web-test web-build toolchain-check check-records ## 一键全量验证（= CI 的 Rust 门槛 + 前端格式/检查/测试/构建 + 工具链一致性 + 记录漂移：fmt / clippy / cargo deny / nextest / e2e 接线 / web-format / web-lint / web-test / web-build / toolchain-check / check-records）
+check-rust: fmt clippy nextest check-e2e-wiring toolchain-check check-records ## Rust 侧门禁（CI 的单一来源；不含 deny/web）
+
+check: check-rust deny web-format web-lint web-test web-build ## 一键全量验证（check-rust + cargo deny + 前端格式/检查/测试/构建）
 
 test: ## 运行全部 Rust 测试（cargo 原生 runner，含 e2e；串行靠测试里的 #[serial]）
 	cargo test
