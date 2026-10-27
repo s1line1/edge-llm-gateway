@@ -23,7 +23,7 @@ use super::tunnel::tunnel_cancel;
 #[derive(Debug)]
 enum HeadOutcome {
     Head(StatusCode, Vec<(String, String)>),
-    Error(u16, String),
+    Error(StatusCode, String),
 }
 
 /// 读响应头帧（或错误帧）。
@@ -64,10 +64,15 @@ where
                 ));
             }
             Some(Frame::Error { code, message, .. }) => {
-                return Ok(HeadOutcome::Error(code, message));
+                // 错误帧里的 code 是线上 `u16`；类型化只在这里发生一次。
+                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+                return Ok(HeadOutcome::Error(status, message));
             }
             Some(Frame::ProxyResponseEnd { .. }) => {
-                return Ok(HeadOutcome::Error(502, "empty upstream response".into()));
+                return Ok(HeadOutcome::Error(
+                    StatusCode::BAD_GATEWAY,
+                    "empty upstream response".into(),
+                ));
             }
             Some(Frame::ProxyResponseBody { chunk, .. }) => {
                 // 忽略是契约；但"这一块再也补不回来"至少要留在日志里
@@ -87,7 +92,7 @@ where
             }
             None => {
                 return Ok(HeadOutcome::Error(
-                    502,
+                    StatusCode::BAD_GATEWAY,
                     "upstream closed before responding".into(),
                 ));
             }
@@ -120,12 +125,9 @@ where
             state.registry.note_tunnel_op_ok(entry.stable_id());
             Ok((s, h))
         }
-        Ok(Ok(HeadOutcome::Error(code, message))) => {
+        Ok(Ok(HeadOutcome::Error(status, message))) => {
             let _ = send.finish();
-            Err(RouteFailure {
-                status: StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
-                message,
-            })
+            Err(RouteFailure { status, message })
         }
         Ok(Err(e)) => {
             let _ = send.finish();
@@ -313,7 +315,7 @@ mod tests {
         // 一字节都没有 = 干净关闭
         let mut empty = FrameReader::new(&[][..]);
         match read_head(&mut empty, 7).await.unwrap() {
-            HeadOutcome::Error(502, message) => {
+            HeadOutcome::Error(StatusCode::BAD_GATEWAY, message) => {
                 assert!(message.contains("closed before responding"), "{message}")
             }
             other => panic!("空流应当是 502，实际：{other:?}"),
@@ -328,7 +330,9 @@ mod tests {
         .await;
         let mut reader = FrameReader::new(bytes.as_slice());
         match read_head(&mut reader, 7).await.unwrap() {
-            HeadOutcome::Error(429, message) => assert_eq!(message, "slow down"),
+            HeadOutcome::Error(StatusCode::TOO_MANY_REQUESTS, message) => {
+                assert_eq!(message, "slow down")
+            }
             other => panic!("错误帧应当原样透出，实际：{other:?}"),
         }
 
@@ -340,7 +344,7 @@ mod tests {
         .await;
         let mut reader = FrameReader::new(bytes.as_slice());
         match read_head(&mut reader, 7).await.unwrap() {
-            HeadOutcome::Error(502, message) => {
+            HeadOutcome::Error(StatusCode::BAD_GATEWAY, message) => {
                 assert!(message.contains("empty upstream response"), "{message}")
             }
             other => panic!("先结束应当是 502，实际：{other:?}"),

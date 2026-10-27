@@ -59,8 +59,8 @@ crates/proto/src/headers.rs  逐跳头过滤（gateway/agent 共享）
    关闭阶段（唯一发送端、单向推进、排空/收尾窗口）在 shutdown.rs
 ② gateway/src/http/mod.rs
    路由、中间件、SPA fallback（/v1/* 怎么进到 proxy）
-③ gateway/src/proxy/mod.rs            ★ 最重要
-   认证 → 限流 → 最少负载选 agent → open_bi 开流 → 发 ProxyRequest → 流式回写
+③ gateway/src/proxy/            ★ 最重要
+   prepare（认证→路径守卫→body→隧道帧）→ routing/head（选路、等响应头）→ forward（流式回写）
 ④ gateway/src/quic.rs
    服务端：accept_loop、Register / Heartbeat 控制流
 ⑤ agent/src/main.rs → lib.rs → session.rs   ★ 另一端

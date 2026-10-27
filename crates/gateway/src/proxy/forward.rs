@@ -232,9 +232,6 @@ async fn send_to_client_or_shutdown(
 /// `op_timeout` 只用于取消帧的写——隧道坏掉时连 Cancel 都可能写不出去，绝不能在这里
 /// 阻塞（这正是"客户端已断开却发现不了"的死角）。
 ///
-/// 参数确实多（流的两半、通道、三个超时、票据、指标、用量记账、请求元信息），但它们都是
-/// 这个后台任务**必须独占持有**的资源；打包成 struct 只是把同一张清单换个地方写，不会让
-/// 这个函数更难懂。
 /// `Terminating` 阶段，或发送端已消失（`Gateway` 被 drop）→ 该收尾了。
 ///
 /// 判据是**阶段**而不是"是否变过"：`changed()` 只保证"变过"，而 `Draining` 阶段只停接新
@@ -243,27 +240,67 @@ fn shutdown_terminating(rx: &watch::Receiver<ShutdownPhase>) -> bool {
     *rx.borrow() == ShutdownPhase::Terminating || rx.has_changed().is_err()
 }
 
-#[allow(clippy::too_many_arguments)]
+/// 一次响应转发任务必须独占持有的资源。
+///
+/// 为什么是一个 struct 而不是 15 个位置参数：参数清单本身没有变，但**顺序**不再由调用点
+/// 靠记忆保证；新增一个资源时只改结构体与一个构造点。`slot` 必须活到本函数结束（它代表
+/// agent 在途槽位），因此由 `ctx` 持有、在函数末尾随局部绑定 drop，不能提前释放。
+pub(super) struct ForwardCtx {
+    pub(super) request_id: u64,
+    pub(super) tx: mpsc::Sender<Result<Bytes, String>>,
+    pub(super) idle_timeout: Duration,
+    pub(super) client_stall: Duration,
+    pub(super) op_timeout: Duration,
+    /// 该请求占用的 agent 在途槽位；随任务结束释放。
+    pub(super) slot: crate::registry::SlotGuard,
+    pub(super) metrics: crate::metrics::Metrics,
+    pub(super) store: crate::storage::Storage,
+    pub(super) key_id: String,
+    pub(super) key_name: String,
+    pub(super) prompt_est: u64,
+    pub(super) is_stream: bool,
+    pub(super) shutdown: watch::Receiver<ShutdownPhase>,
+}
+
+/// 放弃一个**还活着**的请求时的统一收尾：先取消上游，再半关，最后结算已转发用量。
+///
+/// P3-3 的不变量（"每一处放弃请求的 finish 前必须有一次 tunnel_cancel"）原先靠复制粘贴维持；
+/// 收成一个函数后，六条出口共用同一个顺序，新增出口也不会漏掉 Cancel。
+async fn abandon(
+    send: &mut s2n_quic::stream::SendStream,
+    request_id: u64,
+    op_timeout: Duration,
+    usage: UsageCollector,
+) {
+    tunnel_cancel(send, request_id, op_timeout).await;
+    let _ = send.finish();
+    usage.finish();
+}
+
+/// 把上游的帧流转成客户端响应体；失败/取消路径的收尾见 [`abandon`]。
 pub(super) async fn forward_body<R>(
     reader: &mut FrameReader<R>,
     send: &mut s2n_quic::stream::SendStream,
-    request_id: u64,
-    tx: mpsc::Sender<Result<Bytes, String>>,
-    idle_timeout: Duration,
-    client_stall: Duration,
-    op_timeout: Duration,
-    _slot: crate::registry::SlotGuard,
-    metrics: crate::metrics::Metrics,
-    store: crate::storage::Storage,
-    key_id: String,
-    key_name: String,
-    prompt_est: u64,
-    is_stream: bool,
-    mut shutdown: watch::Receiver<ShutdownPhase>,
+    ctx: ForwardCtx,
 ) -> ForwardEnd
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let ForwardCtx {
+        request_id,
+        tx,
+        idle_timeout,
+        client_stall,
+        op_timeout,
+        slot: _slot,
+        metrics,
+        store,
+        key_id,
+        key_name,
+        prompt_est,
+        is_stream,
+        mut shutdown,
+    } = ctx;
     let mut usage = UsageCollector::new(store, key_id, key_name, prompt_est, is_stream);
     // reader 由调用方（`proxy::mod` 的响应编排）创建并**贯穿响应头与响应体两个阶段**
     // （记录 R3）：所以下面这个 `select!` 里 `shutdown.changed()` 分支的 `continue`
@@ -313,9 +350,7 @@ where
                     }
                 }
             }
-            tunnel_cancel(send, request_id, op_timeout).await;
-            let _ = send.finish();
-            usage.finish();
+            abandon(send, request_id, op_timeout, usage).await;
             return ForwardEnd::GatewayShutdown;
         }
         let frame = tokio::select! {
@@ -325,9 +360,7 @@ where
                     request_id,
                     "client disconnected while the upstream was silent; cancelling upstream"
                 );
-                tunnel_cancel(send, request_id, op_timeout).await;
-                let _ = send.finish();
-                usage.finish();
+                abandon(send, request_id, op_timeout, usage).await;
                 return ForwardEnd::ClientGone;
             }
             changed = shutdown.changed() => {
@@ -355,9 +388,7 @@ where
                         &mut shutdown,
                     )
                     .await;
-                    tunnel_cancel(send, request_id, op_timeout).await;
-                    let _ = send.finish();
-                    usage.finish();
+                    abandon(send, request_id, op_timeout, usage).await;
                     return ForwardEnd::ProtocolViolation;
                 }
                 match send_to_client_or_shutdown(
@@ -379,9 +410,7 @@ where
                         // 客户端已断开 → 取消上游；仍结算已转发部分
                         warn!(request_id, "client disconnected, cancelling upstream");
                         usage.observe(&chunk);
-                        tunnel_cancel(send, request_id, op_timeout).await;
-                        let _ = send.finish();
-                        usage.finish();
+                        abandon(send, request_id, op_timeout, usage).await;
                         return ForwardEnd::ClientGone;
                     }
                     SendOutcome::Stalled => {
@@ -396,9 +425,7 @@ where
                             "client stopped consuming the response body; cancelling upstream and releasing the slot"
                         );
                         usage.observe(&chunk);
-                        tunnel_cancel(send, request_id, op_timeout).await;
-                        let _ = send.finish();
-                        usage.finish();
+                        abandon(send, request_id, op_timeout, usage).await;
                         return ForwardEnd::ClientStalled;
                     }
                 }
@@ -455,9 +482,7 @@ where
                     &mut shutdown,
                 )
                 .await;
-                tunnel_cancel(send, request_id, op_timeout).await;
-                let _ = send.finish();
-                usage.finish();
+                abandon(send, request_id, op_timeout, usage).await;
                 return ForwardEnd::IdleTimeout;
             }
         }

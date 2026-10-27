@@ -37,6 +37,8 @@ use tracing::{debug, error, info};
 
 use crate::state::AppState;
 
+use super::admission::RouteClass;
+
 /// 记录请求状态码与耗时（/metrics 自身不计入），并为每个请求确定 id：
 /// 隧道 `request_id` 取自 `crate::request_id`（与响应头、日志同一数字），
 /// 写进入站 headers 供 `proxy` 复用；响应头另有回显客户端原值的规则（见实现）。
@@ -89,7 +91,7 @@ pub(super) async fn request_id_middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
-    if req.uri().path() == "/metrics" {
+    if !RouteClass::of(req.uri().path()).logs_access() {
         return next.run(req).await;
     }
     // 隧道 id 与 HTTP 层共用一个计数器（crate::request_id），并**规范化写回入站 headers**：
