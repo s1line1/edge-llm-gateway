@@ -67,6 +67,13 @@ jobs:
       - name: Test
         run: cargo nextest run --workspace
 
+      # 接线守卫（Phase 0）：`.config/nextest.toml` 用 filter='binary(e2e)' 保证 e2e 串行。
+      # 把 tests/e2e 拆成多个二进制、改名、或删掉测试都会让这个 filter 匹配不到——
+      # nextest 下 `#[serial]` 的进程内锁本来就失效，于是 64 条 QUIC 测试会静默并行。
+      # 这条守卫把"改了线"变成 CI 红灯；条数变化时同步改 Makefile 的 E2E_TEST_COUNT。
+      - name: e2e wiring guard
+        run: make check-e2e-wiring
+
   web:
     name: Web (build)
     runs-on: ubuntu-latest

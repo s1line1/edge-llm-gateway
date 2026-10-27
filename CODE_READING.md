@@ -42,7 +42,7 @@ edge-agent（LLM 所在机器）  主动拨号 + 心跳 + 断线重连
 
 ```
 crates/proto/src/frame.rs    8 种帧类型（Register/Heartbeat/ProxyRequest/Head/Body/End/Cancel/Error）
-crates/proto/src/io.rs       帧读写：长度前缀 [u32 大端] + postcard 序列化
+crates/proto/src/io/mod.rs       帧读写：长度前缀 [u32 大端] + postcard 序列化
 crates/proto/src/pem.rs      证书加载（gateway/agent 共享）
 crates/proto/src/headers.rs  逐跳头过滤（gateway/agent 共享）
 ```
@@ -74,12 +74,13 @@ crates/proto/src/headers.rs  逐跳头过滤（gateway/agent 共享）
 ### 第 3 步：支撑模块（治理逻辑，1 小时）
 
 ```
-gateway/src/registry.rs    agent 注册表 + 模型过滤/精确优先排序 + SlotGuard 并发占位（admission control）
+gateway/src/registry/    agent 注册表（table/entry/routing/eviction/admission 分工）
+                          模型过滤/精确优先排序 + SlotGuard 并发占位（admission control）
 gateway/src/storage/       SQLite 存储 + argon2 哈希 + sha256 lookup 快速索引（+ hash.rs 哈希原语）
 gateway/src/admin.rs        Admin API（key 管理 + agents 列表 + usage 查询）
 gateway/src/usage_meter.rs        per-key token 用量提取 / 无 usage 时估算（纯函数，由 proxy 调用）
 gateway/src/ratelimit.rs    令牌桶
-gateway/src/metrics.rs      Prometheus 指标（HTTP 层 + 隧道层）
+gateway/src/metrics/mod.rs      Prometheus 指标（HTTP 层 + 隧道层）
 gateway/src/error.rs        GatewayError（thiserror；anyhow 仍用于 config/quic/tls 与 agent 侧）
 gateway/src/tls.rs          mTLS 配置（动态信任根方向见 TODO P1 多 CA 方案）
 ```
@@ -87,7 +88,7 @@ gateway/src/tls.rs          mTLS 配置（动态信任根方向见 TODO P1 多 C
 ### 第 4 步：测试与验证（1 小时）
 
 ```
-crates/gateway/tests/e2e/   e2e 场景（common.rs 怎么起全栈；chain.rs 全链路；agents.rs 并发
+crates/gateway/tests/e2e/   e2e 场景（common/ 怎么起全栈；chain.rs 全链路；agents.rs 并发
                             正确性 + 模型路由；admin.rs 管理 API + 错误语义；metrics.rs 指标；
                             https.rs 公网 TLS + 隧道控制流 + 启动 fail-fast；head_timeout.rs 三条
                             超时；stalls.rs 客户端停滞；entry_limits.rs 握手/请求头有界与连接额度；
@@ -106,7 +107,7 @@ scripts/check-toolchain.sh  工具链三处一致（rust-toolchain.toml / 所有
   = `STEP_TIMEOUT`），原始帧 / channel 等待用 `common::bounded(step, ..)` —— 卡住会变成**带步骤名**的
   失败，而不是 nextest 的 180s TIMEOUT、或 `make test`（e2e 是 `#[serial]`）下整个套件无限期挂起。
   **故意让客户端卡住的用例豁免**（`stalls.rs`、`write_backpressure.rs`、
-  `https::e2e_proxy_protocol_edge_cases`），理由见 `common.rs` 的 `test_client` 文档。
+  `https::e2e_proxy_protocol_edge_cases`），理由见 `common/client.rs` 的 `test_client` 文档。
 - **改这几处要跑的红检**：`tests/e2e/stalls.rs`（请求体停滞、响应体停滞各一条；判据是
   `max_concurrent_requests: 1` 下**后续请求不得 429** —— 槽位一泄漏就必然 429）、
   `tests/e2e/entry_limits.rs`（半开握手、半个请求头、额度满时排队各一条）与 `io_stall` 的单测
@@ -136,10 +137,10 @@ web/src/components/   ← 布局/图表/UI（无依赖 SVG 图表）
 | 文件 | 为什么先读它 |
 |---|---|
 | `crates/gateway/src/proxy/mod.rs` | 全链路的心脏（认证 → 路由 → 隧道） |
-| `crates/gateway/src/registry.rs` 的 `try_acquire` | 并发控制精髓（SlotGuard RAII 自动归还） |
+| `crates/gateway/src/registry/table.rs` 的 `try_acquire_excluding` | 并发控制精髓（SlotGuard RAII 自动归还） |
 | `crates/agent/src/stream.rs` 的 `handle_stream` | 转发 + Cancel 的 `select!` 竞速 |
 | `crates/proto/src/frame.rs` | 两端通信的契约 |
-| `crates/gateway/tests/e2e/common.rs` | 怎么在单进程内拉起完整测试栈 |
+| `crates/gateway/tests/e2e/common/` | 怎么在单进程内拉起完整测试栈 |
 
 ---
 

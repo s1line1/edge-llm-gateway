@@ -627,7 +627,7 @@
             新 schema 里把 `heartbeat_secs` 放进 `Register`（或把 `agent_stale_secs` 放进注册回应）
             之后，这三样**应当删掉**，改按协议里的实际数值判断；那时连"只提醒、不拒绝"都可以升级成
             **拒注册**，因为不再是猜（`E2` 的 (a)/(b) 两个方案就并在这里，见复扫记录）。
-         ② **`E4` 现在不动**：`proto/src/io.rs` 的 `write_frame`（每帧两次分配、两次全长拷贝）正好住在
+         ② **`E4` 现在不动**：`proto/src/io/mod.rs` 的 `write_frame`（每帧两次分配、两次全长拷贝）正好住在
             第 3 步要重写的那一层上——postcard 的 `to_allocvec` 会换成 prost 的编码。在**会被替换**的
             代码上优化等于白花力气，等切换完成后照新编码重新评估（长度前缀那层大概率留着，实现要重写）。
          ③ **`P3-1`（ALPN 借用了 `h3`）与本次协议变更合并到同一轮**：两者都是"新旧不能混跑"的兼容性
@@ -919,10 +919,12 @@
 > 此后已经修掉；**本节只登记仍未修的**，避免同一件事在两处各维护一份。行号对应 `6609a8c`。
 
 - [ ] **R1 帧头固定自描述 + golden bytes 契约测试**：线格式仍是 `[u32 BE 长度][postcard 枚举]`，
-      帧类型 tag 就是**变体声明序号**（`crates/proto/src/io.rs:29-33`、`crates/proto/src/frame.rs:7-43`）
-      ——增删变体即破坏线格式，且没有 golden bytes 断言兜住。
+      帧类型 tag 就是**变体声明序号**（`crates/proto/src/io/mod.rs:29-33`、`crates/proto/src/frame.rs:7-43`）
+      ——增删变体即破坏线格式。**2026-10-27 已补**：`io::tests::all_frame_variants_have_stable_wire_bytes`
+      用 golden 字节逐字节钉住全部 8 个变体（含反解），"重排变体仍绿"的缺口已封；仍缺的是
+      **帧头自描述**（类型/长度在头部而不是靠变体序号）。
 - [ ] **R2 按帧类型分设长度上限**：`MAX_FRAME = 64 MiB` 硬编码，且按声明长度直接
-      `vec![0u8; len]`（`crates/proto/src/io.rs:11,54-62`）——敌意前缀声明 64 MiB 就真分配 64 MiB。
+      `vec![0u8; len]`（`crates/proto/src/io/mod.rs:11,54-62`）——敌意前缀声明 64 MiB 就真分配 64 MiB。
       目标：上限按帧类型分设，分配量对声明值不敏感（计数型分配器断言）。
 - [x] **R3 读路径合一（取消安全）（2026-09-22 完成）**：原状是两条读路径——`read_frame`
       （`read_exact` 包装、不可取消）与 `FrameReader`（可取消），而"在 `select!` 里必须用可取消
@@ -943,7 +945,7 @@
       （gateway lib 173、e2e 61、proto 24、agent 32、mock-llm 1+1）；e2e 里 `lifecycle` 那条
       "阶段变化落在帧中途"的用例（P3-26 先红后绿的护栏）继续通过。
 - [x] **R4 EOF 四格分明（2026-09-22 完成）**：`read_frame` 读 4 字节前缀时**任何
-      `UnexpectedEof` 都返回 `Ok(None)`**（`crates/proto/src/io.rs:47-53`）——1–3 字节的头部
+      `UnexpectedEof` 都返回 `Ok(None)`**（`crates/proto/src/io/mod.rs:47-53`）——1–3 字节的头部
       截断被当成干净关闭；`FrameReader` 那侧早就分清了（`io.rs:108-115`），于是同一条线上的
       同一段字节有两种解释。后果是把协议违规说成对端的有序收工：`forward` 侧记成
       `ForwardEnd::UpstreamClosed`（"upstream closed the stream early"）而不是读取错误，
@@ -958,7 +960,7 @@
 - [ ] **R6 "流即会话"可断言**：首帧必须是 `ProxyRequest`、后续帧 `request_id` 必须一致
       ——现在既无断言也无日志，不一致只会表现成"上游好像没在收流"。
 - [x] **R8 原子占位改 CAS（2026-09-22 完成）**：`Admission::try_enter` 原先是 `fetch_add` +
-  超限回滚（`crates/gateway/src/metrics.rs`），回滚前那一瞬间计数**比真实持票数多 1**（幽灵占位）；
+  超限回滚（`crates/gateway/src/metrics/mod.rs`），回滚前那一瞬间计数**比真实持票数多 1**（幽灵占位）；
   若持票者恰在这一刻释放，紧随其后的请求会读到 `prev >= limit` 而被拒——**闸门明明是空的**
   （"双双误拒"：客户端拿到本不该有的 429）。现在改成 **CAS 循环**：只在确实要到票时才加计数，
   因此 `active_count()` **恒等于**已发出的票数（顺带消掉 `hlmg_active_requests` 的瞬时尖峰，
@@ -992,7 +994,7 @@
 - [ ] **R10 总时长上限**：`timeout_secs`（120s）是响应体**逐帧空闲**超时，没有整请求总时限
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
 - [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
-      （`crates/gateway/src/metrics.rs:529-533`）——"p99 变差"从求和值里看不出来。
+      （`crates/gateway/src/metrics/mod.rs:529-533`）——"p99 变差"从求和值里看不出来。
 - [x] **R12 healthz 深度检查（2026-09-22 完成）**：`/healthz` 现在是真探针——
       **200 ⇔ 隧道入口仍在接受新 agent**（`hlmg_quic_accepting`），否则 `503` + `status:"degraded"`
       + `detail`（处置：重启网关）；body 改成 JSON，同时报 `agents.registered` /
@@ -1497,11 +1499,11 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       落在 [1000, 1024) 时会被判**死**（`inflight < effective` 为假以外的分支）而不是"忙"，
       连续 3 次即摘除 → 全量 503。
 - [ ] **`S2-19` `待核` `run_loop_handles_clean_disconnect` 的夹具到不了它声称的 Ok 分支**：
-      用的是把 acceptor 丢掉的 `test_server`（`agent/src/tests.rs:361` 的 `test_server`），register 永远等不到
+      用的是把 acceptor 丢掉的 `test_server`（`agent/src/tests/mod.rs:122` 的 `test_server`），register 永远等不到
       半关 ⇒ 走的是 Err 分支；断言只有"900ms 后任务还活着"，把 Ok 分支删掉也不会红。
 - [ ] **`S2-20` `待核` `TODO` 的 R2 描述与实现不符**：R2 说读帧"按声明长度直接分配 64 MiB"，
       但那条 `read_frame` 已在 R3 删除，唯一路径 `FrameReader` 只把声明值记进 `want`、缓冲区随
-      **真实到达**字节增长，且 `len > MAX_FRAME` 在载荷到达前就拒绝（`proto/src/io.rs:93,105-111`）。
+      **真实到达**字节增长，且 `len > MAX_FRAME` 在载荷到达前就拒绝（`proto/src/io/mod.rs:93,105-111`）。
 - [ ] **`S2-21` `待核` `DESIGN` 的 `cred_generation` 缓存失效只存在于文档**：DESIGN 写"命中条件是
       `cred_version == 当前代次`、变更即 bump 失效"，而代码里 `cred_generation` **只写不读**
       （`storage/mod.rs:324-329,452`），库里 `cred_version` 恒为列默认值（`create` 不写该列）；
@@ -1636,7 +1638,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 - **现状（代码事实）**：路由意义上的"健康"只有两条——心跳不 stale（`agent_stale_secs`）
   与隧道可用；**上游引擎自己死没死完全不参与路由**。上游不可达时 agent 回 `Frame::Error{code:502}`
-  （有专门规格：502 且消息**不含内网地址/端口**，`crates/agent/src/tests.rs:1482`（`an_unreachable_upstream_reports_a_generic_502_and_a_contextual_error`）），
+  （有专门规格：502 且消息**不含内网地址/端口**，`crates/agent/src/tests/upstream.rs:85`（`an_unreachable_upstream_reports_a_generic_502_and_a_contextual_error`）），
   网关把该状态码透传给客户端（`proxy/head.rs:126`，空流/隧道读失败另回落 502，
   `proxy/head.rs:90,133`）——但**后续请求照旧路由到同一个副本**，直到有人手动改配置。
 - **要做**：① 按**错误分类**做**副本级短熔断**（连接拒绝 / 握手失败 / 5xx 分档，与业务 4xx
@@ -1696,7 +1698,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 - **现状**：`hlmg_request_duration_ms` **只有求和值、没有直方图**（`TODO.md:992` R11），
   `hlmg_requests_total` 唯一的 label 是 `status`；**没有首字时间（TTFT）与每输出 token 时间
-  （TPOT）**，agent 侧也没有首字打点（`crates/gateway/src/metrics.rs` 里只有 `total_duration_ms`）。
+  （TPOT）**，agent 侧也没有首字打点（`crates/gateway/src/metrics/mod.rs` 里只有 `total_duration_ms`）。
 - **要做**：TTFT **在网关转发路径上就能测**（"响应头之后第一个非空 delta / 首块"），
   **不需要引擎配合**；TPOT = (总时长 − TTFT) / 输出 token（输出 token 已有，来自 `usage_meter`）；
   指标加 `model` 维度 label（model 是**有限枚举**、基数可控；**别**把 key / user 当 label）。

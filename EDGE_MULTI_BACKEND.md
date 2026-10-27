@@ -32,7 +32,7 @@
 
 记录里已经有过"多副本"的讨论（`TODO.md:1618-1632`）：**多台 edge，每台一个 agent
 + 一个 vLLM**，`model` 的第二次分发发生在**网关**——而且**已经具备**
-（`crates/gateway/src/registry.rs:346`）。那是已登记的**缺口 B**，**不是本文**。
+（`crates/gateway/src/registry/routing.rs:38`）。那是已登记的**缺口 B**，**不是本文**。
 
 本文说的是另一种：**一个** agent ← **多台** vLLM，分发在 **agent 内部**（本文新增）。
 
@@ -51,9 +51,9 @@
 | `Register { agent_id, models, max_concurrency, version }`             | `crates/proto/src/frame.rs:35`                      |
 | `Heartbeat { agent_id, inflight }`                                    | `crates/proto/src/frame.rs:42`                      |
 | 网关收到心跳 `inflight` 后**只打日志**，不存不用                       | `crates/gateway/src/quic.rs:166`、`:179`            |
-| 网关 `pick` = 按 model 过滤（精确优先 → 通配兜底）→ **取 `inflight` 最小者** | `crates/gateway/src/registry.rs:346`                |
+| 网关 `pick` = 按 model 过滤（精确优先 → 通配兜底）→ **取 `inflight` 最小者** | `crates/gateway/src/registry/routing.rs:38`                |
 | 声明容量超过端点流额度 ⇒ 注册时 WARN（配置不一致要看得见）            | `crates/gateway/src/quic.rs:148`                    |
-| 本机闸门归零用「同一原因连续 N 次」的纪律（N = 3）                    | `crates/gateway/src/registry.rs:531`                |
+| 本机闸门归零用「同一原因连续 N 次」的纪律（N = 3）                    | `crates/gateway/src/registry/table.rs:432`                |
 
 ## 4. 分层口径（已定，不再讨论）
 
@@ -81,7 +81,7 @@
 1. **配置**：`upstream` 允许是**一组后端**，每个后端声明自己的 `models`（§7）。
 2. **选路**：收到 `ProxyRequest` 后，按请求的 `model` **筛出候选后端** → 取**在途最少** → 转发。
 3. **本地熔断**：沿用仓库既有的「**同一原因连续 N 次**」纪律
-   （同 `crates/gateway/src/registry.rs:531` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`）。
+   （同 `crates/gateway/src/registry/table.rs:432` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`）。
    **判据是连接级失败**（拒连 / 连接超时）——**不是**上游 404：404 的意思是"这个模型不存在"，
    被当成"后端坏"会误熔断一个健康后端。
 4. **本机闸门按后端各一个**，声明的 `max_concurrency` = 各后端之和。

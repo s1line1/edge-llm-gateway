@@ -19,8 +19,13 @@ DUR ?= 30s
 MODEL ?= qwen2.5
 LIMIT ?= 20
 
+# e2e 测试条数（接线守卫）：`.config/nextest.toml` 用 filter='binary(e2e)' 把 e2e 限成
+# 一次一条。改测试文件名/二进制名/拆分 `tests/e2e` 都会让这个 filter 匹配不到，串行化
+# **静默**失效（进程级 `#[serial]` 在 nextest 下本来就失效）。改条数时同步改这里。
+E2E_TEST_COUNT ?= 70
+
 .PHONY: help setup certs certs-required web-install web-build web-dev build build-debug fmt clippy check test bench bench-k6 \
-        bench-admission bench-admission-local release release-strict check-records \
+        bench-admission bench-admission-local release release-strict check-records check-e2e-wiring \
         run-gateway run-agent run-mock dev dev-ui logs stop clean \
 		docker-gateway-up docker-gateway-down
 
@@ -82,7 +87,16 @@ deny: ##（advisories/bans/licenses/sources 全跑，与 pre-commit hook / CI �
 check-records: ## 记录↔代码漂移（指针越界 / 提交号不实；扫的是工作树里的 docs/，那两份记录不在仓库里）
 	python3 scripts/check-records.py
 
-check: fmt clippy deny nextest web-format web-lint web-test web-build toolchain-check check-records ## 一键全量验证（= CI 的 Rust 门槛 + 前端格式/检查/测试/构建 + 工具链一致性 + 记录漂移：fmt / clippy / cargo deny / nextest / web-format / web-lint / web-test / web-build / toolchain-check / check-records）
+check-e2e-wiring: ## e2e 接线守卫（必须仍是单个 `e2e` 二进制、70 条测试）
+	@count=$$(cargo nextest list -E 'binary(e2e)' 2>/dev/null | grep -c '^    [a-z_]*::' || true); \
+	if [ "$$count" -ne $(E2E_TEST_COUNT) ]; then \
+		echo "e2e wiring changed: expected $(E2E_TEST_COUNT) tests in binary(e2e), found $$count"; \
+		echo "if intentional, update E2E_TEST_COUNT and .config/nextest.toml together"; \
+		exit 1; \
+	fi; \
+	echo "e2e wiring ok: $$count tests in binary(e2e)"
+
+check: fmt clippy deny nextest check-e2e-wiring web-format web-lint web-test web-build toolchain-check check-records ## 一键全量验证（= CI 的 Rust 门槛 + 前端格式/检查/测试/构建 + 工具链一致性 + 记录漂移：fmt / clippy / cargo deny / nextest / e2e 接线 / web-format / web-lint / web-test / web-build / toolchain-check / check-records）
 
 test: ## 运行全部 Rust 测试（cargo 原生 runner，含 e2e；串行靠测试里的 #[serial]）
 	cargo test

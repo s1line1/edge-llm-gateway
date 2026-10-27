@@ -72,7 +72,7 @@
 帧 = [ u32 大端长度 ][ postcard 序列化后的 Frame 枚举 ]
 ```
 
-- **长度前缀只算载荷字节数**（不含自身那 4 字节）；读侧先校验 `len ≤ MAX_FRAME`（64 MiB）再分配（`crates/proto/src/io.rs`）。
+- **长度前缀只算载荷字节数**（不含自身那 4 字节）；读侧先校验 `len ≤ MAX_FRAME`（64 MiB）再分配（`crates/proto/src/io/mod.rs`）。
 - **帧类型不是固定偏移的独立字段**，而是 postcard 的**变体声明序号**（即载荷第 0 字节）。所以**增删或重排 `Frame` 变体就会改变线格式**——这是已知债，契约测试（golden bytes）与固定帧头见 `REBUILD.md` §3.1 与 `TODO.md`《重建蓝图 §6 未修项》的 R1。
 - **`request_id` 位置随变体而变**：`Proxy*`/`Cancel` 是必填 `u64`，`Error` 是 `Option<u64>`，`Register`/`Heartbeat` 没有该字段。不存在"所有帧共用的固定偏移 `request_id`"。
 - 协议版本号目前**只写不读**：`Register.version` 由 agent 上报、网关用 `..` 丢弃；线格式里没有独立版本字段。
