@@ -1,10 +1,20 @@
-// 指标页：轮询采样趋势图 + 状态码分布 + 原始 Prometheus 文本查看。
+// 指标：把 Prometheus 采样变成可读的遥测面板，原始文本按需展开。
 
-import { useMetricsHistory } from "../hooks/useMetricsHistory";
-import { formatBytes, formatDuration } from "../api/metrics";
-import { BarList, Sparkline } from "../components/charts";
-import { Button, Card } from "../components/ui";
 import { useState } from "react";
+
+import { formatBytes, formatDuration } from "../api/metrics";
+import { BarList, ChartPending, Sparkline } from "../components/charts";
+import { Icon } from "../components/icons";
+import {
+  Badge,
+  Button,
+  EmptyState,
+  MetricCard,
+  PageHeader,
+  Panel,
+  PanelHead,
+} from "../components/ui";
+import { useMetricsHistory } from "../hooks/useMetricsHistory";
 
 export default function MetricsPage() {
   const { latest, history, raw, error } = useMetricsHistory();
@@ -23,85 +33,183 @@ export default function MetricsPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-lg font-semibold">指标</h2>
-          <p className="text-sm text-slate-500">
-            每 5 秒轮询{" "}
-            <code className="rounded bg-slate-100 px-1 font-mono text-xs">/metrics</code>，保留最近
-            60 个采样点
-          </p>
-        </div>
-        <Button variant="secondary" onClick={() => setShowRaw((v) => !v)}>
-          {showRaw ? "隐藏原始数据" : "查看原始 Prometheus"}
-        </Button>
-      </div>
+      <PageHeader
+        index="04"
+        eyebrow="OBSERVE / TELEMETRY"
+        title="指标"
+        description="每 5 秒轮询 /metrics，保留最近 60 个采样点。计数器和 gauge 在同一时间序列里对齐。"
+        actions={
+          <>
+            <Badge tone="cyan">{history.length} / 60 PTS</Badge>
+            <Button variant="secondary" onClick={() => setShowRaw((v) => !v)}>
+              <Icon name="terminal" size={13} />
+              {showRaw ? "隐藏原始数据" : "查看原始 Prometheus"}
+            </Button>
+          </>
+        }
+      />
 
       {error && (
-        <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+        <p className="rounded-lg border border-amber/25 bg-amber/6 px-3 py-2 font-mono text-[10px] text-amber">
           最近一次拉取失败：{error}（展示的是上一次成功数据）
         </p>
       )}
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        <Card title="在途请求" subtitle="gauge：当前并发转发数">
-          <Sparkline data={active} stroke="#0f766e" />
-        </Card>
-        <Card title="在线 Agent 数" subtitle="gauge：已注册 agent 数">
-          <Sparkline data={agents} stroke="#4338ca" />
-        </Card>
-        <Card title="累计请求数" subtitle="counter：自网关启动累计">
-          <Sparkline data={counts} stroke="#b45309" />
-        </Card>
-        <Card title="累计转发字节" subtitle="counter：回传客户端字节数">
-          <Sparkline data={bytes} stroke="#be185d" />
-        </Card>
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <MetricCard
+          label="在途请求"
+          value={latest ? latest.active_requests : "—"}
+          hint="gauge · 当前并发"
+          tone="cyan"
+        >
+          <Sparkline data={active} height={30} stroke="#79d7d1" />
+        </MetricCard>
+        <MetricCard
+          label="在线 Agent 数"
+          value={latest ? latest.agents : "—"}
+          hint="gauge · 已注册，含过期"
+          tone="ok"
+        >
+          <Sparkline data={agents} height={30} stroke="#b9f27b" />
+        </MetricCard>
+        <MetricCard
+          label="累计请求数"
+          value={latest ? latest.request_count.toLocaleString() : "—"}
+          hint="counter · since start"
+        >
+          <Sparkline data={counts} height={30} stroke="#f5c46e" />
+        </MetricCard>
+        <MetricCard
+          label="累计转发字节"
+          value={latest ? formatBytes(latest.bytes_out) : "—"}
+          hint="counter · client bytes"
+        >
+          <Sparkline data={bytes} height={30} stroke="#ff8b7b" />
+        </MetricCard>
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">
-        <Card title="状态码分布" subtitle="hlmg_requests_total 按状态码">
-          {statusItems.length > 0 ? (
-            <BarList items={statusItems} />
-          ) : (
-            <p className="py-6 text-center text-sm text-slate-400">暂无请求记录</p>
-          )}
-        </Card>
-        <Card title="汇总" subtitle="累计值">
-          {latest ? (
-            <dl className="space-y-2 text-sm">
-              {[
-                ["累计请求数", latest.request_count.toLocaleString()],
-                [
-                  "平均耗时",
-                  latest.request_count > 0
-                    ? formatDuration(latest.request_duration_ms / latest.request_count)
-                    : "—",
-                ],
-                ["累计耗时", formatDuration(latest.request_duration_ms)],
-                ["累计转发", formatBytes(latest.bytes_out)],
-                ["在线 Agents", String(latest.agents)],
-              ].map(([k, v]) => (
-                <div
-                  key={k}
-                  className="flex items-center justify-between border-b border-slate-50 pb-1.5 last:border-0"
-                >
-                  <dt className="text-slate-500">{k}</dt>
-                  <dd className="font-mono font-medium tabular-nums text-slate-800">{v}</dd>
-                </div>
-              ))}
-            </dl>
-          ) : (
-            <p className="py-6 text-center text-sm text-slate-400">等待首次采样…</p>
-          )}
-        </Card>
+        <Panel>
+          <PanelHead
+            title="在途请求"
+            description="gauge：当前并发转发数"
+            right={<Badge tone="cyan">LIVE</Badge>}
+          />
+          <div className="panel-body">
+            {active.length < 2 ? (
+              <ChartPending label="启动采样中 · 5s" />
+            ) : (
+              <Sparkline data={active} height={116} stroke="#79d7d1" />
+            )}
+          </div>
+        </Panel>
+        <Panel>
+          <PanelHead
+            title="在线 Agent 数"
+            description="gauge：已注册 agent 数（含心跳过期）"
+            right={<Badge tone="ok">MESH</Badge>}
+          />
+          <div className="panel-body">
+            {agents.length < 2 ? (
+              <ChartPending label="启动采样中 · 5s" />
+            ) : (
+              <Sparkline data={agents} height={116} stroke="#b9f27b" />
+            )}
+          </div>
+        </Panel>
+        <Panel>
+          <PanelHead
+            title="累计请求数"
+            description="counter：自网关启动累计"
+            right={<span className="font-mono text-[10px] text-mist-dim">{counts.length} PTS</span>}
+          />
+          <div className="panel-body">
+            {counts.length < 2 ? (
+              <ChartPending label="启动采样中 · 5s" />
+            ) : (
+              <Sparkline data={counts} height={116} stroke="#f5c46e" />
+            )}
+          </div>
+        </Panel>
+        <Panel>
+          <PanelHead
+            title="累计转发字节"
+            description="counter：回传客户端字节数"
+            right={<span className="font-mono text-[10px] text-mist-dim">{bytes.length} PTS</span>}
+          />
+          <div className="panel-body">
+            {bytes.length < 2 ? (
+              <ChartPending label="启动采样中 · 5s" />
+            ) : (
+              <Sparkline data={bytes} height={116} stroke="#ff8b7b" />
+            )}
+          </div>
+        </Panel>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-[1.2fr_1fr]">
+        <Panel>
+          <PanelHead
+            title="状态码分布"
+            description="hlmg_requests_total 按状态码"
+            right={<Badge>HTTP</Badge>}
+          />
+          <div className="panel-body">
+            {statusItems.length > 0 ? (
+              <BarList items={statusItems} />
+            ) : (
+              <EmptyState title="暂无请求记录" detail="网关收到请求后，这里会出现状态码分布。" />
+            )}
+          </div>
+        </Panel>
+        <Panel>
+          <PanelHead title="汇总" description="最近一次成功采样的累计值" />
+          <div className="panel-body">
+            {latest ? (
+              <dl className="space-y-3">
+                {[
+                  ["累计请求数", latest.request_count.toLocaleString()],
+                  [
+                    "平均耗时",
+                    latest.request_count > 0
+                      ? formatDuration(latest.request_duration_ms / latest.request_count)
+                      : "—",
+                  ],
+                  ["累计耗时", formatDuration(latest.request_duration_ms)],
+                  ["累计转发", formatBytes(latest.bytes_out)],
+                  ["在线 Agents", String(latest.agents)],
+                ].map(([k, v]) => (
+                  <div
+                    key={k}
+                    className="flex items-center justify-between border-b border-line-soft pb-2.5 last:border-0 last:pb-0"
+                  >
+                    <dt className="text-[11px] text-mist">{k}</dt>
+                    <dd className="font-mono text-[11px] font-medium tabular-nums text-paper">
+                      {v}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            ) : (
+              <EmptyState title="等待首次采样…" detail="采样器启动后会自动填充。" />
+            )}
+          </div>
+        </Panel>
       </div>
 
       {showRaw && (
-        <Card title="原始 /metrics" subtitle="Prometheus 文本格式">
-          <pre className="max-h-96 overflow-auto rounded-lg bg-slate-900 p-4 text-xs leading-relaxed text-slate-200">
-            {raw ?? (error ? `拉取失败：${error}` : "等待首次采样…")}
-          </pre>
-        </Card>
+        <Panel>
+          <PanelHead
+            title="原始 /metrics"
+            description="Prometheus 文本格式"
+            right={<Badge tone="cyan">RAW</Badge>}
+          />
+          <div className="p-4">
+            <pre className="max-h-96 overflow-auto rounded-lg border border-line bg-ink-950 p-4 font-mono text-[10px] leading-relaxed text-mist">
+              {raw ?? (error ? `拉取失败：${error}` : "等待首次采样…")}
+            </pre>
+          </div>
+        </Panel>
       )}
     </div>
   );
