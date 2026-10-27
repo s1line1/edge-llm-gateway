@@ -215,3 +215,25 @@ async fn healthy_models_aggregates_and_excludes_wildcard() {
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert!(reg.healthy_models(Duration::from_millis(10)).is_empty());
 }
+
+/// 规格（S2-3 的对照）：池里根本没有能服务该模型的 agent 时，仍然是 NoModel（404）；
+/// 即便把唯一存在的别的模型 agent 排除，也不能误报成容量不足。
+#[tokio::test]
+async fn no_model_still_reports_no_model() {
+    let reg = Registry::default();
+    let llama = reg.register(
+        "llama".into(),
+        IP,
+        vec!["llama".into()],
+        4,
+        test_connection().await,
+    );
+    assert!(matches!(
+        reg.try_acquire_excluding(Duration::from_secs(10), "qwen", &[]),
+        Err(AcquireError::NoModel)
+    ));
+    assert!(matches!(
+        reg.try_acquire_excluding(Duration::from_secs(10), "qwen", &[llama]),
+        Err(AcquireError::NoModel)
+    ));
+}

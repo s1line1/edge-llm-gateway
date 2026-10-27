@@ -48,18 +48,24 @@ pub(super) fn pick<'a>(
     if candidates.is_empty() {
         return Err(AcquireError::NoAgent);
     }
+    // 在排除之前记下"是否有新鲜候选能服务该模型"。排除之后如果模型候选为空，这个事实
+    // 决定它是"忙"（AllExcluded → 429）还是"根本没有这个模型"（NoModel → 404）。
+    // 只看 fresh 候选：过期 agent 不构成容量证据。
+    let has_model_candidate = candidates
+        .iter()
+        .any(|e| e.models.iter().any(|m| m == "*" || m == model));
     // 排除要**放在"有没有候选"之后**（复扫 B1）：`exclude` 是**调用方自己**传进来的（本轮
     // 已经试过的连接），把它和"注册表里没人 / 全 stale"混成同一个 `NoAgent`，会让单 agent
     // 场景下的"忙"最终报成 503 `no edge available` + `all-candidates-stale`——两处都与事实
     // 相反（注册表里有人、心跳也新鲜，只是它已经顶到承载上限）。
     candidates.retain(|e| !exclude.contains(&e.stable_id));
     if candidates.is_empty() {
-        return Err(AcquireError::AllExcluded);
+        return Err(empty_reason(has_model_candidate));
     }
     // 模型过滤：只保留能服务请求模型的 agent（声明含 "*" 或含 model）
     candidates.retain(|e| e.models.iter().any(|m| m == "*" || m == model));
     if candidates.is_empty() {
-        return Err(AcquireError::NoModel);
+        return Err(empty_reason(has_model_candidate));
     }
     // 排序：精确声明（exact=true）排前 → 负载轻优先 → 心跳新者优先。
     // bool 排序 false < true，故用 !exact 让精确者排前。
@@ -72,6 +78,15 @@ pub(super) fn pick<'a>(
         )
     });
     Ok(candidates)
+}
+
+/// 候选被滤空时的错误：有模型候选被排除 ⇒ 忙；没有模型候选 ⇒ 404。
+fn empty_reason(has_model_candidate: bool) -> AcquireError {
+    if has_model_candidate {
+        AcquireError::AllExcluded
+    } else {
+        AcquireError::NoModel
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

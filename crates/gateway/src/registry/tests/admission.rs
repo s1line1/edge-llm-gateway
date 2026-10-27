@@ -120,3 +120,28 @@ async fn max_concurrency_zero_always_acquires_and_still_counts_inflight() {
         "最后一次释放后必须回到 0；下溢会变成 4294967295"
     );
 }
+
+/// 规格（S2-3）：唯一能服务该模型的 agent 被本轮 exclude，但池里还有别的模型的 agent 时，
+/// 必须报"忙"（AllExcluded → 429），不能报"模型不存在"（NoModel → 404）。
+#[tokio::test]
+async fn heterogeneous_pool_reports_all_excluded_when_sole_model_agent_is_excluded() {
+    let reg = Registry::default();
+    let qwen = reg.register(
+        "qwen".into(),
+        IP,
+        vec!["qwen".into()],
+        4,
+        test_connection().await,
+    );
+    reg.register(
+        "llama".into(),
+        IP,
+        vec!["llama".into()],
+        4,
+        test_connection().await,
+    );
+    assert!(matches!(
+        reg.try_acquire_excluding(Duration::from_secs(10), "qwen", &[qwen]),
+        Err(AcquireError::AllExcluded)
+    ));
+}
