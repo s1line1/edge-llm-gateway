@@ -1,18 +1,35 @@
 //! agent 的单元测试：从 `agent/src/tests.rs` 搬出，并按变更理由分文件。
 //!
-//! `tests` 仍是 crate 根的子模块，所以 `use super::*` 仍能看到 `next_backoff` /
-//! `ConcurrencyGate` / `connect_once` 等私有项。共享的 QUIC/PKI 夹具留在这里。
+//! `tests` 仍是 crate 根的子模块，所以 `use super::*` 仍能看到 `AgentConfig` /
+//! `AgentExit` 等公开类型；拆分到 `backoff`/`gate`/`session` 的私有项由下面的显式
+//! `use crate::...` 引入。共享的 QUIC/PKI 夹具留在这里。
+
+// 共享 prelude：其中一部分名字只被 `tests/*.rs` 的 `use super::*;` 使用，而
+// `unused_imports` 看不到子模块的 glob 使用；整块放行，新增夹具时可继续往这里加。
+#![allow(unused_imports)]
 
 use super::*;
+use crate::stream::handle_stream;
 use crate::test_log::CapturedLogs;
 use proto::ALPN;
+use proto::{
+    io::{write_frame, FrameReader},
+    Frame,
+};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use s2n_quic::client::Connect;
 use s2n_quic::connection::{Handle, StreamAcceptor};
 use std::sync::Arc;
+use std::time::Instant;
+use tracing::{debug, info, warn};
+
+use crate::backoff::{jittered, next_backoff, BACKOFF_BASE, BACKOFF_MAX, BACKOFF_RESET_AFTER};
+use crate::gate::{acquire_slot, ConcurrencyGate, SlotOutcome, SLOT_WAIT_LOG_AFTER};
+use crate::session::{heartbeat_loop, run, upstream_client};
 
 /// 生成 (CA, 服务端证书, 服务端私钥, 客户端证书, 客户端私钥) 的 DER。
 fn gen_pki() -> (

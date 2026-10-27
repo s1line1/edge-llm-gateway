@@ -758,7 +758,7 @@
       本次用 `rustup toolchain install 1.97.1 --profile minimal -c rustfmt,clippy` 装好（顺带被 rustup
       自己升级到 1.29.1），本地/CI/镜像三处现在都是 1.97.1（同一 commit `8bab26f4f`，验证基座不变）。
 
-- [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`crates/agent/src/lib.rs:573-575`），
+- [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`crates/agent/src/session.rs:265-267`），
       网关只打 debug 日志（`quic.rs:76-84`）。它是《⛔ 健康上报驱动的更精细路由》的前置数据：要么实现上报，
       要么删掉该字段（现在是死载荷，容易误导）。
 - [x] **重连退避无抖动（2026-09-22 已修）**：`run()` 现在给退避加 **±20% 抖动**
@@ -780,7 +780,7 @@
       现在**委托**给 `gen_certs_pem()`（CA 的 `key_usages` 取并集），两份 fixture 不再各自演化。
       原记录：`tests/e2e/common.rs` 的 `gen_certs`（`:24-82`）与
       `gen_certs_pem`（`:85-123`）逐行重复，CA 的 `key_usages` 一个 3 项、一个 2 项；全仓另有
-      23 处 `CertificateParams::default()` 的 PKI 脚手架（`agent/src/lib.rs:326-366`、
+      23 处 `CertificateParams::default()` 的 PKI 脚手架（`agent/src/tests/mod.rs:34-78`、
       `gateway/src/tls.rs:75-109`、`gateway/src/main.rs:76-100`、`agent/src/main.rs:75-99`、
       `registry.rs:212-255`、`quic.rs:103-125`）。抽一个共享 fixture。
 - [x] **重复逻辑（认证+限流这一半已修，2026-09）**：`proxy` 曾内联复制一份已封装的
@@ -1495,11 +1495,11 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       与 `openai.rs:22-24` 承诺的"网关自己产生的错误全局一致"不符。
 - [ ] **`S2-18` `待核` `open_timeout_is_fatal` 传的是**本地**流上限而非 `min(本地, 对端)`**：
       `routing.rs:130-134` 传 `state.max_open_tunnel_streams`（默认 1024），而 agent 只广告 1000
-      （`agent/src/lib.rs:342`）⇒ `max_concurrency: 0`（文档语义"不限"）的 agent 在 inflight
+      （`agent/src/session.rs:82`）⇒ `max_concurrency: 0`（文档语义"不限"）的 agent 在 inflight
       落在 [1000, 1024) 时会被判**死**（`inflight < effective` 为假以外的分支）而不是"忙"，
       连续 3 次即摘除 → 全量 503。
 - [ ] **`S2-19` `待核` `run_loop_handles_clean_disconnect` 的夹具到不了它声称的 Ok 分支**：
-      用的是把 acceptor 丢掉的 `test_server`（`agent/src/tests/mod.rs:122` 的 `test_server`），register 永远等不到
+      用的是把 acceptor 丢掉的 `test_server`（`agent/src/tests/mod.rs:138` 的 `test_server`），register 永远等不到
       半关 ⇒ 走的是 Err 分支；断言只有"900ms 后任务还活着"，把 Ok 分支删掉也不会红。
 - [ ] **`S2-20` `待核` `TODO` 的 R2 描述与实现不符**：R2 说读帧"按声明长度直接分配 64 MiB"，
       但那条 `read_frame` 已在 R3 删除，唯一路径 `FrameReader` 只把声明值记进 `want`、缓冲区随
@@ -1612,7 +1612,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 - **现状（代码事实）**：`pick()`（`crates/gateway/src/registry/routing.rs:38-75`）的候选排序是
   **精确声明 model 优先 → `inflight` 最少 → 心跳最新**，其中唯一的"负载"信号是**网关自己数的
   在途请求数**（`Entry.inflight`）。协议里留了位置但**恒为 0**：`Frame::Heartbeat { inflight }`
-  的构造点写死 `inflight: 0`（`crates/agent/src/lib.rs:573-575`，`TODO.md:759` 已登记该空洞）。
+  的构造点写死 `inflight: 0`（`crates/agent/src/session.rs:265-267`，`TODO.md:759` 已登记该空洞）。
 - **为什么不够**：等长请求下 `inflight` 是"最少负载"的合理近似；一旦长短混合（agentic /
   长上下文），两个副本的 `inflight` 可以相同而 KV 池余量天差地别——此时"最少 inflight"会把
   新请求送到**最可能触发抢占 / 重算**的那个副本，TTFT 反而更差（这正是"模型网关"与
@@ -1722,7 +1722,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 ### 顺手记下的文档漂移（本次一并修掉）
 
-- `TODO.md:759` 的指针原写 `agent/src/lib.rs:136-140`，构造点其实在 **`crates/agent/src/lib.rs:573-575`**
+- `TODO.md:759` 的指针原写 `agent/src/lib.rs:136-140`，构造点其实在 **`crates/agent/src/session.rs:265-267`**
   （`:136-140` 现为 `wait_for_abnormal_exit`）。**成因**：该条写于 `a410472`（2026-09-11），当时
   `:136` 确实是构造点；此后这个文件从 570 行长到 2935 行，指针原地不动就漂了。
 - `TODO.md:248` 原引用"本文件**「容量感知路由」那条**"，而 TODO 里没有同名条目——已改指真实条目
@@ -1844,8 +1844,8 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       的既有纪律（同 `crates/gateway/src/registry/table.rs:432` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），
       但**判据是连接级失败，不是上游 404**——404 的意思是"这个模型不存在"，误当"后端坏"会熔断
       一个健康后端。
-      **本机闸门按后端各一个**（今天是**一个全局** `Semaphore`，`crates/agent/src/lib.rs:280`
-      与 `:292`），声明值 = 各后端之和：那个闸门存在的意义就是"别把一台**机器**打爆"，而池里
+      **本机闸门按后端各一个**（今天是**一个全局** `Semaphore`，`crates/agent/src/gate.rs:38-46`
+      与 `:43`），声明值 = 各后端之和：那个闸门存在的意义就是"别把一台**机器**打爆"，而池里
       每台是独立机器，一个全局信号量会让一台慢后端占住其他后端的额度。
       **刻意不新增配置旋钮**：多后端时 `models` 缺省取各后端 `models` 的**并集**，从既有字段推导。
       **待定**：① 只做拓扑 A 还是 A+B 都要；② 本机闸门全局 vs 按后端；③ `models` 缺省推导

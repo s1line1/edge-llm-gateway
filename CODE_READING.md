@@ -62,8 +62,9 @@ crates/proto/src/headers.rs  逐跳头过滤（gateway/agent 共享）
    认证 → 限流 → 最少负载选 agent → open_bi 开流 → 发 ProxyRequest → 流式回写
 ④ gateway/src/quic.rs
    服务端：accept_loop、Register / Heartbeat 控制流
-⑤ agent/src/main.rs → lib.rs          ★ 另一端
-   拨号 → 注册 → accept_bi → handle_stream（转发上游 + Cancel 传播）
+⑤ agent/src/main.rs → lib.rs → session.rs   ★ 另一端
+   拨号 → 注册 → 心跳 → accept_bi → handle_stream（转发上游 + Cancel 传播）；
+   重连退避在 backoff.rs，本机并发闸门在 gate.rs
 ```
 
 **关键问题自测**：
