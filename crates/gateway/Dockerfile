@@ -77,16 +77,17 @@ RUN if [ -n "$CRATES_MIRROR" ]; then \
 
 WORKDIR /build
 
-# ① 清单层：只拷**四份清单** + Cargo.lock 并造最小骨架，**这一层只负责下载依赖**。
+# ① 清单层：只拷**五份清单** + Cargo.lock 并造最小骨架，**这一层只负责下载依赖**。
 #    这样改源码不会让它失效——依赖不必重下（原来 74 MB 每次重下，是构建最慢的一段）。
 #
 #    ⚠️ 下面每一条拷贝 / 每一个骨架文件都是**承重的**，别"顺手清理"——三条失败模式都实测过
 #    （本机等价实验：临时目录里只放清单 + 骨架，跑 `cargo fetch --locked --offline`）：
 #      1) 缺任一 member 的清单 ⇒ `failed to load manifest for workspace member`（根 `Cargo.toml`
-#         的 members 是**显式四个路径**，不是 glob）；agent / mock-llm 因此也要拷清单，
+#         的 members 是**显式五个路径**，不是 glob）；agent / mock-llm / test-support 因此也要拷清单，
 #         尽管它们**不参与编译**（下面只 `--bin gateway`）。
 #      2) member 没有 target 文件（`src/lib.rs` 或 `src/main.rs`）⇒ `no targets specified in the
-#         manifest`——所以三个 bin 的 `main.rs` 与 proto 的 `lib.rs` 都要造出来。
+#         manifest`——所以三个 bin 的 `main.rs`、proto 的 `lib.rs` 与 test-support 的 `lib.rs`
+#         都要造出来。
 #      3) 显式声明的 `[[bench]]` 缺文件 ⇒ `can't find 'frame' bench at benches/frame.rs`
 #         （proto 的 `frame`、gateway 的 `keystore`，两者都无显式 path）——**只删这两个 bench
 #         骨架就会让这一层失败**（这曾经是我的直觉误判，被实测否掉）。
@@ -95,11 +96,13 @@ COPY crates/proto/Cargo.toml crates/proto/
 COPY crates/gateway/Cargo.toml crates/gateway/
 COPY crates/agent/Cargo.toml crates/agent/
 COPY crates/mock-llm/Cargo.toml crates/mock-llm/
+COPY crates/test-support/Cargo.toml crates/test-support/
 RUN set -eux; \
     mkdir -p crates/proto/src crates/proto/benches \
              crates/gateway/src crates/gateway/benches \
-             crates/agent/src crates/mock-llm/src; \
+             crates/agent/src crates/mock-llm/src crates/test-support/src; \
     : > crates/proto/src/lib.rs; \
+    : > crates/test-support/src/lib.rs; \
     : > crates/proto/benches/frame.rs; \
     : > crates/gateway/benches/keystore.rs; \
     for b in gateway agent mock-llm; do printf 'fn main() {}\n' > "crates/$b/src/main.rs"; done; \
