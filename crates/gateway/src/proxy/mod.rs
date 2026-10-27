@@ -101,8 +101,16 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         guard.finish(end);
     });
 
+    let connection = proto::headers::connection_tokens(
+        out_headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
     let mut builder = Response::builder().status(status);
     for (k, v) in out_headers {
+        if !forwardable_response_header(&k, &connection) {
+            continue;
+        }
         if let Some((name, value)) = relayable_response_header(&k, &v) {
             builder = builder.header(name, value);
         }
@@ -121,6 +129,13 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             )
         }
     }
+}
+
+/// 响应方向是否允许转发：逐跳头与 `Connection` 点名头都不行。
+///
+/// 真实 agent 已经在 `stream.rs` 里剥过；这里是网关侧的纵深防御，针对坏/旧 agent。
+fn forwardable_response_header(name: &str, connection: &[String]) -> bool {
+    !proto::headers::is_hop_by_hop(name) && !proto::headers::is_connection_named(name, connection)
 }
 
 /// 把隧道帧里的响应头装进对客户端的响应（记录 P3-16 的复核）。
@@ -169,5 +184,14 @@ mod tests {
             relayable_response_header("bad name", "v").is_none(),
             "非法头名仍要丢"
         );
+    }
+
+    /// 规格（S2-10）：响应方向也必须丢掉 `Connection` 点名的字段。
+    #[test]
+    fn connection_named_response_fields_are_not_forwarded() {
+        let connection = proto::headers::connection_tokens([("connection", "x-internal")]);
+        assert!(!forwardable_response_header("connection", &connection));
+        assert!(!forwardable_response_header("x-internal", &connection));
+        assert!(forwardable_response_header("content-type", &connection));
     }
 }

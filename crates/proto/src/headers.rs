@@ -1,6 +1,9 @@
 //! HTTP 逐跳头（hop-by-hop）与调用方凭据头的过滤规则（gateway 与 agent 共享）。
 
 /// 转发时剔除的逐跳头（不得透传到下一跳）。
+///
+/// 注意：`connection` 的值还会点名额外字段；那些字段由 [`connection_tokens`] 解析，
+/// 不能只靠这张静态表。
 pub const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -27,7 +30,36 @@ pub const HOP_BY_HOP: &[&str] = &[
 /// 透传是零收益、纯风险：edge 一旦被攻破，攻击者白得一把可用的公网凭据；而且 edge 与
 /// 上游的日志里会留下一份**吊销不掉**的副本（吊销客户端 key 也救不回来）。
 /// 上游确实需要认证时，应在 **agent 侧**配置上游自己的凭据，而不是转发调用方的 key。
-pub const CLIENT_CREDENTIAL_HEADERS: &[&str] = &["authorization", "cookie"];
+///
+/// `x-api-key` 虽然**网关自己不用它认证**，但客户端可能把它当上游凭据发送；按同一策略
+/// 一并剥离，避免"以为在配置上游、实际把凭据交给了 edge"。
+pub const CLIENT_CREDENTIAL_HEADERS: &[&str] = &["authorization", "cookie", "x-api-key"];
+
+/// 收集所有 `Connection` 头值里点名的字段（小写）。
+///
+/// RFC 9110 §7.6.1：`Connection` 的值本身是一个逗号分隔的字段名列表，这些字段与
+/// `Connection` 一样只对单跳有意义。只去掉 `Connection` 本身不够——`Connection: x-internal`
+/// 后面的 `x-internal` 仍会被转发。值里的非 ASCII/非 UTF-8 片段无法解析，跳过即可。
+pub fn connection_tokens<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<String> {
+    headers
+        .into_iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// `name` 是否被某个 `Connection` 头值点名（大小写无关）。
+pub fn is_connection_named(name: &str, tokens: &[String]) -> bool {
+    tokens.iter().any(|token| token.eq_ignore_ascii_case(name))
+}
+
+/// 请求方向是否允许转发该头：逐跳、`Connection` 点名、调用方凭据三类都剔除。
+pub fn is_forwardable(name: &str, tokens: &[String]) -> bool {
+    !is_hop_by_hop(name) && !is_connection_named(name, tokens) && !is_client_credential(name)
+}
 
 /// 判断 HTTP 头名是否为逐跳头。
 ///
@@ -49,6 +81,30 @@ pub fn is_client_credential(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_tokens_and_named_fields() {
+        let tokens = connection_tokens([
+            ("connection", "x-internal, X-Other"),
+            ("content-type", "application/json"),
+        ]);
+        assert_eq!(
+            tokens,
+            vec!["x-internal".to_string(), "x-other".to_string()]
+        );
+        assert!(is_connection_named("X-Internal", &tokens));
+        assert!(!is_connection_named("x-not-listed", &tokens));
+        assert!(!is_hop_by_hop("x-internal"));
+        assert!(!is_forwardable("x-internal", &tokens));
+        assert!(is_forwardable("content-type", &tokens));
+    }
+
+    #[test]
+    fn x_api_key_is_a_client_credential() {
+        assert!(is_client_credential("x-api-key"));
+        assert!(is_client_credential("X-API-Key"));
+        assert!(!is_forwardable("x-api-key", &[]));
+    }
 
     #[test]
     fn filters_known_hop_by_hop() {

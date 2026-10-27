@@ -194,11 +194,16 @@ pub(super) async fn prepare(state: &AppState, req: Request) -> Result<Prepared, 
 /// 注意凭据**不是**逐跳头（RFC 语义上端到端），因此这里用两条独立规则，
 /// 规则常量见 `proto::headers`。
 fn filter_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    let connection = proto::headers::connection_tokens(
+        headers
+            .iter()
+            .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value))),
+    );
     headers
         .iter()
         .filter_map(|(k, v)| {
             let name = k.as_str();
-            if proto::headers::is_hop_by_hop(name) || proto::headers::is_client_credential(name) {
+            if !proto::headers::is_forwardable(name, &connection) {
                 return None;
             }
             // 记录 P3-16：**不能**用 `to_str()`——它只接受可见 ASCII，而 HTTP 允许 obs-text
@@ -286,6 +291,7 @@ mod tests {
             HeaderValue::from_static("Bearer sk-secret"),
         );
         headers.insert("cookie", HeaderValue::from_static("session=topsecret"));
+        headers.insert("x-api-key", HeaderValue::from_static("sk-upstream"));
 
         let out = filter_headers(&headers);
         let names: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
@@ -355,5 +361,22 @@ mod tests {
         assert!(model(br#"{"model":123}"#).is_err(), "非字符串 model");
         assert!(model(br#"{"model":""}"#).is_err(), "空串 model");
         assert!(model(b"not json").is_err(), "非法 JSON");
+    }
+
+    /// 规格（S2-10）：`Connection` 点名的字段与 `x-api-key` 都必须被剔除。
+    #[test]
+    fn filter_headers_strips_connection_named_fields_and_x_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", HeaderValue::from_static("x-internal"));
+        headers.insert("x-internal", HeaderValue::from_static("secret"));
+        headers.insert("x-api-key", HeaderValue::from_static("sk-upstream"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let out = filter_headers(&headers);
+        assert_eq!(
+            out,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            "only the end-to-end header may survive: {out:?}"
+        );
     }
 }
