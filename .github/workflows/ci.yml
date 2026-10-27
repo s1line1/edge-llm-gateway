@@ -20,6 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `check-records` 要验证 TODO/REBUILD 里的「已修(<commit>)」声明；
+          # 默认 depth=1 的 shallow clone 会让所有历史 hash 看起来都不存在。
+          fetch-depth: 0
 
       # 工具链的**单一来源**是 `rust-toolchain.toml`：这里读出它的 channel 再交给 action。
       # 以前写死 `@stable`（不读那个文件，步骤名却叫 "Install Rust (rust-toolchain.toml)"），
