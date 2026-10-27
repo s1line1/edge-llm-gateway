@@ -556,26 +556,16 @@ async fn e2e_dead_tunnel_fails_fast_instead_of_hanging() {
     .await;
 
     // 裸 QUIC 客户端冒充 agent：注册成功后就**什么都不做**（不读流、不回帧、不出字）。
-    let client = s2n_quic::Client::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Client::from(
-            std::sync::Arc::new(
-                agent::tls::rustls_client_tls(
-                    &certs.ca,
-                    certs.client_cert.clone(),
-                    certs.client_key.clone_key(),
-                )
-                .unwrap(),
-            ),
-        ))
-        .unwrap()
-        .with_io("0.0.0.0:0")
-        .unwrap()
-        .start()
-        .unwrap();
-    let mut conn = client
-        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
-        .await
-        .unwrap();
+    let client_config = agent::tls::rustls_client_tls(
+        &certs.ca,
+        certs.client_cert.clone(),
+        certs.client_key.clone_key(),
+    )
+    .unwrap();
+    let mut conn =
+        test_support::tunnel::connect(gw.quic_addr, "localhost", client_config, "0.0.0.0:0")
+            .await
+            .unwrap();
     let stream = conn.open_bidirectional_stream().await.unwrap();
     let (mut reg_recv, mut reg_send) = stream.split();
     write_frame(

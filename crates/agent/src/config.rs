@@ -194,34 +194,6 @@ fn normalize_upstream(raw: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
     use crate::test_log::CapturedLogs;
-    use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
-
-    /// 在临时目录生成 (ca, client.crt, client.key) 并返回路径。
-    fn gen_cert_files(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
-        let ca_key = KeyPair::generate().unwrap();
-        let mut ca = CertificateParams::default();
-        ca.distinguished_name.push(DnType::CommonName, "test ca");
-        ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
-        let ca_cert = ca.self_signed(&ca_key).unwrap();
-
-        let cli_key = KeyPair::generate().unwrap();
-        let mut cli = CertificateParams::default();
-        cli.distinguished_name.push(DnType::CommonName, "agent");
-        cli.subject_alt_names = vec![SanType::DnsName("localhost".try_into().unwrap())];
-        let cli_cert = cli.signed_by(&cli_key, &ca_cert, &ca_key).unwrap();
-
-        let write = |name: &str, content: &str| {
-            let p = dir.join(name);
-            std::fs::write(&p, content).unwrap();
-            p
-        };
-        (
-            write("ca.crt", &ca_cert.pem()),
-            write("client.crt", &cli_cert.pem()),
-            write("client.key", &cli_key.serialize_pem()),
-        )
-    }
 
     fn parse_yaml(yaml: &str) -> ConfigFile {
         serde_yaml_ng::from_str(yaml).unwrap()
@@ -234,7 +206,7 @@ mod tests {
     #[test]
     fn zero_heartbeat_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
+        let (ca, cert, key) = test_support::pki::write_cert_files(dir.path());
         let yaml = format!(
             r#"
 cloud_addr: "127.0.0.1:4433"
@@ -273,7 +245,7 @@ heartbeat_secs: {{}}
     #[test]
     fn upstream_is_validated_at_load_time() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
+        let (ca, cert, key) = test_support::pki::write_cert_files(dir.path());
         let load = |upstream: &str| {
             let yaml = format!(
                 "cloud_addr: \"127.0.0.1:4433\"\nca: {}\ncert: {}\nkey: {}\nupstream: \"{}\"\n",
@@ -339,7 +311,7 @@ heartbeat_secs: {{}}
     #[test]
     fn a_slow_heartbeat_is_warned_about() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
+        let (ca, cert, key) = test_support::pki::write_cert_files(dir.path());
         let load = |secs: u64| {
             let yaml = format!(
                 "cloud_addr: \"127.0.0.1:4433\"\nca: {}\ncert: {}\nkey: {}\nheartbeat_secs: {secs}\n",
@@ -394,7 +366,7 @@ heartbeat_secs: {{}}
     #[test]
     fn yaml_maps_to_agent_config() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
+        let (ca, cert, key) = test_support::pki::write_cert_files(dir.path());
         let yaml = format!(
             r#"
 cloud_addr: "1.2.3.4:4433"
@@ -432,7 +404,7 @@ max_concurrency: 2
     #[test]
     fn minimal_yaml_applies_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
+        let (ca, cert, key) = test_support::pki::write_cert_files(dir.path());
         let yaml = format!(
             "cloud_addr: \"127.0.0.1:4433\"\nca: {}\ncert: {}\nkey: {}\n",
             ca.to_str().unwrap(),
@@ -452,7 +424,7 @@ max_concurrency: 2
     #[test]
     fn missing_required_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, _, key) = gen_cert_files(dir.path());
+        let (ca, _, key) = test_support::pki::write_cert_files(dir.path());
         let yaml = format!(
             "cloud_addr: \"127.0.0.1:4433\"\nca: {}\nkey: {}\n",
             ca.to_str().unwrap(),
@@ -478,7 +450,7 @@ max_concurrency: 2
     #[test]
     fn from_path_reads_and_maps() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
+        let (ca, cert, key) = test_support::pki::write_cert_files(dir.path());
         let config_path = dir.path().join("agent-config.yml");
         let yaml = format!(
             "cloud_addr: \"127.0.0.1:4433\"\nca: {}\ncert: {}\nkey: {}\n",

@@ -5,12 +5,9 @@
 
 use std::{
     fs::File,
-    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
 };
-
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType};
 
 /// 子进程守卫：断言失败 / 提前 panic 也要收尸，别把 agent 留在后台。
 struct ChildGuard(Child);
@@ -32,34 +29,6 @@ impl Drop for ChildGuard {
     }
 }
 
-/// 生成 (ca, client.crt, client.key) 三个 PEM 文件。agent 需要一个能装载的客户端身份；
-/// 本用例里它永远连不上（配置指向没人监听的端口），所以只需"装得进去"。
-fn gen_cert_files(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
-    let ca_key = KeyPair::generate().unwrap();
-    let mut ca = CertificateParams::default();
-    ca.distinguished_name.push(DnType::CommonName, "test ca");
-    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-    let ca_cert = ca.self_signed(&ca_key).unwrap();
-
-    let cli_key = KeyPair::generate().unwrap();
-    let mut cli = CertificateParams::default();
-    cli.distinguished_name.push(DnType::CommonName, "agent");
-    cli.subject_alt_names = vec![SanType::DnsName("localhost".try_into().unwrap())];
-    let cli_cert = cli.signed_by(&cli_key, &ca_cert, &ca_key).unwrap();
-
-    let write = |name: &str, content: &str| {
-        let p = dir.join(name);
-        std::fs::write(&p, content).unwrap();
-        p
-    };
-    (
-        write("ca.crt", &ca_cert.pem()),
-        write("client.crt", &cli_cert.pem()),
-        write("client.key", &cli_key.serialize_pem()),
-    )
-}
-
 fn send_signal(pid: u32, sig: &str) {
     let out = Command::new("kill")
         .arg(format!("-{sig}"))
@@ -78,7 +47,7 @@ fn send_signal(pid: u32, sig: &str) {
 #[test]
 fn sighup_goes_through_the_graceful_shutdown_path() {
     let dir = tempfile::tempdir().unwrap();
-    let (ca, cert, key) = gen_cert_files(dir.path());
+    let (ca, cert, key) = test_support::pki::write_cert_files(dir.path());
     let cfg_path = dir.path().join("agent.yml");
     std::fs::write(
         &cfg_path,

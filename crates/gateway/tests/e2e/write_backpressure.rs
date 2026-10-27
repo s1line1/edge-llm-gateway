@@ -171,24 +171,13 @@ async fn spawn_half_reading_agent(
 ) {
     use tokio::io::AsyncReadExt;
 
-    let client = s2n_quic::Client::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Client::from(
-            std::sync::Arc::new(
-                agent::tls::rustls_client_tls(
-                    &certs.ca,
-                    certs.client_cert.clone(),
-                    certs.client_key.clone_key(),
-                )
-                .unwrap(),
-            ),
-        ))
-        .unwrap()
-        .with_io("0.0.0.0:0")
-        .unwrap()
-        .start()
-        .unwrap();
-    let conn = client
-        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
+    let client_config = agent::tls::rustls_client_tls(
+        &certs.ca,
+        certs.client_cert.clone(),
+        certs.client_key.clone_key(),
+    )
+    .unwrap();
+    let conn = test_support::tunnel::connect(gw.quic_addr, "localhost", client_config, "0.0.0.0:0")
         .await
         .unwrap();
     let (mut handle, mut acceptor) = conn.split();
@@ -219,7 +208,7 @@ async fn spawn_half_reading_agent(
     let (out_tx, out_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         // `conn` 已被 `split()` 消耗，保活靠它分出来的 handle/acceptor
-        let _keep_alive = (client, handle, reg_recv);
+        let _keep_alive = (handle, reg_recv);
         let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await else {
             let _ = out_tx.send(HalfReadOutcome::ReadError("no request stream".into()));
             return;

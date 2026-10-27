@@ -16,12 +16,7 @@ use proto::{
     io::{write_frame, FrameReader},
     Frame,
 };
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose, SanType,
-};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use s2n_quic::client::Connect;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use s2n_quic::connection::{Handle, StreamAcceptor};
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,6 +27,8 @@ use crate::gate::{acquire_slot, ConcurrencyGate, SlotOutcome, SLOT_WAIT_LOG_AFTE
 use crate::session::{heartbeat_loop, run, upstream_client};
 
 /// 生成 (CA, 服务端证书, 服务端私钥, 客户端证书, 客户端私钥) 的 DER。
+///
+/// 实际生成在 `test-support` 里（gateway e2e 与 agent 单测共用一份）。
 fn gen_pki() -> (
     CertificateDer<'static>,
     CertificateDer<'static>,
@@ -39,52 +36,23 @@ fn gen_pki() -> (
     CertificateDer<'static>,
     PrivateKeyDer<'static>,
 ) {
-    let ca_key = KeyPair::generate().unwrap();
-    let mut ca_params = CertificateParams::default();
-    ca_params
-        .distinguished_name
-        .push(DnType::CommonName, "test ca");
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-    let srv_key = KeyPair::generate().unwrap();
-    let mut srv = CertificateParams::default();
-    srv.distinguished_name.push(DnType::CommonName, "gw");
-    srv.subject_alt_names = vec![SanType::DnsName("localhost".try_into().unwrap())];
-    srv.is_ca = IsCa::NoCa;
-    srv.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    srv.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    let srv_cert = srv.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
-
-    let cli_key = KeyPair::generate().unwrap();
-    let mut cli = CertificateParams::default();
-    cli.distinguished_name.push(DnType::CommonName, "agent");
-    cli.is_ca = IsCa::NoCa;
-    cli.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    cli.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    let cli_cert = cli.signed_by(&cli_key, &ca_cert, &ca_key).unwrap();
-
+    let pki = test_support::pki::generate();
     (
-        ca_cert.der().clone(),
-        srv_cert.der().clone(),
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(srv_key.serialize_der())),
-        cli_cert.der().clone(),
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cli_key.serialize_der())),
+        test_support::pki::parse_certs(&pki.ca).remove(0),
+        test_support::pki::parse_certs(&pki.server_cert).remove(0),
+        test_support::pki::parse_key(&pki.server_key),
+        test_support::pki::parse_certs(&pki.client_cert).remove(0),
+        test_support::pki::parse_key(&pki.client_key),
     )
 }
 
 /// 建立一个本地的 s2n-quic 连接对（无 mTLS），返回客户端 [`Handle`]。
 /// 服务端只保活连接、不读流。
 async fn test_connection() -> Handle {
-    // 服务端：自签证书 + 无客户端认证
-    let key = KeyPair::generate().unwrap();
-    let cert = CertificateParams::new(vec!["localhost".to_string()])
-        .unwrap()
-        .self_signed(&key)
-        .unwrap();
-    let cert_der = cert.der().clone();
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+    // 服务端：用测试 PKI 的服务端身份；客户端只信任 CA（无客户端认证）
+    let (ca, srv_cert, srv_key, _, _) = gen_pki();
+    let cert_der = srv_cert;
+    let key_der = srv_key;
 
     let mut stls = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -112,23 +80,13 @@ async fn test_connection() -> Handle {
 
     // 客户端：信任自签证书，无客户端证书
     let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert_der).unwrap();
+    roots.add(ca).unwrap();
     let mut ctls = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     ctls.alpn_protocols = vec![ALPN.to_vec()];
 
-    let client = s2n_quic::Client::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
-            ctls,
-        )))
-        .unwrap()
-        .with_io("0.0.0.0:0")
-        .unwrap()
-        .start()
-        .unwrap();
-    let conn = client
-        .connect(s2n_quic::client::Connect::new(server_addr).with_server_name("localhost"))
+    let conn = test_support::tunnel::connect(server_addr, "localhost", ctls, "0.0.0.0:0")
         .await
         .unwrap();
     let (handle, _acceptor) = conn.split();
@@ -365,19 +323,10 @@ async fn connect_for_test_with_acceptor(
     cfg: &AgentConfig,
     client_config: rustls::ClientConfig,
 ) -> (s2n_quic::connection::Handle, StreamAcceptor) {
-    let client = s2n_quic::Client::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
-            client_config,
-        )))
-        .unwrap()
-        .with_io("0.0.0.0:0")
-        .unwrap()
-        .start()
-        .unwrap();
-    let conn = client
-        .connect(Connect::new(cfg.cloud_addr).with_server_name(cfg.server_name.clone()))
-        .await
-        .unwrap();
+    let conn =
+        test_support::tunnel::connect(cfg.cloud_addr, &cfg.server_name, client_config, "0.0.0.0:0")
+            .await
+            .unwrap();
     let (handle, acceptor) = conn.split();
     (handle, acceptor)
 }

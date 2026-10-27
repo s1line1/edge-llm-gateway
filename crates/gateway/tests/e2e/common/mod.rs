@@ -13,10 +13,7 @@ pub use proto::{
     io::{write_frame, FrameReader},
     Frame,
 };
-pub use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose, SanType,
-};
+pub use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 pub use serial_test::serial;
 

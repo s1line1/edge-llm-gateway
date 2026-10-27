@@ -24,62 +24,26 @@ pub fn gen_certs() -> (
 }
 
 /// 生成同一套证书的 PEM 文本（HTTPS 公网入口需要 PEM 字节）。
+///
+/// 实际生成在 `test-support` 里（e2e / agent 测试共用一份）；这里只把字段摊平成元组，
+/// 免得所有调用点都改成解构 `PemCerts`。
 pub fn gen_certs_pem() -> (String, String, String, String, String) {
-    let ca_key = KeyPair::generate().unwrap();
-    let mut ca_params = CertificateParams::default();
-    ca_params
-        .distinguished_name
-        .push(DnType::CommonName, "e2e CA");
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    // CA 的用途取并集：DER 路径原先多一项 DigitalSignature，PEM 路径没有。
-    // 合并成一份之后按**更宽**的那个来——给 CA 加用途不会让原本通过的握手失败。
-    ca_params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-        KeyUsagePurpose::DigitalSignature,
-    ];
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-    let server_key = KeyPair::generate().unwrap();
-    let mut srv = CertificateParams::default();
-    srv.distinguished_name.push(DnType::CommonName, "gateway");
-    srv.subject_alt_names = vec![
-        SanType::DnsName("localhost".try_into().unwrap()),
-        SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-    ];
-    srv.is_ca = IsCa::NoCa;
-    srv.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    srv.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    let server_cert = srv.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
-
-    let client_key = KeyPair::generate().unwrap();
-    let mut cli = CertificateParams::default();
-    cli.distinguished_name
-        .push(DnType::CommonName, "test-agent");
-    cli.is_ca = IsCa::NoCa;
-    cli.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    cli.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    let client_cert = cli.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
-
+    let pki = test_support::pki::generate();
     (
-        ca_cert.pem(),
-        server_cert.pem(),
-        server_key.serialize_pem(),
-        client_cert.pem(),
-        client_key.serialize_pem(),
+        pki.ca,
+        pki.server_cert,
+        pki.server_key,
+        pki.client_cert,
+        pki.client_key,
     )
 }
 
 pub fn parse_certs_pem(pem: &str) -> Vec<CertificateDer<'static>> {
-    rustls_pemfile::certs(&mut std::io::Cursor::new(pem.as_bytes()))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+    test_support::pki::parse_certs(pem)
 }
 
 pub fn parse_key_pem(pem: &str) -> PrivateKeyDer<'static> {
-    rustls_pemfile::private_key(&mut std::io::Cursor::new(pem.as_bytes()))
-        .unwrap()
-        .unwrap()
+    test_support::pki::parse_key(pem)
 }
 
 /// 一套测试用证书材料：CA + 一份 agent 客户端身份 + 服务端身份的两种编码形态。

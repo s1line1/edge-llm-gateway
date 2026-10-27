@@ -98,6 +98,7 @@ crates/gateway/tests/e2e/   e2e 场景（common/ 怎么起全栈；chain.rs 全�
                             write_backpressure.rs 写帧背压；nofile.rs；lifecycle.rs 关闭语义；
                             evict_close.rs 摘除宽限）
 crates/proto/benches/       Criterion 微基准（帧编解码；gateway 侧只剩 keystore argon2）
+crates/test-support/        测试专用 PKI + 裸 QUIC connect（e2e 与 agent 单测共用；publish = false）
 scripts/bench-k6/           k6 宏观压测模板（SSE 长流 + QPS，含 429 分类断言）
 scripts/check-toolchain.sh  工具链三处一致（rust-toolchain.toml / 所有构建 Rust 的 Dockerfile / MSRV；CI 与 `make check` 跑）
 ```

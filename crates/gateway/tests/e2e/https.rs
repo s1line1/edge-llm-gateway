@@ -2,7 +2,6 @@
 
 use super::common::*;
 
-use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -124,24 +123,20 @@ async fn e2e_quic_control_stream_edge_frames() {
     let TestGateway { gw, certs, .. } = start_gateway(|o| o.keys_file = None).await;
 
     // 裸 s2n-quic 客户端（复用 agent 的 mTLS 配置），不走 agent crate 逻辑
-    let client = s2n_quic::Client::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
-            agent::tls::rustls_client_tls(
-                &certs.ca,
-                certs.client_cert.clone(),
-                certs.client_key.clone_key(),
-            )
-            .unwrap(),
-        )))
-        .unwrap()
-        .with_io("0.0.0.0:0")
-        .unwrap()
-        .start()
-        .unwrap();
-    let mut conn = client
-        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
-        .await
-        .unwrap();
+    let client_config = agent::tls::rustls_client_tls(
+        &certs.ca,
+        certs.client_cert.clone(),
+        certs.client_key.clone_key(),
+    )
+    .unwrap();
+    let mut conn = test_support::tunnel::connect(
+        gw.quic_addr,
+        "localhost",
+        client_config.clone(),
+        "0.0.0.0:0",
+    )
+    .await
+    .unwrap();
 
     // 正常注册 → 进入注册表
     let stream = conn.open_bidirectional_stream().await.unwrap();
@@ -214,10 +209,10 @@ async fn e2e_quic_control_stream_edge_frames() {
     .await;
 
     // 第二个裸客户端：注册后直接关闭连接 → accept_bi 出错 → 正常摘除
-    let mut conn2 = client
-        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
-        .await
-        .unwrap();
+    let mut conn2 =
+        test_support::tunnel::connect(gw.quic_addr, "localhost", client_config, "0.0.0.0:0")
+            .await
+            .unwrap();
     let stream = conn2.open_bidirectional_stream().await.unwrap();
     let (mut rr2, mut rs2) = stream.split();
     write_frame(
@@ -278,16 +273,8 @@ async fn mtls_registration_succeeds(
     gw: &Gateway,
     agent_id: &str,
 ) -> bool {
-    let client = s2n_quic::Client::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(tls)))
-        .unwrap()
-        .with_io("0.0.0.0:0")
-        .unwrap()
-        .start()
-        .unwrap();
-    let Ok(mut conn) = client
-        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
-        .await
+    let Ok(mut conn) =
+        test_support::tunnel::connect(gw.quic_addr, "localhost", tls, "0.0.0.0:0").await
     else {
         return false;
     };
@@ -415,24 +402,20 @@ async fn e2e_proxy_protocol_edge_cases() {
     .await;
 
     // 裸 s2n-quic 客户端：注册后按场景应答网关的代理请求
-    let client = s2n_quic::Client::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
-            agent::tls::rustls_client_tls(
-                &certs.ca,
-                certs.client_cert.clone(),
-                certs.client_key.clone_key(),
-            )
-            .unwrap(),
-        )))
-        .unwrap()
-        .with_io("0.0.0.0:0")
-        .unwrap()
-        .start()
-        .unwrap();
-    let mut conn = client
-        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
-        .await
-        .unwrap();
+    let client_config = agent::tls::rustls_client_tls(
+        &certs.ca,
+        certs.client_cert.clone(),
+        certs.client_key.clone_key(),
+    )
+    .unwrap();
+    let mut conn = test_support::tunnel::connect(
+        gw.quic_addr,
+        "localhost",
+        client_config.clone(),
+        "0.0.0.0:0",
+    )
+    .await
+    .unwrap();
     let stream = conn.open_bidirectional_stream().await.unwrap();
     let (mut rr, mut rs) = stream.split();
     write_frame(
