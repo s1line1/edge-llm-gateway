@@ -13,7 +13,7 @@ port), and you want to call it from anywhere with a standard OpenAI SDK — **wi
 local inference endpoint to the public Internet.**
 
 <p align="center">
-  <img alt="tests" src="https://img.shields.io/badge/tests-388%20passed-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-399%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -343,7 +343,7 @@ fmt · clippy -D warnings · cargo deny · nextest · web-format · web-lint · 
 web-build · toolchain-check · check-records
 ```
 
-> **Current scale (`cargo nextest run --workspace`, measured)**: **388 tests executed and passed (0 skipped)**, of which
+> **Current scale (`cargo nextest run --workspace`, measured)**: **399 tests executed and passed (0 skipped)**, of which
 > **70 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
 > per commit; trust the actual run output.
 >

@@ -500,9 +500,9 @@
 
 | 环节 | 位置 | 事实 |
 |---|---|---|
-| 发号 | `storage/hash.rs:116` | key 恒为 `sk-` + 24 随机字节（**192 位熵**）；`/admin/keys` 只收 `name`，**不存在"运维自己填 key"的入口**（`admin.rs:98`） |
-| 存储 | `storage/mod.rs:374` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
-| 校验 | `storage/mod.rs:350` → `hash.rs:94` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
+| 发号 | `storage/hash.rs:119` | key 恒为 `sk-` + 24 随机字节（**192 位熵**）；`/admin/keys` 只收 `name`，**不存在"运维自己填 key"的入口**（`admin.rs:98`） |
+| 存储 | `storage/mod.rs:155` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
+| 校验 | `storage/mod.rs:266` → `hash.rs:87` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
 | 缓存 | `storage/verified.rs:55` | `(lookup, cred_version)` 命中即跳过校验；有 TTL 与上限（`verified_cache_max: 1650`） |
 | 单飞 | `storage/verified.rs:73` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
 
@@ -1393,13 +1393,15 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 ### 中危
 
-- [ ] **`S2-1` `ProxyResponseEnd.ok` 写了但没人读（上游中途断流被当成正常结束）**：
+- [x] **`S2-1` `ProxyResponseEnd.ok` 写了但没人读（上游中途断流被当成正常结束）**：
       `proto/src/frame.rs:67` 定义了 `ok`，agent 在上游响应体 `next()` 出错时置 `false` 并照发
       （`crates/agent/src/stream.rs:313,336`），而网关**两处**消费点都用 `{ .. }` 忽略它
       （`crates/gateway/src/proxy/forward.rs:406`、`head.rs:69`）⇒ 客户端拿到**语法完整**的 200 +
       半截 JSON / 没有 `[DONE]` 的 SSE，指标还记成 `upstream_end`（与真正常结束同标签）、用量按
       "已结束"结算。修法：`ok == false` 时走 `Frame::Error` 那条路（推错误项掐断响应体）。
       **复核**：我自己读了代码（全仓无 `ok` 读者）。
+      **已修（2026-10-27，`fix(proxy): emit an error signal for truncated upstream responses`）**：网关在 `ForwardEnd::UpstreamTruncated` 上独立记账；SSE 发 `event: error` 且不发 `[DONE]`，非 SSE 推错误项中止响应体。回归：`upstream_end_signal_distinguishes_truncation_from_completion` + `e2e_truncated_sse_is_not_reported_as_complete`。
+
 - [ ] **`S2-2` 关停时非 SSE 的在途响应没有任何"不完整"信号**：
       `forward.rs:284-318` 里只有 `is_stream` 分支写 `event: error`；非 SSE 直接
       `tunnel_cancel + send.finish()` ⇒ 同样给客户端一个"完整"的截断体（`content-length` 是逐跳头、
@@ -1407,27 +1409,33 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       记为已完成，但代码没有任何客户端可见的截断信号，e2e 也只钉了 SSE
       （`tests/e2e/lifecycle.rs` 的 `e2e_shutdown_announces_incomplete_sse_instead_of_cutting`）。
       **复核**：我自己读了代码。
-- [ ] **`S2-3` "唯一能服务该模型的 agent 正忙"被报成 404（应 429）**：
+- [x] **`S2-3` "唯一能服务该模型的 agent 正忙"被报成 404（应 429）**：
       忙（`Disposition::Transient`）刻意不写 `last_failure`（`routing.rs:188-194`），但重试时
       `pick()` 是"**先按 exclude 过滤、再按 model 过滤**"（`registry.rs:360-371`）⇒ 唯一服务该模型
       的候选被 exclude 后，模型过滤滤空 → `AcquireError::NoModel` → **404 `model not found on any
       agent`** + 标签 `no-agent-serves-model`，把"该扩容"说成"没人声明这个模型"（SDK 也不会按 429
       退避重试）。`B1` 的修复只覆盖了"候选全被 exclude"那一格（`AllExcluded` → 429）。
       触发：异构 edge（A 只声明 qwen、B 只声明 llama）+ A 到达流额度。**复核**：我自己读了代码。
-- [ ] **`S2-4` key id 只有 32 位，且 `create` 用 `INSERT OR REPLACE`：撞 id 时静默删掉另一把 key 的库行**：
+      **已修（2026-10-27，`fix(registry): report busy model agents as capacity`）**：`pick()` 在 exclude 前记录 `has_model_candidate`；模型候选被全部排除时返回 `AllExcluded`（429），只有确实没有该模型时才 `NoModel`（404）。回归：`heterogeneous_pool_reports_all_excluded_when_sole_model_agent_is_excluded` + `no_model_still_reports_no_model`。
+
+- [x] **`S2-4` key id 只有 32 位，且 `create` 用 `INSERT OR REPLACE`：撞 id 时静默删掉另一把 key 的库行**：
       `storage/hash.rs:119-127` 把 4 个随机字节格式化成 8 位十六进制；这条 id 同时是主键、吊销的键
       与用量归因的键（`storage/mod.rs:388` 的 `INSERT OR REPLACE`，无碰撞检查/重试）。生日碰撞：
       1 万把 key ≈1.2%、6.5 万把 ≈39%。后果：旧 key 的库行被销毁（内存里两把都还在、继续放行，
       重启后旧 key 静默 401）、`delete(id)` 会一次吊销两把、两把用量并进同一行。**修法要单独定**
       （扩 id 位数是库/接口层面的变化）。**复核**：我自己读了代码；子代理另用 `sqlite3 :memory:`
       跑了同形语句复现"旧行被删"。
-- [ ] **`S2-5` `key_usage` 载入失败降级成空账本 + flush 写绝对值 ⇒ 覆盖库里已累计的用量**：
+      **已修（2026-10-27，`fix(storage): make key ids collision-safe`）**：新 id 为 128 位（32 位十六进制）；`create` 改为普通 `INSERT` + 最多 3 次唯一冲突重试，不再 `INSERT OR REPLACE`；旧 8 字符 id 仍可载入。回归：`generate_id_key_format` + `duplicate_id_insert_is_rejected_not_replaced` + `eight_character_legacy_id_still_loads`。
+
+- [x] **`S2-5` `key_usage` 载入失败降级成空账本 + flush 写绝对值 ⇒ 覆盖库里已累计的用量**：
       `storage/usage.rs:106-122` 载入失败只 `warn!` + 空 `HashMap`（凭据侧同位置是记 failure 并让
       启动 fail-fast），而 upsert 写的是 `excluded.prompt_tokens`（`:238`）⇒ 之后第一次 flush 就把
       库里原有的大数值覆盖成重启后的小数值，**抹掉历史**（不是"少记一段"）。触发：任何让这条
       SELECT 失败但写仍可用的状态（某行列被写成 TEXT、页损坏等）；`for row in rows { row? }` 还会
       因一行坏而丢弃整次载入。`TODO` 曾把"告警 + 空账本继续"定性为刻意不改，但**没有覆盖这个
       覆盖后果**，需重新确认。**复核**：我自己读了代码；子代理跑了同形 UPSERT 复现覆盖。
+      **已修（2026-10-27，`fix(storage): preserve usage rows when load fails`）**：`key_usage` 载入失败时 `UsageStore::has_db=false`，本进程禁用落库并 `error!`，旧行不再被绝对值 upsert 覆盖。回归：`usage_load_failure_disables_persistence`。
+
 - [ ] **`S2-6` 指标页把 `hlmg_agents`（含心跳过期）当"在线 Agents"，与同屏侧边栏矛盾**：
       `web/src/pages/MetricsPage.tsx:82`（卡片标题"在线 Agent 数"、副标题"已注册 agent 数"）
       用的是 `latest.agents`，而 `Layout.tsx:78` 用 `agents_healthy`。G1/P3-19 修了
@@ -1452,10 +1460,12 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       但标签 `all-candidates-at-capacity` 来自 `routing.rs:270-281`，客户端拿到的是 **429
       `agent at capacity`**。同类问题在 `hlmg_tunnel_retries_total` 上已按 C2-5 修过，这一族漏了。
       **复核**：我自己读了 HELP 与映射两侧。
-- [ ] **`S2-10` `Connection` 头点名的字段不会被剥离**：`proto/src/headers.rs:38-40` 的谓词只收
+- [x] **`S2-10` `Connection` 头点名的字段不会被剥离**：`proto/src/headers.rs:38-40` 的谓词只收
       **头名**，全仓没有任何调用点读 `Connection` 的取值（RFC 9110 §7.6.1 要求连它点名的字段一起
       删）⇒ 客户端/前置反代用 `Connection: X-Client-Cert` 标成单跳的头会一路进隧道、可能进上游的
       鉴权分支或日志。**复核**：我自己 grep 了全仓（无读者）。
+      **已修（2026-10-27，`fix(headers): strip connection-named fields and x-api-key`）**：新增 `connection_tokens`/`is_connection_named`/`is_forwardable`，网关请求、agent 请求、agent 响应、网关响应四处都剥离 `Connection` 点名字段；`x-api-key` 加入凭据头。回归：`connection_tokens_and_named_fields`、`x_api_key_is_a_client_credential`、`filter_headers_strips_connection_named_fields_and_x_api_key`、`connection_named_response_fields_are_not_forwarded`。
+
 - [x] **`S2-11` `build-release.sh` 四个目标全被跳过时仍报成功**：`scripts/build-release.sh:49-54`
       只在 `failed` 非空时退出 1；全 `continue` 时 `built` 为空也会打印"完成（0 个目标），产物在
       dist/"并 exit 0（rustup 不在 PATH 时必然如此），dist/ 是空的。H1-6 只修了"第一个失败吞掉
