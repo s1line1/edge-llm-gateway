@@ -841,14 +841,14 @@
       源码注释里**的审计标记。起因：我把 `//` 注释写在了 JSX **子节点位置**（那里它是文本），
       整段说明被渲染到了总览页上，而 `tsc` 与 `vite build` 都不会报错（见 PROJECT_SCAN P3-19）。
       它是启发式的（只抓这种标记），但把"这一类"变成了**构建即失败**；放进 `build` 脚本而不是
-      Makefile，是因为 CI 跑的是 `pnpm build`（`.github/workflows/ci.yml:90`），这样三处都覆盖。
+      Makefile，是因为 CI 跑的是 `pnpm build`（`.github/workflows/ci.yml:89`），这样三处都覆盖。
 
 ### 前端工程化（P3-21：三条工具已落地，下述条目为历史登记）
 
 - [x] **前端 lint / formatter / 测试（2026-09-26 复核：三样都已落地，本次只是对账）**：
       `web/` 现在有 **prettier**（`pnpm format:check`）、**oxlint**（`pnpm lint`，`--max-warnings 0`）、
       **vitest + @testing-library/react**（`pnpm test`，当前 35 条），CI 四步全覆盖
-      （`.github/workflows/ci.yml:89-99` 跑 format:check / lint / test / build）。与当初预案的差别：
+      （`.github/workflows/ci.yml:79-89` 跑 format:check / lint / test / build）。与当初预案的差别：
       lint 用的是 **oxlint** 而不是 `eslint` + `typescript-eslint`——零配置、更快，也省掉了"先定规则集"
       那一步。**原始登记（供对照）**：当时 `web/` 只有 `tsc` + `vite build` 两道，三样都要新增
       devDependencies、属本阶段冻结的"新依赖"，故先登记不实施；当时建议一次只加一件，并提醒 CI 的 node 是 22
@@ -1358,7 +1358,7 @@
 来源：2026-09-25 的全项目复扫（明细在 gitignored 的 `docs/PROJECT_SCAN_2026-09-25.md`）。
 本节只登记"修复已落地、但约定的测试仍没写成"的那一条；复扫里其余未修项不在这里重复。
 
-- [ ] **`B1`（唯一 agent 忙 ⇒ 429）约定的 e2e 没写成**：修复本身在——`pick()` 改成先判"有没有
+- [x] **`B1`（唯一 agent 忙 ⇒ 429）约定的 e2e 没写成**：修复本身在——`pick()` 改成先判"有没有
       候选"、再按 `exclude` 过滤，新增 `AcquireError::AllExcluded`，`rejection_response()` 把两种
       "忙"一起映射成 429 `agent at capacity` + 标签 `all-candidates-at-capacity`，两层都有单测
       且都做了变异验证。缺的是"单 agent + 忙"的端到端用例。下面记下**正确诊断**与**走过的弯路**，
@@ -1382,6 +1382,14 @@
         闸门先把它拦下来）、`tunnel_op_timeout = 1s`、并发 > 2。超出的那批会开流超时，而
         `inflight(> 2) ≥ min(0 → ceiling = 2)` ⇒ 判"忙"。若这条路仍不通，再上"额度很小的假
         peer"：只广告很小的 MAX_STREAMS，并且接受流之后**握着不放**。
+      **已修（2026-10-27，`test(e2e): cover single-agent open-timeout busy 429`）**：新增 `e2e_single_agent_open_timeout_busy_returns_429`；两条长 SSE 握住 `max_open_tunnel_streams=2`，第三个请求 1s 开流超时后走 `AllExcluded` → 429，连续 5 次通过。
+
+- [x] **`504-not-retried` 约定"响应头超时后不重试"的直接测试没写成**：代码在
+      `proxy/routing.rs` 只对开流/写帧失败重试，504 直接返回；缺的是"第二个上游没有收到请求"的
+      端到端证据。
+      **已修（2026-10-27，`test(e2e): assert head timeout is not retried`）**：新增
+      `e2e_head_timeout_is_not_retried`；两个 agent/mock 下 504 后两边 `/stats.requests` 总和只
+      增加 1，连续 3 次通过。
 
 ## 2026-09-26 全项目复扫（第二轮，六切片）
 

@@ -12,7 +12,7 @@
 任何地方用标准的 OpenAI SDK 调它，同时**不把本地推理端点直接暴露到公网**。
 
 <p align="center">
-  <img alt="测试" src="https://img.shields.io/badge/tests-399%20passed-brightgreen">
+  <img alt="测试" src="https://img.shields.io/badge/tests-401%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -295,15 +295,16 @@ make check                             # 全量门槛：见下
 优雅关闭、真实进程的启动/信号/日志，以及端到端全链路（内存生成证书起完整
 QUIC + mTLS 栈，不需要任何外部服务）。
 
-`make check` 是本地等价于 CI 的一键全量验证：
+`make check-rust` 是 CI Rust job 的单一来源：
 
 ```
-fmt · clippy -D warnings · cargo deny · nextest · web-format · web-lint · web-test ·
-web-build · toolchain-check · check-records
+fmt · clippy -D warnings · nextest · e2e 接线 · toolchain-check · check-records
 ```
 
-> **当前规模（`cargo nextest run --workspace` 实测）**：**399 个被执行且通过的测试（0 skipped）**，其中
-> **70 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
+`make check` 在它之外再加 `cargo deny` 与前端四项（web-format / web-lint / web-test / web-build）。
+
+> **当前规模（`cargo nextest run --workspace` 实测）**：**401 个被执行且通过的测试（0 skipped）**，其中
+> **73 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
 >
 > 两点与 `cargo test` 不同的行为要知道：**nextest 每条测试一个进程**，所以 `serial_test` 的
 > `#[serial]`（进程内锁）在它下面失效——e2e 的串行改由 `.config/nextest.toml` 的 `test-group`
