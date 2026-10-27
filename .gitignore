@@ -27,3 +27,5 @@ keys.db-shm
 /diagrams/*
 
 /specs/*
+
+/plan
