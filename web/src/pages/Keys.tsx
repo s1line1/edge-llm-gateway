@@ -1,10 +1,11 @@
-// API Keys：签发、查看与吊销调用方凭据。明文只在创建时出现一次。
+// API Keys：角色/tenant 作用域内的签发、列表与吊销。明文只在创建时出现一次。
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 
-import { createKey, deleteKey, listKeys } from "../api/client";
+import { createKey, deleteKey, listKeys, listTenants } from "../api/client";
 import type { CreatedKey, KeyUsage } from "../api/types";
+import { useAuth } from "../auth/useAuth";
 import { Icon } from "../components/icons";
 import {
   Badge,
@@ -15,26 +16,35 @@ import {
   Panel,
   PanelHead,
 } from "../components/ui";
-import { useAdminToken } from "../hooks/useAdminToken";
 
 export default function Keys() {
-  const token = useAdminToken();
+  const { user } = useAuth();
   const queryClient = useQueryClient();
+  const isSuper = user?.role === "super_admin";
+  const isUser = user?.role === "user";
 
   const [name, setName] = useState("");
+  const [tenantFilter, setTenantFilter] = useState("");
   const [created, setCreated] = useState<CreatedKey | null>(null);
   const [copied, setCopied] = useState(false);
   const [search, setSearch] = useState("");
 
+  const tenantsQuery = useQuery({
+    queryKey: ["admin", "tenants"],
+    queryFn: listTenants,
+    enabled: isSuper,
+    staleTime: 10_000,
+  });
+
   const keysQuery = useQuery({
-    queryKey: ["admin", "keys"],
-    queryFn: () => listKeys(token),
-    enabled: !!token,
+    queryKey: ["admin", "keys", tenantFilter],
+    queryFn: () => listKeys(tenantFilter || undefined),
+    enabled: !!user,
     refetchInterval: 10_000,
   });
 
   const createMutation = useMutation({
-    mutationFn: (keyName: string) => createKey(token, keyName),
+    mutationFn: (keyName: string) => createKey(keyName, tenantFilter || undefined),
     onSuccess: (rec) => {
       setCreated(rec);
       setName("");
@@ -43,7 +53,7 @@ export default function Keys() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (id: string) => deleteKey(token, id),
+    mutationFn: (id: string) => deleteKey(id),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "keys"] }),
   });
 
@@ -80,7 +90,7 @@ export default function Keys() {
   const keys = (keysQuery.data ?? []).filter((k) => {
     const needle = search.trim().toLowerCase();
     if (!needle) return true;
-    return `${k.name} ${k.id} ${k.tenant_name ?? k.tenant_id ?? "default"}`
+    return `${k.name} ${k.id} ${k.owner_username ?? ""} ${k.tenant_name ?? k.tenant_id ?? ""}`
       .toLowerCase()
       .includes(needle);
   });
@@ -89,9 +99,13 @@ export default function Keys() {
     <div className="space-y-6">
       <PageHeader
         index="03"
-        eyebrow="CONTROL / CREDENTIALS"
+        eyebrow={isUser ? "ACCESS / MY KEYS" : "CONTROL / CREDENTIALS"}
         title="API Keys"
-        description="每个客户端一枚独立凭据。Key 持久化在网关 SQLite，只保存 argon2 哈希，明文只在创建时返回一次。"
+        description={
+          isUser
+            ? "这里只显示你名下的 Key 与用量。创建后把明文配置到客户端；吊销立即生效。"
+            : "每个客户端一枚独立凭据。Key 只保存 argon2 哈希，明文只在创建时返回一次。"
+        }
         actions={
           <>
             <Badge tone="cyan">{keysQuery.data?.length ?? "—"} ISSUED</Badge>
@@ -109,9 +123,32 @@ export default function Keys() {
           <PanelHead
             eyebrow="ISSUE"
             title="创建新 Key"
-            description="为每个客户端（DSH / Codex / 脚本）单独创建，便于独立吊销与计量。"
+            description={
+              isSuper
+                ? "超级管理员可以为任意 tenant 签发 tenant 级 Key。"
+                : isUser
+                  ? "Key 自动归属当前账号，其他用户不可见。"
+                  : "Key 自动归属当前 tenant，由 tenant 管理员统一管理。"
+            }
           />
           <div className="panel-body">
+            {isSuper && (
+              <label className="mb-2 block">
+                <span className="micro-label mb-1.5 block">Tenant</span>
+                <select
+                  value={tenantFilter}
+                  onChange={(e) => setTenantFilter(e.target.value)}
+                  className="input"
+                >
+                  <option value="">default tenant</option>
+                  {(tenantsQuery.data ?? []).map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name} ({t.id.slice(0, 8)})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <form
               className="flex flex-col gap-2 sm:flex-row"
               onSubmit={(e) => {
@@ -173,7 +210,7 @@ export default function Keys() {
               ["STORAGE", "SQLite · argon2id hash"],
               ["LOOKUP", "sha256 index · verified cache"],
               ["REVOKE", "immediate · no TTL wait"],
-              ["SCOPE", "tenant-scoped routing"],
+              ["SCOPE", isUser ? "owned by you" : "tenant-scoped routing"],
             ].map(([label, value]) => (
               <div
                 key={label}
@@ -227,11 +264,12 @@ export default function Keys() {
             <EmptyState title="没有匹配的 Key" detail="调整搜索词。" icon="search" />
           ) : (
             <div className="-mx-4 overflow-x-auto sm:mx-0">
-              <table className="data-table min-w-[860px]">
+              <table className="data-table min-w-[940px]">
                 <thead>
                   <tr>
                     <th>名称</th>
                     <th>Tenant</th>
+                    <th>Owner</th>
                     <th>ID</th>
                     <th>前缀</th>
                     <th>用量（token）</th>
@@ -247,6 +285,9 @@ export default function Keys() {
                       <td className="font-medium text-paper">{k.name}</td>
                       <td>
                         <Badge tone="cyan">{k.tenant_name ?? k.tenant_id ?? "default"}</Badge>
+                      </td>
+                      <td className="font-mono text-[10px] text-mist">
+                        {k.owner_username ?? "tenant"}
                       </td>
                       <td className="font-mono text-[10px] text-mist">{k.id}</td>
                       <td className="font-mono text-[10px] text-mist">{k.prefix}</td>

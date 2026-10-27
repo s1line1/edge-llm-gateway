@@ -1,7 +1,17 @@
-// 网关 HTTP 客户端：fetch 封装，Bearer 认证 + 统一错误处理。
+// 网关 HTTP 客户端：同源 session cookie + CSRF，统一错误处理。
 
 import { looksLikePrometheus } from "./metrics";
-import type { AgentInfo, ApiKey, CreatedKey, HealthStatus } from "./types";
+import type {
+  AdminUser,
+  AgentInfo,
+  ApiKey,
+  AuditRecord,
+  CreatedKey,
+  HealthStatus,
+  Tenant,
+  UsageRecord,
+  UserRole,
+} from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -13,18 +23,41 @@ export class ApiError extends Error {
   }
 }
 
-const jsonHeaders = (token: string | null) => ({
-  "Content-Type": "application/json",
-  ...(token ? { Authorization: `Bearer ${token}` } : {}),
-});
+function cookieValue(name: string): string {
+  if (typeof document === "undefined") return "";
+  const prefix = `${name}=`;
+  const part = document.cookie
+    .split(";")
+    .map((p) => p.trim())
+    .find((p) => p.startsWith(prefix));
+  return part ? decodeURIComponent(part.slice(prefix.length)) : "";
+}
+
+function isUnsafe(method: string): boolean {
+  return !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
+}
 
 /**
- * JSON 边界的**形状**校验。
- *
- * `as T` 不做任何运行时检查：网关版本错配（字段改名/变成错误对象）时，问题会在
- * `data.map(...)` 那类地方炸成一句看不出原因的错误。这里只校最基本的形状（数组/对象），
- * 把失败点前移，并说清是哪个端点、收到的是什么（P3-20）。
+ * 所有 `/admin/*` 请求的统一入口：同源 cookie、禁止缓存、写方法带 CSRF。
+ * 会话 token 是 HttpOnly，前端只负责携带 cookie；CSRF 从非 HttpOnly cookie 读取。
  */
+export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  if (init.body !== undefined && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (isUnsafe(init.method ?? "GET")) {
+    const csrf = cookieValue("hlmg_csrf");
+    if (csrf) headers.set("X-CSRF-Token", csrf);
+  }
+  return fetch(path, {
+    ...init,
+    headers,
+    credentials: "same-origin",
+    cache: "no-store",
+  });
+}
+
 function expectArray<T>(value: unknown, what: string): T[] {
   if (!Array.isArray(value)) throw new Error(`${what}: 期望数组，收到 ${describe(value)}`);
   return value as T[];
@@ -43,7 +76,7 @@ function describe(value: unknown): string {
   return typeof value;
 }
 
-async function handle<T>(resp: Response): Promise<T> {
+export async function handle<T>(resp: Response): Promise<T> {
   if (!resp.ok) {
     let message = `HTTP ${resp.status}`;
     try {
@@ -71,17 +104,7 @@ export async function fetchHealth(): Promise<HealthStatus> {
 /** `/metrics` 取数的超时（毫秒）。 */
 export const METRICS_TIMEOUT_MS = 10_000;
 
-/**
- * 网关 /metrics（Prometheus 文本）。
- *
- * 超时是**必须**的（复扫 G2）：网关侧的 `/metrics` 可能长时间不返回（慢查询、连接泄漏、
- * 后端卡住），而没有 `signal` 的 `fetch` 会一直挂着。调用方 `useMetricsHistory` 只在
- * `finally` 里安排下一次采样，所以"挂死"会让轮询**永久停止**，且 `reachable`/`latest`
- * 冻结在上次成功的值上——界面继续显示"网关在线 · N agents"，是**假绿**。有了超时，
- * 挂死变成一次普通失败：进 `catch`（标记不可达）并重新排期。
- *
- * `timeoutMs` 可传：测试用一个小值验证"挂死不返回"这条路径，不必等默认的 10 秒。
- */
+/** 网关 /metrics（Prometheus 文本）。超时防止轮询永久停止。 */
 export async function fetchMetricsText(timeoutMs: number = METRICS_TIMEOUT_MS): Promise<string> {
   const resp = await fetch("/metrics", {
     cache: "no-store",
@@ -90,11 +113,6 @@ export async function fetchMetricsText(timeoutMs: number = METRICS_TIMEOUT_MS): 
   if (!resp.ok) throw new ApiError(resp.status, `metrics: HTTP ${resp.status}`);
   const text = await resp.text();
 
-  // **200 不等于"这是指标"**（复扫 G3）：网关在**同一个 URL** 上按 `Accept` 也会回 SPA 页面
-  // （A5），中间缓存一旦按 URI 张冠李戴就会把它喂过来；而解析器把"解析不出来"当成"全是 0"，
-  // 界面于是显示 0 agents / 0 请求——与"网关真的空闲"不可区分，比拿不到更糟。
-  // 两道守卫：① 内容类型 —— 拦 A5 那条链；② 正文形状 —— 兜住"类型正常但内容不是指标"。
-  // 宁可判成一次失败：上层（`useMetricsHistory`）会标记不可达并继续轮询。
   if ((resp.headers.get("content-type") ?? "").toLowerCase().includes("text/html")) {
     throw new Error(
       "metrics: 期望 Prometheus 文本，收到的却是 HTML —— 可能是缓存把 /metrics 的 SPA 页面喂了过来",
@@ -106,41 +124,135 @@ export async function fetchMetricsText(timeoutMs: number = METRICS_TIMEOUT_MS): 
   return text;
 }
 
-export async function listKeys(token: string): Promise<ApiKey[]> {
-  const resp = await fetch("/admin/keys", {
-    headers: { Authorization: `Bearer ${token}` },
-    cache: "no-store",
-  });
+function adminQuery(tenantId?: string | null): string {
+  return tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : "";
+}
+
+export async function listKeys(tenantId?: string | null): Promise<ApiKey[]> {
+  const resp = await apiFetch(`/admin/keys${adminQuery(tenantId)}`);
   return expectArray<ApiKey>(await handle<unknown>(resp), "GET /admin/keys");
 }
 
-export async function createKey(token: string, name: string): Promise<CreatedKey> {
-  const resp = await fetch("/admin/keys", {
+export async function createKey(
+  name: string,
+  tenantId?: string | null,
+  ownerUserId?: string | null,
+): Promise<CreatedKey> {
+  const resp = await apiFetch("/admin/keys", {
     method: "POST",
-    headers: jsonHeaders(token),
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({
+      name,
+      ...(tenantId ? { tenant_id: tenantId } : {}),
+      ...(ownerUserId ? { owner_user_id: ownerUserId } : {}),
+    }),
   });
   return expectObject<CreatedKey>(await handle<unknown>(resp), "POST /admin/keys");
 }
 
-export async function deleteKey(token: string, id: string): Promise<void> {
-  const resp = await fetch(`/admin/keys/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-    headers: { Authorization: `Bearer ${token}` },
-  });
+export async function listUsage(tenantId?: string | null): Promise<UsageRecord[]> {
+  const resp = await apiFetch(`/admin/usage${adminQuery(tenantId)}`);
+  return expectArray<UsageRecord>(await handle<unknown>(resp), "GET /admin/usage");
+}
+
+export async function deleteKey(id: string): Promise<void> {
+  const resp = await apiFetch(`/admin/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
   await handle<void>(resp);
 }
 
-/**
- * Agent 明细（网关已实现；数据来自注册表实时快照）。
- * 返回 null 表示拿不到明细——旧版网关，或该部署未配置 admin_token（`/admin/*` 未挂载）；
- * 由调用方决定降级展示。
- */
-export async function fetchAgents(token: string): Promise<AgentInfo[] | null> {
-  const resp = await fetch("/admin/agents", {
-    headers: { Authorization: `Bearer ${token}` },
-    cache: "no-store",
-  });
+/** Agent 明细；404 仍表示旧版网关或未挂载 /admin/*。 */
+export async function fetchAgents(tenantId?: string | null): Promise<AgentInfo[] | null> {
+  const resp = await apiFetch(`/admin/agents${adminQuery(tenantId)}`);
   if (resp.status === 404) return null;
   return expectArray<AgentInfo>(await handle<unknown>(resp), "GET /admin/agents");
+}
+
+export async function listTenants(): Promise<Tenant[]> {
+  const resp = await apiFetch("/admin/tenants");
+  return expectArray<Tenant>(await handle<unknown>(resp), "GET /admin/tenants");
+}
+
+export async function createTenant(input: {
+  name: string;
+  max_concurrent_requests?: number;
+  requests_per_minute?: number;
+}): Promise<Tenant> {
+  const resp = await apiFetch("/admin/tenants", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return expectObject<Tenant>(await handle<unknown>(resp), "POST /admin/tenants");
+}
+
+export async function updateTenant(
+  id: string,
+  patch: Partial<
+    Pick<Tenant, "name" | "enabled" | "max_concurrent_requests" | "requests_per_minute">
+  >,
+): Promise<Tenant> {
+  const resp = await apiFetch(`/admin/tenants/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+  return expectObject<Tenant>(await handle<unknown>(resp), "PATCH /admin/tenants");
+}
+
+export async function deleteTenant(id: string): Promise<void> {
+  const resp = await apiFetch(`/admin/tenants/${encodeURIComponent(id)}`, { method: "DELETE" });
+  await handle<void>(resp);
+}
+
+export async function rotateAgentToken(id: string): Promise<{ agent_token: string }> {
+  const resp = await apiFetch(`/admin/tenants/${encodeURIComponent(id)}/agent-token`, {
+    method: "POST",
+  });
+  return expectObject<{ agent_token: string }>(
+    await handle<unknown>(resp),
+    "POST /admin/tenants/{id}/agent-token",
+  );
+}
+
+export async function listUsers(tenantId?: string | null): Promise<AdminUser[]> {
+  const resp = await apiFetch(`/admin/users${adminQuery(tenantId)}`);
+  return expectArray<AdminUser>(await handle<unknown>(resp), "GET /admin/users");
+}
+
+export async function createUser(input: {
+  username: string;
+  password: string;
+  role: UserRole;
+  tenant_id?: string | null;
+}): Promise<AdminUser> {
+  const resp = await apiFetch("/admin/users", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return expectObject<AdminUser>(await handle<unknown>(resp), "POST /admin/users");
+}
+
+export async function updateUser(
+  id: string,
+  patch: {
+    username?: string;
+    password?: string;
+    role?: UserRole;
+    tenant_id?: string;
+    clear_tenant?: boolean;
+    enabled?: boolean;
+  },
+): Promise<AdminUser> {
+  const resp = await apiFetch(`/admin/users/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+  return expectObject<AdminUser>(await handle<unknown>(resp), "PATCH /admin/users");
+}
+
+export async function deleteUser(id: string): Promise<void> {
+  const resp = await apiFetch(`/admin/users/${encodeURIComponent(id)}`, { method: "DELETE" });
+  await handle<void>(resp);
+}
+
+export async function listAudit(tenantId?: string | null): Promise<AuditRecord[]> {
+  const resp = await apiFetch(`/admin/audit${adminQuery(tenantId)}`);
+  return expectArray<AuditRecord>(await handle<unknown>(resp), "GET /admin/audit");
 }

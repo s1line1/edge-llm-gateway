@@ -7,8 +7,8 @@ import { useMemo, useState } from "react";
 import { fetchAgents } from "../api/client";
 import type { AgentInfo } from "../api/types";
 import { Badge, EmptyState, IconButton, PageHeader, Panel, PanelHead } from "../components/ui";
-import { useAdminToken } from "../hooks/useAdminToken";
-import { useMetricsHistory } from "../hooks/useMetricsHistory";
+import { useAuth } from "../auth/useAuth";
+import { useMetricsHistoryOptional } from "../hooks/useMetricsHistory";
 
 type Filter = "all" | "healthy" | "full" | "stale";
 
@@ -110,15 +110,16 @@ function AgentCard({ agent }: { agent: AgentInfo }) {
 }
 
 export default function Agents() {
-  const token = useAdminToken();
-  const { latest } = useMetricsHistory();
+  const { user } = useAuth();
+  const metrics = useMetricsHistoryOptional();
+  const latest = metrics?.latest ?? null;
   const [filter, setFilter] = useState<Filter>("all");
   const [search, setSearch] = useState("");
 
   const detailQuery = useQuery({
     queryKey: ["admin", "agents"],
-    queryFn: () => fetchAgents(token),
-    enabled: !!token,
+    queryFn: () => fetchAgents(),
+    enabled: !!user,
     refetchInterval: 5000,
     retry: false,
   });
@@ -167,7 +168,9 @@ export default function Agents() {
                   latest && latest.agents_healthy > 0 ? "status-dot-live" : "status-dot-warn"
                 }`}
               />
-              {latest ? `${latest.agents_healthy} ROUTABLE` : "NO TELEMETRY"}
+              {latest
+                ? `${latest.agents_healthy} ROUTABLE`
+                : `${detailQuery.data?.filter((a) => a.healthy).length ?? 0} ROUTABLE`}
             </Badge>
             <IconButton
               icon="refresh"
@@ -182,7 +185,9 @@ export default function Agents() {
         <div className="panel p-3 sm:p-4">
           <div className="micro-label">在线 Agent</div>
           <div className="mt-2 metric-value text-signal sm:mt-3">
-            {latest ? latest.agents_healthy : "—"}
+            {latest
+              ? latest.agents_healthy
+              : (detailQuery.data?.filter((a) => a.healthy).length ?? "—")}
           </div>
           <div className="mt-2 hidden text-[10px] leading-relaxed text-mist sm:block">
             可路由（hlmg_agents_healthy），不含心跳过期
@@ -191,7 +196,9 @@ export default function Agents() {
         <div className="panel p-3 sm:p-4">
           <div className="micro-label">在途请求</div>
           <div className="mt-2 metric-value text-paper sm:mt-3">
-            {latest ? latest.active_requests : "—"}
+            {latest
+              ? latest.active_requests
+              : (detailQuery.data?.reduce((sum, a) => sum + a.inflight, 0) ?? "—")}
           </div>
           <div className="mt-2 hidden text-[10px] leading-relaxed text-mist sm:block">
             所有 agent 合计
@@ -267,9 +274,7 @@ export default function Agents() {
                     <code className="font-mono text-[11px]">GET /admin/agents</code> 返回 404
                   </p>
                   <p className="mt-1.5 max-w-2xl text-[11px] leading-relaxed text-mist">
-                    网关版本较旧，或该部署没有配置{" "}
-                    <code className="font-mono text-[10px] text-mist">admin_token</code>
-                    （/admin/* 未挂载）。在线总数见上方卡片。
+                    网关版本较旧，或该部署没有挂载管理接口。在线总数见上方卡片。
                   </p>
                 </div>
               </div>

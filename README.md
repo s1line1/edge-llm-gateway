@@ -12,7 +12,7 @@
 任何地方用标准的 OpenAI SDK 调它，同时**不把本地推理端点直接暴露到公网**。
 
 <p align="center">
-  <img alt="测试" src="https://img.shields.io/badge/tests-418%20passed-brightgreen">
+  <img alt="测试" src="https://img.shields.io/badge/tests-447%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -107,6 +107,14 @@ agent 只做一件事：把隧道里收到的请求帧，变成一次对本地 L
 - 管理面：`/admin/tenants` CRUD、agent-token rotate，`/admin/keys`、`/admin/usage`、`/admin/agents`
   支持 tenant 过滤；tenant 不进 metric label（避免高基数），进结构化日志
 
+**Users & Roles**
+- Dashboard 使用账号密码登录：`super_admin`（平台级）、`tenant_admin`（单 tenant）、`user`（个人 key/用量）
+- 服务端 session 存 `sha256(token)`，cookie 为 `HttpOnly + SameSite=Lax`；写请求要求 CSRF double-submit
+- 首次启动用现有 `admin_token` 调 `POST /admin/auth/bootstrap` 创建第一个 `super_admin`；
+  `admin_token` 此后只作为 break-glass 凭据，不是日常登录方式
+- 禁用/删除用户会撤销 session 并禁用其名下 API key；改角色/改密码也会撤销旧 session
+- 最后一名 `super_admin` 不能被删除、禁用或降级
+
 **Security**
 - API Key：`sha256(token)` 快速索引定位 + **argon2id** 校验，**明文不落盘**
 - 已验证身份缓存（单飞 + 凭据版本核对），把 argon2 从"每请求一次"降到"每凭据版本一次"，
@@ -190,9 +198,14 @@ client = OpenAI(base_url="https://<你的网关>:8443/v1", api_key="sk-...")
 client.chat.completions.create(model="qwen2.5", messages=[{"role": "user", "content": "你好"}])
 ```
 
-**管理接口**（`admin_token` 启用，也提供网页管理页 `/`）：
+**管理接口**（网页管理页 `/` 用账号登录；下面的 `admin_token` 是 break-glass 路径）：
 
 ```bash
+# 首次启动：用 admin_token 创建第一个 super_admin（仅 users 表为空时可用）
+curl -X POST http://127.0.0.1:8080/admin/auth/bootstrap -H "Authorization: Bearer <admin-token>" \
+  -H "Content-Type: application/json" -d '{"username":"root","password":"<12+ chars>"}'
+
+# 浏览器打开 / 用 root 登录；脚本/应急仍可用 Bearer admin-token：
 curl -X POST   http://127.0.0.1:8080/admin/keys      -H "Authorization: Bearer <admin-token>" \
   -H "Content-Type: application/json" -d '{"name":"dsh-client"}'   # 返回明文 key，仅此一次
 curl           http://127.0.0.1:8080/admin/keys      -H "Authorization: Bearer <admin-token>"   # 列表（脱敏）
@@ -314,8 +327,8 @@ fmt · clippy -D warnings · nextest · e2e 接线 · toolchain-check · check-r
 
 `make check` 在它之外再加 `cargo deny` 与前端四项（web-format / web-lint / web-test / web-build）。
 
-> **当前规模（`cargo nextest run --workspace` 实测）**：**418 个被执行且通过的测试（0 skipped）**，其中
-> **76 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
+> **当前规模（`cargo nextest run --workspace` 实测）**：**447 个被执行且通过的测试（0 skipped）**，其中
+> **77 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
 >
 > 两点与 `cargo test` 不同的行为要知道：**nextest 每条测试一个进程**，所以 `serial_test` 的
 > `#[serial]`（进程内锁）在它下面失效——e2e 的串行改由 `.config/nextest.toml` 的 `test-group`

@@ -22,6 +22,9 @@ export interface ApiKey {
   created_at: number;
   enabled: boolean;
   prefix: string;
+  /** 归属的 dashboard 用户；null 表示 tenant 级共享 key。 */
+  owner_user_id?: string | null;
+  owner_username?: string | null;
   /** 用量汇总（无记录时各字段为 0）。 */
   usage: KeyUsage;
 }
@@ -105,3 +108,62 @@ export interface MetricsSnapshot {
 
 /** 轮询保留的最近采样点数。 */
 export const HISTORY_LEN = 60;
+
+/** dashboard 角色。字符串必须与 Rust `UserRole::as_str` 一致。 */
+export type UserRole = "super_admin" | "tenant_admin" | "user";
+
+export interface User {
+  id: string | null;
+  username: string;
+  role: UserRole;
+  tenant_id: string | null;
+  tenant_name: string | null;
+  enabled: boolean;
+  created_at: number;
+  updated_at: number;
+  last_login_at: number;
+}
+
+export interface SessionInfo {
+  user: User;
+  csrf_token: string | null;
+  source: "session" | "break_glass";
+}
+
+export interface AuthStatus {
+  bootstrapped: boolean;
+  break_glass_available: boolean;
+}
+
+export interface Tenant {
+  id: string;
+  name: string;
+  created_at: number;
+  enabled: boolean;
+  max_concurrent_requests: number;
+  requests_per_minute: number;
+  key_count: number;
+  user_count: number;
+  agent_count: number;
+  usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    requests: number;
+  };
+  agent_token?: string;
+}
+
+export interface AdminUser extends User {
+  created_by?: string | null;
+}
+
+export interface AuditRecord {
+  id: string;
+  actor_user_id: string | null;
+  actor_label: string;
+  tenant_id: string | null;
+  action: string;
+  target_id: string;
+  created_at: number;
+}

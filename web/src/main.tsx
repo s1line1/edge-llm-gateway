@@ -1,47 +1,114 @@
 import { QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
 import { createQueryClient } from "./api/queryClient";
+import { AuthProvider } from "./auth/AuthProvider";
+import { useAuth } from "./auth/useAuth";
 import Layout from "./components/Layout";
 import RequireAuth from "./components/RequireAuth";
+import RequireRole from "./components/RequireRole";
 import { MetricsHistoryProvider } from "./hooks/useMetricsHistory";
 import Agents from "./pages/Agents";
 import Keys from "./pages/Keys";
 import Login from "./pages/Login";
 import MetricsPage from "./pages/MetricsPage";
+import MyAccess from "./pages/MyAccess";
 import Overview from "./pages/Overview";
+import Tenants from "./pages/Tenants";
+import Users from "./pages/Users";
 import "./index.css";
 
-// 401 处理与默认选项在 `api/queryClient.ts`（那里可被测试直接构造）。
 const queryClient = createQueryClient();
+
+/** super_admin 需要全局 metrics；tenant_admin/user 不挂轮询，避免把跨 tenant 数据拉到浏览器。 */
+function AppShell() {
+  const { user } = useAuth();
+  if (user?.role === "super_admin") {
+    return (
+      <MetricsHistoryProvider>
+        <Layout />
+      </MetricsHistoryProvider>
+    );
+  }
+  return <Layout />;
+}
+
+function RoleHome() {
+  const { user } = useAuth();
+  if (user?.role === "super_admin") return <Overview />;
+  if (user?.role === "tenant_admin") return <Navigate to="/tenants" replace />;
+  return <Navigate to="/my-access" replace />;
+}
+
+function SuperOnly({ children }: { children: ReactNode }) {
+  return <RequireRole roles={["super_admin"]}>{children}</RequireRole>;
+}
+
+function TenantOrSuper({ children }: { children: ReactNode }) {
+  return <RequireRole roles={["super_admin", "tenant_admin"]}>{children}</RequireRole>;
+}
+
+function UserOnly({ children }: { children: ReactNode }) {
+  return <RequireRole roles={["user"]}>{children}</RequireRole>;
+}
 
 createRoot(document.getElementById("root")!).render(
   <QueryClientProvider client={queryClient}>
     <BrowserRouter>
-      <Routes>
-        <Route path="/login" element={<Login />} />
-        <Route element={<RequireAuth />}>
-          {/*
-            已登录的壳上挂**唯一**的 `/metrics` 轮询（复扫 G4）：侧边栏（`Layout`）与当前页面
-            （Overview / MetricsPage / Agents）共享同一份历史，不再各自开一条、各采各的
-            （采样时刻不同步时两处数字会对不上）。放在 `RequireAuth` 里面，所以登录页不拉。
-          */}
-          <Route
-            element={
-              <MetricsHistoryProvider>
-                <Layout />
-              </MetricsHistoryProvider>
-            }
-          >
-            <Route index element={<Overview />} />
-            <Route path="/keys" element={<Keys />} />
-            <Route path="/agents" element={<Agents />} />
-            <Route path="/metrics" element={<MetricsPage />} />
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route element={<RequireAuth />}>
+            <Route element={<AppShell />}>
+              <Route index element={<RoleHome />} />
+              <Route path="/keys" element={<Keys />} />
+              <Route
+                path="/agents"
+                element={
+                  <TenantOrSuper>
+                    <Agents />
+                  </TenantOrSuper>
+                }
+              />
+              <Route
+                path="/tenants"
+                element={
+                  <TenantOrSuper>
+                    <Tenants />
+                  </TenantOrSuper>
+                }
+              />
+              <Route
+                path="/users"
+                element={
+                  <TenantOrSuper>
+                    <Users />
+                  </TenantOrSuper>
+                }
+              />
+              <Route
+                path="/metrics"
+                element={
+                  <SuperOnly>
+                    <MetricsPage />
+                  </SuperOnly>
+                }
+              />
+              <Route
+                path="/my-access"
+                element={
+                  <UserOnly>
+                    <MyAccess />
+                  </UserOnly>
+                }
+              />
+            </Route>
           </Route>
-        </Route>
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
     </BrowserRouter>
   </QueryClientProvider>,
 );

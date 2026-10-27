@@ -11,8 +11,16 @@ import { describe, expect, it, vi } from "vitest";
 
 import viteConfig from "../vite.config";
 import Layout from "./components/Layout";
+import { TestAuthProvider } from "./auth/TestAuthProvider";
 
 vi.mock("./hooks/useMetricsHistory", () => ({
+  useMetricsHistoryOptional: () => ({
+    latest: null,
+    history: [],
+    raw: null,
+    error: null,
+    reachable: false,
+  }),
   useMetricsHistory: () => ({
     latest: null,
     history: [],
@@ -54,7 +62,9 @@ describe("网关版本号的单一来源（P3-20①）", () => {
   it("Layout 渲染的是注入值，不是写死的字面量", () => {
     render(
       <MemoryRouter>
-        <Layout />
+        <TestAuthProvider role="super_admin">
+          <Layout />
+        </TestAuthProvider>
       </MemoryRouter>,
     );
 

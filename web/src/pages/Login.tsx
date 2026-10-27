@@ -1,35 +1,51 @@
-// 登录：网关控制台的唯一入口。左侧是产品拓扑，右侧只做一件事——验证 admin token。
+// 登录：正常账号密码；首次启动时用 admin_token 创建第一个 super_admin，再走同一套登录。
 
+import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import type { FormEvent } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
-import { listKeys } from "../api/client";
+import { bootstrapAdmin, bootstrapStatus } from "../api/auth";
+import { useAuth } from "../auth/useAuth";
 import { GatewayMark, Icon } from "../components/icons";
 import { Badge, Button, Field } from "../components/ui";
-import { useSetAdminToken } from "../hooks/useAdminToken";
 
 export default function Login() {
-  const [token, setToken] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [adminToken, setAdminToken] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const saveToken = useSetAdminToken();
+  const { login } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const from = (location.state as { from?: string } | null)?.from ?? "/";
+  const statusQuery = useQuery({
+    queryKey: ["admin", "auth", "status"],
+    queryFn: bootstrapStatus,
+    retry: false,
+    staleTime: 10_000,
+  });
+
+  const needsBootstrap = statusQuery.data?.bootstrapped === false;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    const trimmed = token.trim();
-    if (!trimmed) return;
+    if (!username.trim() || !password) return;
     setLoading(true);
     setError(null);
     try {
-      await listKeys(trimmed);
-      saveToken(trimmed);
+      if (needsBootstrap) {
+        if (!adminToken.trim()) {
+          setError("首次启动需要 gateway-config.yml 中的 admin_token");
+          return;
+        }
+        await bootstrapAdmin(adminToken.trim(), username.trim(), password);
+      }
+      await login(username.trim(), password);
       navigate(from, { replace: true });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "登录失败，请检查 admin_token");
+      setError(err instanceof Error ? err.message : "登录失败");
     } finally {
       setLoading(false);
     }
@@ -70,8 +86,8 @@ export default function Login() {
                 入口开在公网。
               </h1>
               <p className="mt-5 max-w-md text-[0.82rem] leading-relaxed text-mist">
-                网关把 OpenAI 兼容入口、Bearer 认证与 QUIC 隧道接在一起。你在这里看到的每个数字，
-                都来自同一条请求路径。
+                网关把 OpenAI 兼容入口、Bearer 认证与 QUIC 隧道接在一起。登录后，租户、用户与 edge
+                的边界都按角色收敛。
               </p>
             </div>
           </div>
@@ -79,7 +95,7 @@ export default function Login() {
           <div className="relative grid grid-cols-3 gap-3">
             {[
               ["TRANSPORT", "QUIC + mTLS", "shield"],
-              ["ROUTING", "edge-local", "edge"],
+              ["ACCESS", "tenant scoped", "edge"],
               ["OBSERVE", "/metrics", "pulse"],
             ].map(([label, value, icon]) => (
               <div key={label} className="rounded-lg border border-line bg-ink-950/35 p-3">
@@ -117,26 +133,60 @@ export default function Login() {
             </div>
 
             <div className="hidden lg:block">
-              <div className="eyebrow">AUTHENTICATE</div>
+              <div className="eyebrow">{needsBootstrap ? "FIRST RUN" : "AUTHENTICATE"}</div>
               <h2 className="mt-2 text-2xl font-[560] tracking-[-0.035em] text-paper">
-                管理员登录
+                {needsBootstrap ? "初始化超级管理员" : "登录控制台"}
               </h2>
             </div>
             <p className="mt-3 text-[11px] leading-relaxed text-mist">
-              使用 gateway-config.yml 中配置的 admin_token。它只用于调用
-              /admin/*，不会进入模型请求。
+              {needsBootstrap
+                ? "用户表为空。先用启动配置里的 admin_token 创建第一个 super_admin，之后用账号密码登录。"
+                : "使用 dashboard 账号登录。session 存在 HttpOnly cookie 中，不写入 localStorage。"}
             </p>
+            {statusQuery.isError && (
+              <p className="mt-3 rounded-lg border border-amber/25 bg-amber/6 px-3 py-2 font-mono text-[10px] leading-relaxed text-amber">
+                无法读取启动状态：{statusQuery.error.message}
+              </p>
+            )}
 
             <form onSubmit={submit} className="mt-7 space-y-4">
-              <Field label="Admin Token" htmlFor="admin-token">
+              {needsBootstrap && (
+                <Field label="Admin Token" htmlFor="admin-token">
+                  <input
+                    id="admin-token"
+                    type="password"
+                    value={adminToken}
+                    onChange={(e) => setAdminToken(e.target.value)}
+                    placeholder="gateway-config.yml 中的 admin_token"
+                    autoComplete="off"
+                    className="input"
+                  />
+                </Field>
+              )}
+              <Field label="用户名" htmlFor="username">
                 <input
-                  id="admin-token"
-                  type="password"
-                  value={token}
-                  onChange={(e) => setToken(e.target.value)}
-                  placeholder="启动网关时配置的 admin_token"
-                  autoComplete="current-password"
+                  id="username"
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="例如 alice"
+                  autoComplete="username"
                   autoFocus
+                  className="input"
+                />
+              </Field>
+              <Field
+                label="密码"
+                htmlFor="password"
+                hint={needsBootstrap ? "至少 12 个字符" : undefined}
+              >
+                <input
+                  id="password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••••••"
+                  autoComplete="current-password"
                   className="input"
                 />
               </Field>
@@ -147,20 +197,20 @@ export default function Login() {
                 </p>
               )}
 
-              <Button type="submit" disabled={!token.trim() || loading} className="w-full">
+              <Button
+                type="submit"
+                disabled={!username.trim() || !password || loading}
+                className="w-full"
+              >
                 <Icon name="arrow" size={13} />
-                {loading ? "验证中…" : "登录控制台"}
+                {loading ? "验证中…" : needsBootstrap ? "初始化并登录" : "登录控制台"}
               </Button>
             </form>
 
             <div className="mt-7 border-t border-line-soft pt-5">
               <p className="text-[10px] leading-relaxed text-mist-dim">
-                token 保存在本浏览器 localStorage，仅用于调用 /admin/*。部署时在 gateway-config.yml
-                中配置，可用{" "}
-                <code className="rounded bg-ink-800 px-1 py-0.5 font-mono text-[9px] text-mist">
-                  openssl rand -hex 32
-                </code>{" "}
-                生成。
+                session 保存在 HttpOnly cookie；管理请求使用 CSRF double-submit。首次初始化后，
+                admin_token 只保留为 break-glass 凭据。
               </p>
             </div>
           </div>

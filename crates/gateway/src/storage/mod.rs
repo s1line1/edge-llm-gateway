@@ -36,12 +36,16 @@ use rusqlite::Connection;
 use crate::error::GatewayError;
 
 pub mod hash;
+mod session;
 mod tenant;
 mod usage;
+pub mod user;
 mod verified;
 
+pub use session::{CreatedSession, SessionRecord};
 pub(crate) use tenant::DEFAULT_TENANT_ID;
 pub use tenant::{CreatedTenant, TenantError, TenantPatch, TenantRecord};
+pub use user::{AuditRecord, CreatedUser, UserError, UserPatch, UserRecord, UserRole};
 
 /// 用量记账/落库的类型由私有模块 `usage` 定义，路径 `crate::storage::UsageDelta` 保持不变。
 pub use usage::{KeyUsageInfo, UsageDelta};
@@ -54,7 +58,7 @@ use crate::sync::{lock_or_recover, read_or_recover, write_or_recover};
 mod db;
 mod schema;
 
-use schema::{load_keys, load_tenants};
+use schema::{load_keys, load_sessions, load_tenants, load_users};
 
 #[derive(Clone)]
 pub struct Storage {
@@ -66,6 +70,12 @@ struct StoreInner {
     runtime: RwLock<HashMap<String, KeyRecord>>,
     /// 租户；`default` 始终存在。
     tenants: RwLock<HashMap<String, tenant::TenantRecord>>,
+    /// dashboard 用户，key = user id。
+    users: RwLock<HashMap<String, user::UserRecord>>,
+    /// 规范化用户名 → user id；与 `users` 同步维护。
+    usernames: RwLock<HashMap<String, String>>,
+    /// 服务端会话，key = sha256(token)。
+    sessions: RwLock<HashMap<String, session::SessionRecord>>,
     /// SQLite 持久化连接（None = 仅内存，如 db 打开失败时降级）。
     ///
     /// **与用量记账共享**（`Arc`）：连接是**资源**（凭据写穿与用量落库都用它），
@@ -109,6 +119,7 @@ pub struct KeyRecord {
     /// 从而让基于旧版本建立的已验证缓存**立即失效**（见 `verified` 模块）。
     pub(crate) cred_version: u64,
     pub(crate) tenant_id: String,
+    pub(crate) owner_user_id: Option<String>,
 }
 
 impl KeyRecord {
@@ -136,6 +147,11 @@ impl KeyRecord {
     /// 所属租户 id。
     pub fn tenant_id(&self) -> &str {
         &self.tenant_id
+    }
+
+    /// 归属的 dashboard 用户；`None` = tenant 级 key（迁移前或管理员创建）。
+    pub fn owner_user_id(&self) -> Option<&str> {
+        self.owner_user_id.as_deref()
     }
 }
 
@@ -168,8 +184,8 @@ fn is_unique_key_collision(err: &rusqlite::Error) -> bool {
 
 fn insert_api_key(conn: &Connection, record: &KeyRecord) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO api_keys (id, lookup, key_hash, name, created_at, enabled, tenant_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO api_keys (id, lookup, key_hash, name, created_at, enabled, tenant_id, owner_user_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             record.id,
             record.lookup,
@@ -177,7 +193,8 @@ fn insert_api_key(conn: &Connection, record: &KeyRecord) -> rusqlite::Result<()>
             record.name,
             record.created_at as i64,
             1i64,
-            record.tenant_id
+            record.tenant_id,
+            record.owner_user_id
         ],
     )
     .map(|_| ())
@@ -383,6 +400,9 @@ impl Storage {
         if self.key_count_for_tenant(id) > 0 {
             return Err(TenantError::HasKeys);
         }
+        if self.user_count_for_tenant(id) > 0 {
+            return Err(TenantError::HasUsers);
+        }
         if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
             if let Err(e) = conn.execute("DELETE FROM tenants WHERE id = ?1", rusqlite::params![id])
             {
@@ -424,9 +444,542 @@ impl Storage {
         self.inner.usage.usage_for_tenant(tenant_id)
     }
 
+    /// 某用户拥有的 key 的用量（按 key id 排序，供普通用户视图）。
+    pub fn usage_for_owner(&self, tenant_id: &str, owner_user_id: &str) -> Vec<KeyUsageInfo> {
+        let ids: Vec<String> = self
+            .list_for_owner(tenant_id, owner_user_id)
+            .into_iter()
+            .map(|k| k.id().to_string())
+            .collect();
+        let mut rows: Vec<KeyUsageInfo> = ids.iter().filter_map(|id| self.usage_of(id)).collect();
+        rows.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        rows
+    }
+
     /// tenant 汇总 (prompt, completion, total, requests)。
     pub fn tenant_totals(&self, tenant_id: &str) -> (u64, u64, u64, u64) {
         self.inner.usage.tenant_totals(tenant_id)
+    }
+
+    // ── dashboard users ──────────────────────────────────────────────────────
+
+    /// 按 id 取用户快照。
+    pub fn user(&self, id: &str) -> Option<UserRecord> {
+        read_or_recover(&self.inner.users).get(id).cloned()
+    }
+
+    /// 按规范化用户名取用户快照。
+    pub fn user_by_username(&self, username: &str) -> Option<UserRecord> {
+        let username = username.trim().to_ascii_lowercase();
+        let users = read_or_recover(&self.inner.users);
+        let usernames = read_or_recover(&self.inner.usernames);
+        usernames
+            .get(&username)
+            .and_then(|id| users.get(id))
+            .cloned()
+            .or_else(|| {
+                users
+                    .values()
+                    .find(|u| u.username().eq_ignore_ascii_case(&username))
+                    .cloned()
+            })
+    }
+
+    /// 全部用户（按创建时间排序）。
+    pub fn users(&self) -> Vec<UserRecord> {
+        let mut v: Vec<UserRecord> = read_or_recover(&self.inner.users)
+            .values()
+            .cloned()
+            .collect();
+        v.sort_by_key(|u| u.created_at());
+        v
+    }
+
+    /// 某 tenant 的用户（按创建时间排序）。
+    pub fn users_for_tenant(&self, tenant_id: &str) -> Vec<UserRecord> {
+        let mut v: Vec<UserRecord> = read_or_recover(&self.inner.users)
+            .values()
+            .filter(|u| u.tenant_id() == Some(tenant_id))
+            .cloned()
+            .collect();
+        v.sort_by_key(|u| u.created_at());
+        v
+    }
+
+    pub fn user_count(&self) -> usize {
+        read_or_recover(&self.inner.users).len()
+    }
+
+    pub fn user_count_for_tenant(&self, tenant_id: &str) -> usize {
+        read_or_recover(&self.inner.users)
+            .values()
+            .filter(|u| u.tenant_id() == Some(tenant_id))
+            .count()
+    }
+
+    /// 创建 dashboard 用户。密码只以 argon2 哈希落库。
+    pub fn create_user(
+        &self,
+        username: String,
+        password: String,
+        role: UserRole,
+        tenant_id: Option<String>,
+        created_by: Option<String>,
+    ) -> Result<CreatedUser, UserError> {
+        let username = user::validate_username(&username)?;
+        user::validate_password(&password)?;
+        self.ensure_role_tenant(role, tenant_id.as_deref())?;
+        if read_or_recover(&self.inner.usernames).contains_key(&username) {
+            return Err(UserError::UsernameTaken);
+        }
+        let password_hash = hash_argon2(&password);
+        let now = now_secs();
+        let record = UserRecord::from_parts(
+            user::generate_user_id(),
+            tenant_id,
+            username.clone(),
+            password_hash,
+            role,
+            true,
+            now,
+            now,
+            0,
+            created_by,
+        );
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            if let Err(e) = conn.execute(
+                "INSERT INTO users
+                 (id, tenant_id, username, password_hash, role, enabled, created_at, updated_at, last_login_at, created_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    record.id(),
+                    record.tenant_id(),
+                    record.username(),
+                    record.password_hash(),
+                    record.role().as_str(),
+                    i64::from(record.enabled()),
+                    record.created_at() as i64,
+                    record.updated_at() as i64,
+                    record.last_login_at() as i64,
+                    record.created_by(),
+                ],
+            ) {
+                if is_unique_violation(&e) {
+                    return Err(UserError::UsernameTaken);
+                }
+                return Err(UserError::Database(e.to_string()));
+            }
+        }
+        write_or_recover(&self.inner.usernames).insert(username, record.id().to_string());
+        write_or_recover(&self.inner.users).insert(record.id().to_string(), record.clone());
+        Ok(CreatedUser { record })
+    }
+
+    /// 更新用户。`password` 在 PATCH 里单独处理（先哈希，再与字段更新一起落库）。
+    pub fn update_user(&self, id: &str, patch: UserPatch) -> Result<UserRecord, UserError> {
+        let current = self.user(id).ok_or(UserError::NotFound)?;
+        let username = match patch.username {
+            Some(name) => user::validate_username(&name)?,
+            None => current.username().to_string(),
+        };
+        if username != current.username() {
+            let taken = read_or_recover(&self.inner.usernames)
+                .get(&username)
+                .is_some_and(|other| other != id);
+            if taken {
+                return Err(UserError::UsernameTaken);
+            }
+        }
+        let role = patch.role.unwrap_or(current.role());
+        let tenant = patch
+            .tenant_id
+            .unwrap_or_else(|| current.tenant_id().map(str::to_string));
+        self.ensure_role_tenant(role, tenant.as_deref())?;
+        let enabled = patch.enabled.unwrap_or(current.enabled());
+        if !enabled && current.role() == UserRole::SuperAdmin && current.enabled() {
+            self.ensure_not_last_super(id)?;
+        }
+        if role != UserRole::SuperAdmin && current.role() == UserRole::SuperAdmin {
+            self.ensure_not_last_super(id)?;
+        }
+        if patch.password.is_some() {
+            user::validate_password(patch.password.as_deref().unwrap_or_default())?;
+        }
+        let password_hash = patch
+            .password
+            .as_deref()
+            .map(hash_argon2)
+            .unwrap_or_else(|| current.password_hash().to_string());
+        let now = now_secs();
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            if let Err(e) = conn.execute(
+                "UPDATE users SET tenant_id = ?1, username = ?2, password_hash = ?3,
+                 role = ?4, enabled = ?5, updated_at = ?6 WHERE id = ?7",
+                rusqlite::params![
+                    tenant.as_deref(),
+                    username,
+                    password_hash,
+                    role.as_str(),
+                    i64::from(enabled),
+                    now as i64,
+                    id,
+                ],
+            ) {
+                if is_unique_violation(&e) {
+                    return Err(UserError::UsernameTaken);
+                }
+                return Err(UserError::Database(e.to_string()));
+            }
+        }
+        let updated = UserRecord::from_parts(
+            current.id().to_string(),
+            tenant.clone(),
+            username.clone(),
+            password_hash,
+            role,
+            enabled,
+            current.created_at(),
+            now,
+            current.last_login_at(),
+            current.created_by().map(str::to_string),
+        );
+        {
+            let mut usernames = write_or_recover(&self.inner.usernames);
+            usernames.retain(|_, v| v != id);
+            usernames.insert(username, id.to_string());
+        }
+        write_or_recover(&self.inner.users).insert(id.to_string(), updated.clone());
+        if !enabled
+            || role != current.role()
+            || tenant.as_deref() != current.tenant_id()
+            || patch.password.is_some()
+        {
+            let _ = self.revoke_user_sessions(id, None);
+        }
+        if !enabled {
+            let _ = self.disable_keys_for_owner(id);
+        }
+        Ok(updated)
+    }
+
+    /// 删除用户；禁止删除自己由 admin 层检查。最后一个 super_admin 不可删除。
+    pub fn delete_user(&self, id: &str) -> Result<(), UserError> {
+        let current = self.user(id).ok_or(UserError::NotFound)?;
+        if current.role() == UserRole::SuperAdmin {
+            self.ensure_not_last_super(id)?;
+        }
+        let _ = self.revoke_user_sessions(id, None);
+        let _ = self.disable_keys_for_owner(id);
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            conn.execute("DELETE FROM users WHERE id = ?1", rusqlite::params![id])
+                .map_err(|e| UserError::Database(e.to_string()))?;
+        }
+        write_or_recover(&self.inner.usernames).retain(|_, v| v != id);
+        write_or_recover(&self.inner.users).remove(id);
+        Ok(())
+    }
+
+    /// 设置密码并撤销该用户的全部 session（可选保留当前 session hash）。
+    pub fn set_user_password(
+        &self,
+        id: &str,
+        password: &str,
+        keep_session_hash: Option<&str>,
+    ) -> Result<(), UserError> {
+        user::validate_password(password)?;
+        let current = self.user(id).ok_or(UserError::NotFound)?;
+        let hash = hash_argon2(password);
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            conn.execute(
+                "UPDATE users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![hash, now_secs() as i64, id],
+            )
+            .map_err(|e| UserError::Database(e.to_string()))?;
+        }
+        let mut users = write_or_recover(&self.inner.users);
+        if let Some(user) = users.get_mut(id) {
+            *user = UserRecord::from_parts(
+                current.id().to_string(),
+                current.tenant_id().map(str::to_string),
+                current.username().to_string(),
+                hash,
+                current.role(),
+                current.enabled(),
+                current.created_at(),
+                now_secs(),
+                current.last_login_at(),
+                current.created_by().map(str::to_string),
+            );
+        }
+        drop(users);
+        self.revoke_user_sessions(id, keep_session_hash);
+        Ok(())
+    }
+
+    /// 校验密码；用户不存在时也执行一次 dummy argon2。
+    pub fn verify_password(&self, user: Option<&UserRecord>, password: &str) -> bool {
+        hash::verify_login_password(password, user.map(|u| u.password_hash()))
+    }
+
+    /// 记录一次成功登录时间。
+    pub fn record_login(&self, id: &str) {
+        let now = now_secs();
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            let _ = conn.execute(
+                "UPDATE users SET last_login_at = ?1, updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now as i64, id],
+            );
+        }
+        if let Some(user) = write_or_recover(&self.inner.users).get_mut(id) {
+            *user = UserRecord::from_parts(
+                user.id().to_string(),
+                user.tenant_id().map(str::to_string),
+                user.username().to_string(),
+                user.password_hash().to_string(),
+                user.role(),
+                user.enabled(),
+                user.created_at(),
+                now,
+                now,
+                user.created_by().map(str::to_string),
+            );
+        }
+    }
+
+    fn ensure_role_tenant(&self, role: UserRole, tenant_id: Option<&str>) -> Result<(), UserError> {
+        match (role, tenant_id) {
+            (UserRole::SuperAdmin, None) => Ok(()),
+            (UserRole::SuperAdmin, Some(_)) => Err(UserError::TenantMismatch),
+            (UserRole::TenantAdmin | UserRole::User, None) => Err(UserError::TenantRequired),
+            (UserRole::TenantAdmin | UserRole::User, Some(tenant_id)) => {
+                if self.tenant(tenant_id).is_some() {
+                    Ok(())
+                } else {
+                    Err(UserError::TenantRequired)
+                }
+            }
+        }
+    }
+
+    fn ensure_not_last_super(&self, target_id: &str) -> Result<(), UserError> {
+        let users = read_or_recover(&self.inner.users);
+        let target_is_enabled_super = users
+            .get(target_id)
+            .is_some_and(|u| u.role() == UserRole::SuperAdmin && u.enabled());
+        let enabled = users
+            .values()
+            .filter(|u| u.role() == UserRole::SuperAdmin && u.enabled())
+            .count();
+        if target_is_enabled_super && enabled <= 1 {
+            return Err(UserError::LastSuperAdmin);
+        }
+        Ok(())
+    }
+
+    // ── sessions ─────────────────────────────────────────────────────────────
+
+    pub fn create_session(
+        &self,
+        user_id: &str,
+        ttl_secs: u64,
+    ) -> Result<CreatedSession, UserError> {
+        let user = self.user(user_id).ok_or(UserError::NotFound)?;
+        if !user.enabled() {
+            return Err(UserError::Disabled);
+        }
+        let now = now_secs();
+        let token = session::generate_session_token();
+        let csrf_token = session::generate_csrf_token();
+        let record = SessionRecord::from_parts(
+            session::generate_session_id(),
+            user_id.to_string(),
+            session::session_token_hash(&token),
+            now,
+            now.saturating_add(ttl_secs.max(1)),
+        );
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            conn.execute(
+                "INSERT INTO sessions (id, user_id, token_hash, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    record.id(),
+                    record.user_id(),
+                    record.token_hash(),
+                    record.created_at() as i64,
+                    record.expires_at() as i64,
+                ],
+            )
+            .map_err(|e| UserError::Database(e.to_string()))?;
+        }
+        write_or_recover(&self.inner.sessions)
+            .insert(record.token_hash().to_string(), record.clone());
+        Ok(CreatedSession {
+            record,
+            token,
+            csrf_token,
+        })
+    }
+
+    /// 校验 session cookie：token hash 命中、未过期、用户与 tenant 都启用。
+    pub fn authorize_session(&self, token: &str) -> Option<UserRecord> {
+        let hash = session::session_token_hash(token);
+        let session = read_or_recover(&self.inner.sessions).get(&hash).cloned()?;
+        if session.expires_at() <= now_secs() {
+            return None;
+        }
+        let user = self.user(session.user_id())?;
+        if !user.enabled() {
+            return None;
+        }
+        if let Some(tenant_id) = user.tenant_id() {
+            if !self.tenant(tenant_id).is_some_and(|t| t.enabled()) {
+                return None;
+            }
+        }
+        Some(user)
+    }
+
+    pub fn revoke_session(&self, token: &str) -> bool {
+        let hash = session::session_token_hash(token);
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            let _ = conn.execute(
+                "DELETE FROM sessions WHERE token_hash = ?1",
+                rusqlite::params![hash],
+            );
+        }
+        write_or_recover(&self.inner.sessions)
+            .remove(&hash)
+            .is_some()
+    }
+
+    /// 撤销用户全部 session；`keep_hash` 可选保留当前 session。
+    pub fn revoke_user_sessions(&self, user_id: &str, keep_hash: Option<&str>) -> usize {
+        let hashes: Vec<String> = read_or_recover(&self.inner.sessions)
+            .iter()
+            .filter(|(hash, s)| s.user_id() == user_id && Some(hash.as_str()) != keep_hash)
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        if hashes.is_empty() {
+            return 0;
+        }
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            for hash in &hashes {
+                let _ = conn.execute(
+                    "DELETE FROM sessions WHERE token_hash = ?1",
+                    rusqlite::params![hash],
+                );
+            }
+        }
+        let mut sessions = write_or_recover(&self.inner.sessions);
+        for hash in &hashes {
+            sessions.remove(hash);
+        }
+        hashes.len()
+    }
+
+    pub fn prune_expired_sessions(&self, now: u64) -> usize {
+        let hashes: Vec<String> = read_or_recover(&self.inner.sessions)
+            .iter()
+            .filter(|(_, s)| s.expires_at() <= now)
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        if hashes.is_empty() {
+            return 0;
+        }
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            for hash in &hashes {
+                let _ = conn.execute(
+                    "DELETE FROM sessions WHERE token_hash = ?1",
+                    rusqlite::params![hash],
+                );
+            }
+        }
+        let mut sessions = write_or_recover(&self.inner.sessions);
+        for hash in &hashes {
+            sessions.remove(hash);
+        }
+        hashes.len()
+    }
+
+    #[cfg(test)]
+    pub fn session_count(&self) -> usize {
+        read_or_recover(&self.inner.sessions).len()
+    }
+
+    // ── audit ────────────────────────────────────────────────────────────────
+
+    pub fn append_audit(
+        &self,
+        actor_user_id: Option<&str>,
+        actor_label: &str,
+        tenant_id: Option<&str>,
+        action: &str,
+        target_id: &str,
+    ) -> Result<(), GatewayError> {
+        let record = AuditRecord {
+            id: user::generate_user_id(),
+            actor_user_id: actor_user_id.map(str::to_string),
+            actor_label: actor_label.to_string(),
+            tenant_id: tenant_id.map(str::to_string),
+            action: action.to_string(),
+            target_id: target_id.to_string(),
+            created_at: now_secs(),
+        };
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            conn.execute(
+                "INSERT INTO admin_audit
+                 (id, actor_user_id, actor_label, tenant_id, action, target_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    record.id,
+                    record.actor_user_id,
+                    record.actor_label,
+                    record.tenant_id,
+                    record.action,
+                    record.target_id,
+                    record.created_at as i64,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn audit_records(&self, tenant_id: Option<&str>, limit: usize) -> Vec<AuditRecord> {
+        let conn = lock_or_recover(&self.inner.db);
+        let Some(conn) = conn.as_ref() else {
+            return Vec::new();
+        };
+        let sql = if tenant_id.is_some() {
+            "SELECT id, actor_user_id, actor_label, tenant_id, action, target_id, created_at
+             FROM admin_audit WHERE tenant_id = ?1 ORDER BY created_at DESC LIMIT ?2"
+        } else {
+            "SELECT id, actor_user_id, actor_label, tenant_id, action, target_id, created_at
+             FROM admin_audit ORDER BY created_at DESC LIMIT ?1"
+        };
+        let mut out = Vec::new();
+        let map = |r: &rusqlite::Row<'_>| {
+            Ok(AuditRecord {
+                id: r.get(0)?,
+                actor_user_id: r.get(1)?,
+                actor_label: r.get(2)?,
+                tenant_id: r.get(3)?,
+                action: r.get(4)?,
+                target_id: r.get(5)?,
+                created_at: r.get::<_, i64>(6)? as u64,
+            })
+        };
+        if let Some(tid) = tenant_id {
+            if let Ok(mut stmt) = conn.prepare(sql) {
+                if let Ok(rows) = stmt.query_map(rusqlite::params![tid, limit as i64], map) {
+                    out.extend(rows.flatten());
+                }
+            }
+        } else if let Ok(mut stmt) = conn.prepare(sql) {
+            if let Ok(rows) = stmt.query_map(rusqlite::params![limit as i64], map) {
+                out.extend(rows.flatten());
+            }
+        }
+        out
     }
 
     pub fn new(file: Option<PathBuf>) -> Self {
@@ -483,19 +1036,58 @@ impl Storage {
         tenants
             .entry(tenant::DEFAULT_TENANT_ID.to_string())
             .or_insert_with(tenant::default_tenant);
+        let (users, sessions) = match &db {
+            Some(conn) => {
+                let users = match load_users(conn) {
+                    Ok(map) => map,
+                    Err(e) => {
+                        tracing::warn!("users db load failed: {e}; using empty user store");
+                        if matches!(persistence, Some(Ok(()))) {
+                            persistence = Some(Err(format!("cannot load the users db: {e}")));
+                        }
+                        HashMap::new()
+                    }
+                };
+                let now = now_secs();
+                let sessions = match load_sessions(conn) {
+                    Ok(map) => map
+                        .into_iter()
+                        .filter(|(_, s)| s.expires_at() > now)
+                        .collect::<HashMap<_, _>>(),
+                    Err(e) => {
+                        tracing::warn!("sessions db load failed: {e}; using empty session store");
+                        if matches!(persistence, Some(Ok(()))) {
+                            persistence = Some(Err(format!("cannot load the sessions db: {e}")));
+                        }
+                        HashMap::new()
+                    }
+                };
+                (users, sessions)
+            }
+            None => (HashMap::new(), HashMap::new()),
+        };
+        let mut usernames = HashMap::new();
+        for user in users.values() {
+            usernames.insert(user.username().to_ascii_lowercase(), user.id().to_string());
+        }
         let db = Arc::new(Mutex::new(db));
         let usage = usage::UsageStore::new(db.clone());
-        Self {
+        let storage = Self {
             inner: Arc::new(StoreInner {
                 runtime: RwLock::new(runtime),
                 tenants: RwLock::new(tenants),
+                users: RwLock::new(users),
+                usernames: RwLock::new(usernames),
+                sessions: RwLock::new(sessions),
                 db,
                 usage,
                 verified: verified::VerifiedCache::new(max, ttl),
                 cred_generation: AtomicU64::new(1),
                 persistence,
             }),
-        }
+        };
+        storage.prune_expired_sessions(now_secs());
+        storage
     }
 
     /// 推进凭据代数并返回新值。**任何**改变"某个 key 是否有效/其哈希"的写路径
@@ -549,17 +1141,32 @@ impl Storage {
     ///
     /// 纯内存模式（`db = None`，库打不开时的降级）没有可落库的对象，直接成功。
     pub fn create(&self, name: String) -> Result<CreatedKey, GatewayError> {
-        self.create_in(tenant::DEFAULT_TENANT_ID, name)
+        self.create_in(tenant::DEFAULT_TENANT_ID, None, name)
     }
 
-    /// 在指定 tenant 下创建 key。tenant 必须存在且启用。
-    pub fn create_in(&self, tenant_id: &str, name: String) -> Result<CreatedKey, GatewayError> {
+    /// 在指定 tenant 下创建 key。tenant 必须存在且启用；`owner_user_id` 必须是同 tenant 用户。
+    pub fn create_in(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        name: String,
+    ) -> Result<CreatedKey, GatewayError> {
         if let Some(t) = self.tenant(tenant_id) {
             if !t.enabled() {
                 return Err(GatewayError::Other("tenant is disabled".into()));
             }
         } else {
             return Err(GatewayError::Other("tenant not found".into()));
+        }
+        if let Some(owner) = owner_user_id {
+            let Some(user) = self.user(owner) else {
+                return Err(GatewayError::Other("key owner not found".into()));
+            };
+            if user.tenant_id() != Some(tenant_id) {
+                return Err(GatewayError::Other(
+                    "key owner must belong to the same tenant".into(),
+                ));
+            }
         }
         for _ in 0..3 {
             let (id, plaintext) = generate_id_key();
@@ -575,6 +1182,7 @@ impl Storage {
                 // 成功落库后才 bump；重试不能浪费凭据代数。
                 cred_version: 0,
                 tenant_id: tenant_id.to_string(),
+                owner_user_id: owner_user_id.map(str::to_string),
             };
             // ① 先落库。失败 → 直接把错误交给调用方（admin 映射 500），内存一个字都不改。
             if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
@@ -617,6 +1225,62 @@ impl Storage {
             .collect();
         v.sort_by_key(|r| r.created_at);
         v
+    }
+
+    /// 按 id 取 key 快照（权限检查用；不暴露哈希）。
+    pub fn key(&self, id: &str) -> Option<KeyRecord> {
+        read_or_recover(&self.inner.runtime)
+            .values()
+            .find(|r| r.id == id)
+            .cloned()
+    }
+
+    /// 只列某用户拥有的 key。
+    pub fn list_for_owner(&self, tenant_id: &str, owner_user_id: &str) -> Vec<KeyRecord> {
+        let mut v: Vec<KeyRecord> = read_or_recover(&self.inner.runtime)
+            .values()
+            .filter(|r| {
+                r.tenant_id == tenant_id && r.owner_user_id.as_deref() == Some(owner_user_id)
+            })
+            .cloned()
+            .collect();
+        v.sort_by_key(|r| r.created_at);
+        v
+    }
+
+    /// 停用某用户拥有的全部 key（禁用/删除用户时调用）。返回实际停用条数。
+    pub fn disable_keys_for_owner(&self, owner_user_id: &str) -> Result<usize, GatewayError> {
+        let ids: Vec<String> = read_or_recover(&self.inner.runtime)
+            .values()
+            .filter(|r| r.owner_user_id.as_deref() == Some(owner_user_id) && r.enabled)
+            .map(|r| r.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            let tx = conn.transaction()?;
+            for id in &ids {
+                tx.execute(
+                    "UPDATE api_keys SET enabled = 0 WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+            }
+            tx.commit()?;
+        }
+        {
+            let mut runtime = write_or_recover(&self.inner.runtime);
+            for rec in runtime.values_mut() {
+                if rec.owner_user_id.as_deref() == Some(owner_user_id) {
+                    rec.enabled = false;
+                }
+            }
+        }
+        self.bump_cred_generation();
+        for id in &ids {
+            self.inner.verified.invalidate_by_id(id);
+        }
+        Ok(ids.len())
     }
 
     /// 吊销动态 key：`Ok(true)` = 真的删掉了，`Ok(false)` = 本来就不存在；

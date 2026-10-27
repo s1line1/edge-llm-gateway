@@ -14,12 +14,20 @@ import { render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentInfo } from "../api/types";
+import { TestAuthProvider } from "../auth/TestAuthProvider";
 
 const mocks = vi.hoisted(() => ({ fetchAgents: vi.fn() }));
 
 vi.mock("../api/client", () => ({ fetchAgents: mocks.fetchAgents }));
 
 vi.mock("../hooks/useMetricsHistory", () => ({
+  useMetricsHistoryOptional: () => ({
+    latest: null,
+    history: [],
+    raw: null,
+    error: null,
+    reachable: true,
+  }),
   useMetricsHistory: () => ({
     latest: null,
     history: [],
@@ -35,7 +43,9 @@ function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <Agents />
+      <TestAuthProvider role="tenant_admin">
+        <Agents />
+      </TestAuthProvider>
     </QueryClientProvider>,
   );
 }
@@ -59,7 +69,6 @@ describe("Agents 页：同名不同来源（D1）与旧网关降级", () => {
   let errorSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    localStorage.setItem("hlmg.admin.token", "t");
     mocks.fetchAgents.mockReset();
     // React 的重复 key 只经 console.error 暴露，不抛异常；所以必须**断言这条通道干净**，
     // 否则"key 改回 agent_id"这类回归在测试里完全看不见。

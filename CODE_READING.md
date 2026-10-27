@@ -82,7 +82,12 @@ gateway/src/registry/    agent 注册表（table/entry/routing/eviction/admissio
 gateway/src/storage/       SQLite 存储（db 打开/迁移 + schema + usage/verified）+ argon2 哈希
                           + sha256 lookup 快速索引（+ hash.rs 哈希原语）
                           storage/tenant.rs: TenantRecord/default/agent token；storage/usage.rs 带 tenant_id
-gateway/src/admin.rs        Admin API（tenant CRUD + agent token + tenant 过滤的 keys/agents/usage）
+                          storage/user.rs + session.rs: dashboard 用户/角色/会话；api_keys.owner_user_id
+gateway/src/admin.rs        Admin API（tenant/key/agent/usage + RBAC 过滤）
+gateway/src/admin_auth.rs   登录/bootstrap/session/cookie/CSRF + 管理面中间件
+gateway/src/admin_users.rs  用户管理与审计查询
+gateway/src/rbac.rs         Principal / Action 权限矩阵与 tenant 作用域
+gateway/src/login_limiter.rs 登录失败限流
 gateway/src/usage_meter.rs        per-key token 用量提取 / 无 usage 时估算（纯函数，由 proxy 调用）
 gateway/src/ratelimit.rs    令牌桶（per-key + per-tenant）
 gateway/src/tenant_limits.rs tenant 并发票（随响应 body 持有）

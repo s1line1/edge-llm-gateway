@@ -22,7 +22,7 @@ LIMIT ?= 20
 # e2e 测试条数（接线守卫）：`.config/nextest.toml` 用 filter='binary(e2e)' 把 e2e 限成
 # 一次一条。改测试文件名/二进制名/拆分 `tests/e2e` 都会让这个 filter 匹配不到，串行化
 # **静默**失效（进程级 `#[serial]` 在 nextest 下本来就失效）。改条数时同步改这里。
-E2E_TEST_COUNT ?= 76
+E2E_TEST_COUNT ?= 77
 
 .PHONY: help setup certs certs-required web-install web-build web-dev build build-debug fmt clippy check test bench bench-k6 \
         bench-admission bench-admission-local release release-strict check-rust check-records check-e2e-wiring \

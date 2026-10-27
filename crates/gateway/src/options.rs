@@ -139,6 +139,10 @@ pub struct Options {
     /// 迁移期：接受不带 tenant 的 legacy `Register` 帧并归入 `default`。
     /// **默认 false**；只有升级旧 agent 时临时打开。
     pub allow_legacy_agent_registration: bool,
+    /// dashboard session 的绝对有效期（秒）。默认 12 小时。
+    pub session_ttl_secs: u64,
+    /// session cookie 是否带 `Secure`。`None` = 有 HTTPS 时为 true，纯 HTTP 时为 false。
+    pub session_cookie_secure: Option<bool>,
     /// 关闭时强制落库的**等待上限**：超过它就放弃等待、继续 abort 任务。
     ///
     /// 为什么需要：`Gateway::shutdown` 的强制落库是阻塞式 SQLite 写，而
@@ -157,6 +161,8 @@ pub struct Options {
 }
 
 impl Options {
+    /// dashboard session 默认有效期（秒）。
+    pub const DEFAULT_SESSION_TTL_SECS: u64 = 43_200;
     /// 单次转发空闲超时默认值（秒）。
     pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
     /// 隧道控制操作超时默认值。见 `config::default_tunnel_op_secs` 的实测依据。
@@ -283,6 +289,13 @@ impl Options {
                     "config: {yaml_key} ({field}) must be at least 1 second, but is 0: {consequence}"
                 ));
             }
+        }
+
+        if self.session_ttl_secs == 0 {
+            return Err(
+                "config: session_ttl_secs must be at least 1, but is 0: sessions would expire before the login response is usable"
+                    .into(),
+            );
         }
 
         // 上界（复扫 D4）：这些秒数**没有上限校验**，而"接近 u64 上限"的值能通过上面的零值
@@ -437,6 +450,8 @@ impl Default for Options {
             max_entry_connections: Self::DEFAULT_MAX_ENTRY_CONNECTIONS,
             max_open_tunnel_streams: Self::DEFAULT_MAX_OPEN_TUNNEL_STREAMS,
             allow_legacy_agent_registration: false,
+            session_ttl_secs: Self::DEFAULT_SESSION_TTL_SECS,
+            session_cookie_secure: None,
             shutdown_flush_timeout: Self::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
             shutdown_grace: Self::DEFAULT_SHUTDOWN_GRACE,
         }

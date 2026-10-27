@@ -2,7 +2,7 @@
 //! 所有 /admin/* 请求都需要 `Authorization: Bearer <--admin-token>`。
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -11,9 +11,9 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::error;
 
+use crate::rbac::{authorize, effective_tenant, response as rbac_response, Action, Principal};
 use crate::state::AppState;
-use crate::storage::hash::constant_time_eq;
-use crate::storage::{TenantError, TenantPatch};
+use crate::storage::{TenantError, TenantPatch, UserRole};
 
 /// admin 500 的**细节进日志、响应体只留固定文案**（SL-P3-20）。
 ///
@@ -32,30 +32,13 @@ fn log_admin_failure(headers: &HeaderMap, error: &dyn std::fmt::Display, what: &
     error!(request_id, error = %error, "{what}");
 }
 
-/// Admin 鉴权中间件：仅放行持有 admin token 的请求。
-pub async fn admin_auth(
-    State(state): State<AppState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let expected = state.admin_token.as_deref().unwrap_or_default();
-    // 与 `/v1` 认证共用同一套 Bearer 解析（P3-17：scheme 大小写不敏感、`1*SP` 分隔），
-    // 否则会出现"api key 认小写、admin token 不认"的半拉子状态。比较仍是恒定时间。
-    let ok = crate::auth::bearer_token(req.headers())
-        .map(|t| constant_time_eq(expected.as_bytes(), t.as_bytes()))
-        .unwrap_or(false);
-    if ok {
-        return next.run(req).await;
-    }
-    // 统一走 openai::error_response：`type` 按状态码映射（401 → authentication_error），
-    // 与 proxy / 中间件产生的错误同一个语义表——自造 type 会让 SDK 无从判断重试行为。
-    crate::openai::error_response(StatusCode::UNAUTHORIZED, "invalid admin token")
-}
-
 /// 列出所有动态 key（不暴露明文；明文不落盘后无法显示真实前缀，用固定掩码）。
 /// 每项附带该 key 的用量汇总（无记录时为 0）。
-pub async fn list_keys(State(state): State<AppState>) -> Json<serde_json::Value> {
-    keys_json(&state, None)
+pub async fn list_keys(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    keys_json(&state, &principal, None)
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,15 +48,31 @@ pub struct TenantFilter {
 
 pub async fn list_keys_filtered(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(query): Query<TenantFilter>,
-) -> Json<serde_json::Value> {
-    keys_json(&state, query.tenant_id.as_deref())
+) -> Response {
+    keys_json(&state, &principal, query.tenant_id.as_deref())
 }
 
-fn keys_json(state: &AppState, tenant_id: Option<&str>) -> Json<serde_json::Value> {
-    let records = match tenant_id {
-        Some(tenant_id) => state.store.list_for_tenant(tenant_id),
-        None => state.store.list(),
+fn keys_json(state: &AppState, principal: &Principal, tenant_filter: Option<&str>) -> Response {
+    if let Err(e) = authorize(principal, Action::KeyRead, tenant_filter) {
+        return rbac_response(e);
+    }
+    let tenant = match effective_tenant(principal, tenant_filter) {
+        Ok(t) => t,
+        Err(e) => return rbac_response(e),
+    };
+    let records = match principal.role {
+        UserRole::User => {
+            let (Some(tenant), Some(owner)) = (tenant, principal.user_id.as_deref()) else {
+                return crate::openai::error_response(StatusCode::FORBIDDEN, "permission denied");
+            };
+            state.store.list_for_owner(&tenant, owner)
+        }
+        _ => match tenant {
+            Some(tenant) => state.store.list_for_tenant(&tenant),
+            None => state.store.list(),
+        },
     };
     let out: Vec<serde_json::Value> = records
         .into_iter()
@@ -83,6 +82,8 @@ fn keys_json(state: &AppState, tenant_id: Option<&str>) -> Json<serde_json::Valu
                 "id": r.id(),
                 "tenant_id": r.tenant_id(),
                 "tenant_name": state.store.tenant(r.tenant_id()).map(|t| t.name().to_string()),
+                "owner_user_id": r.owner_user_id(),
+                "owner_username": r.owner_user_id().and_then(|id| state.store.user(id)).map(|u| u.username().to_string()),
                 "name": r.name(),
                 "created_at": r.created_at(),
                 "enabled": r.enabled(),
@@ -105,25 +106,44 @@ fn keys_json(state: &AppState, tenant_id: Option<&str>) -> Json<serde_json::Valu
             })
         })
         .collect();
-    Json(json!(out))
+    Json(json!(out)).into_response()
 }
 
 /// 全部 key 的用量汇总（含已吊销 key 的历史记录，可审计）。
-pub async fn usage_route(State(state): State<AppState>) -> Json<serde_json::Value> {
-    usage_json(&state, None)
+pub async fn usage_route(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    usage_json(&state, &principal, None)
 }
 
 pub async fn usage_filtered(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(query): Query<TenantFilter>,
-) -> Json<serde_json::Value> {
-    usage_json(&state, query.tenant_id.as_deref())
+) -> Response {
+    usage_json(&state, &principal, query.tenant_id.as_deref())
 }
 
-fn usage_json(state: &AppState, tenant_id: Option<&str>) -> Json<serde_json::Value> {
-    let rows = match tenant_id {
-        Some(tenant_id) => state.store.usage_for_tenant(tenant_id),
-        None => state.store.usage_snapshot(),
+fn usage_json(state: &AppState, principal: &Principal, tenant_filter: Option<&str>) -> Response {
+    if let Err(e) = authorize(principal, Action::UsageRead, tenant_filter) {
+        return rbac_response(e);
+    }
+    let tenant = match effective_tenant(principal, tenant_filter) {
+        Ok(t) => t,
+        Err(e) => return rbac_response(e),
+    };
+    let rows = match principal.role {
+        UserRole::User => {
+            let (Some(tenant), Some(owner)) = (tenant, principal.user_id.as_deref()) else {
+                return crate::openai::error_response(StatusCode::FORBIDDEN, "permission denied");
+            };
+            state.store.usage_for_owner(&tenant, owner)
+        }
+        _ => match tenant {
+            Some(tenant) => state.store.usage_for_tenant(&tenant),
+            None => state.store.usage_snapshot(),
+        },
     };
     let out: Vec<serde_json::Value> = rows
         .into_iter()
@@ -141,12 +161,13 @@ fn usage_json(state: &AppState, tenant_id: Option<&str>) -> Json<serde_json::Val
             })
         })
         .collect();
-    Json(json!(out))
+    Json(json!(out)).into_response()
 }
 
 /// 创建 key，返回明文（仅此一次展示；此后只存 argon2 哈希）。
 pub async fn create_key(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
@@ -158,23 +179,54 @@ pub async fn create_key(
     if name.chars().count() > 64 {
         return crate::openai::error_response(StatusCode::BAD_REQUEST, "name too long");
     }
-    let tenant_id = body
-        .get("tenant_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or(crate::storage::DEFAULT_TENANT_ID)
-        .to_string();
+    let requested = body.get("tenant_id").and_then(|v| v.as_str());
+    let tenant_id = match principal.role {
+        UserRole::SuperAdmin => requested
+            .unwrap_or(crate::storage::DEFAULT_TENANT_ID)
+            .to_string(),
+        _ => match effective_tenant(&principal, requested) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                return crate::openai::error_response(StatusCode::FORBIDDEN, "permission denied")
+            }
+            Err(e) => return rbac_response(e),
+        },
+    };
+    if let Err(e) = authorize(&principal, Action::KeyWrite, Some(&tenant_id)) {
+        return rbac_response(e);
+    }
+    let owner = match principal.role {
+        UserRole::User => principal.user_id.clone(),
+        UserRole::SuperAdmin => body
+            .get("owner_user_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        UserRole::TenantAdmin => None,
+    };
+    if let Some(owner_id) = owner.as_deref() {
+        let Some(owner_user) = state.store.user(owner_id) else {
+            return crate::openai::error_response(StatusCode::BAD_REQUEST, "unknown key owner");
+        };
+        if owner_user.tenant_id() != Some(tenant_id.as_str()) {
+            return crate::openai::error_response(
+                StatusCode::BAD_REQUEST,
+                "key owner must belong to the same tenant",
+            );
+        }
+    }
     let Some(tenant) = state.store.tenant(&tenant_id) else {
-        return crate::openai::error_response(StatusCode::BAD_REQUEST, "unknown tenant");
+        return crate::openai::error_response(StatusCode::NOT_FOUND, "tenant not found");
     };
     if !tenant.enabled() {
         return crate::openai::error_response(StatusCode::BAD_REQUEST, "tenant is disabled");
     }
-    // argon2 哈希 + SQLite 写穿较重，移到阻塞线程池，避免卡 async worker
     let store = state.store.clone();
-    let created = match tokio::task::spawn_blocking(move || store.create_in(&tenant_id, name)).await
+    let created = match tokio::task::spawn_blocking(move || {
+        store.create_in(&tenant_id, owner.as_deref(), name)
+    })
+    .await
     {
         Ok(Ok(c)) => c,
-        // 落库失败：**什么都没创建**（key 也没发出去），必须让运维看到失败而不是 201。
         Ok(Err(e)) => {
             log_admin_failure(&headers, &e, "admin key creation failed (store error)");
             return crate::openai::error_response(
@@ -190,12 +242,20 @@ pub async fn create_key(
             );
         }
     };
+    audit(
+        &state,
+        &principal,
+        Some(created.record.tenant_id()),
+        "key.create",
+        created.record.id(),
+    );
     (
         StatusCode::CREATED,
         Json(json!({
             "id": created.record.id(),
             "tenant_id": created.record.tenant_id(),
             "tenant_name": tenant.name(),
+            "owner_user_id": created.record.owner_user_id(),
             "key": created.plaintext,
             "name": created.record.name(),
             "created_at": created.record.created_at(),
@@ -217,17 +277,24 @@ pub async fn create_key(
 /// 吊销 key。
 pub async fn delete_key(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    // 桶键就是 key id（`ratelimit.rs`）：吊销成功后要把桶一并丢掉，否则一个再也不会被
-    // 取用的桶要留到空闲清扫为止（P2-19）。
+    let Some(key) = state.store.key(&id) else {
+        return crate::openai::error_response(StatusCode::NOT_FOUND, "key not found");
+    };
+    if let Err(e) = authorize(&principal, Action::KeyWrite, Some(key.tenant_id())) {
+        return rbac_response(e);
+    }
+    if principal.role == UserRole::User && key.owner_user_id() != principal.user_id.as_deref() {
+        return crate::openai::error_response(StatusCode::NOT_FOUND, "key not found");
+    }
+    let tenant_id = key.tenant_id().to_string();
     let bucket_key = id.clone();
     let store = state.store.clone();
     let removed = match tokio::task::spawn_blocking(move || store.delete(&id)).await {
         Ok(Ok(r)) => r,
-        // 落库失败：**吊销没有生效**，那把 key 仍然可用——文案要说清这一点，
-        // 否则运维看到 500 会以为"至少内存里删掉了"（评估 §5 H2 / 记录 P1-4）。
         Ok(Err(e)) => {
             log_admin_failure(&headers, &e, "admin key deletion failed (store error)");
             return crate::openai::error_response(
@@ -244,6 +311,13 @@ pub async fn delete_key(
         }
     };
     if removed {
+        audit(
+            &state,
+            &principal,
+            Some(&tenant_id),
+            "key.delete",
+            &bucket_key,
+        );
         if let Some(rl) = &state.rate_limiter {
             rl.evict(&bucket_key);
         }
@@ -261,21 +335,48 @@ pub struct AgentQuery {
 
 pub async fn list_agents(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(query): Query<AgentQuery>,
-) -> Json<Vec<crate::registry::AgentInfo>> {
+) -> Response {
+    if let Err(e) = authorize(&principal, Action::AgentRead, query.tenant_id.as_deref()) {
+        return rbac_response(e);
+    }
+    let tenant = match effective_tenant(&principal, query.tenant_id.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return rbac_response(e),
+    };
     let mut agents = state.registry.snapshot(state.policy.agent_stale_after);
-    if let Some(tenant_id) = query.tenant_id {
+    if let Some(tenant_id) = tenant {
         agents.retain(|a| a.tenant_id == tenant_id);
     }
-    Json(agents)
+    Json(agents).into_response()
+}
+
+fn audit(
+    state: &AppState,
+    principal: &Principal,
+    tenant_id: Option<&str>,
+    action: &str,
+    target_id: &str,
+) {
+    if let Err(e) = state.store.append_audit(
+        principal.user_id.as_deref(),
+        principal.label(),
+        tenant_id,
+        action,
+        target_id,
+    ) {
+        error!(error = %e, action, "admin audit write failed");
+    }
 }
 
 fn tenant_error_response(error: TenantError) -> Response {
     let status = match error {
         TenantError::NotFound => StatusCode::NOT_FOUND,
-        TenantError::NameTaken | TenantError::HasKeys | TenantError::DefaultTenant => {
-            StatusCode::CONFLICT
-        }
+        TenantError::NameTaken
+        | TenantError::HasKeys
+        | TenantError::HasUsers
+        | TenantError::DefaultTenant => StatusCode::CONFLICT,
         TenantError::InvalidName | TenantError::Disabled | TenantError::BadToken => {
             StatusCode::BAD_REQUEST
         }
@@ -294,6 +395,8 @@ fn tenant_json(state: &AppState, tenant: &crate::storage::TenantRecord) -> serde
         "max_concurrent_requests": tenant.max_concurrent_requests(),
         "requests_per_minute": tenant.requests_per_minute(),
         "key_count": state.store.key_count_for_tenant(tenant.id()),
+        "user_count": state.store.user_count_for_tenant(tenant.id()),
+        "agent_count": state.registry.count_for_tenant(tenant.id()),
         "usage": {
             "prompt_tokens": totals.0,
             "completion_tokens": totals.1,
@@ -303,21 +406,48 @@ fn tenant_json(state: &AppState, tenant: &crate::storage::TenantRecord) -> serde
     })
 }
 
-pub async fn list_tenants(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let out: Vec<_> = state
-        .store
-        .tenants()
+pub async fn list_tenants(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    if let Err(e) = authorize(&principal, Action::TenantRead, None) {
+        return rbac_response(e);
+    }
+    let tenants = match effective_tenant(&principal, None) {
+        Ok(None) => state.store.tenants(),
+        Ok(Some(id)) => state.store.tenant(&id).into_iter().collect(),
+        Err(e) => return rbac_response(e),
+    };
+    let out: Vec<_> = tenants
         .iter()
         .map(|tenant| tenant_json(&state, tenant))
         .collect();
-    Json(json!(out))
+    Json(json!(out)).into_response()
+}
+
+pub async fn tenant_by_id(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authorize(&principal, Action::TenantRead, Some(&id)) {
+        return rbac_response(e);
+    }
+    let Some(tenant) = state.store.tenant(&id) else {
+        return crate::openai::error_response(StatusCode::NOT_FOUND, "tenant not found");
+    };
+    Json(tenant_json(&state, &tenant)).into_response()
 }
 
 pub async fn create_tenant(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    if let Err(e) = authorize(&principal, Action::TenantWrite, None) {
+        return rbac_response(e);
+    }
     let name = body
         .get("name")
         .and_then(|v| v.as_str())
@@ -344,6 +474,13 @@ pub async fn create_tenant(
                 );
             }
         };
+    audit(
+        &state,
+        &principal,
+        Some(created.record.id()),
+        "tenant.create",
+        created.record.id(),
+    );
     (
         StatusCode::CREATED,
         Json(json!({
@@ -361,9 +498,16 @@ pub async fn create_tenant(
 
 pub async fn update_tenant(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    if let Err(e) = authorize(&principal, Action::TenantWrite, Some(&id)) {
+        return rbac_response(e);
+    }
+    if state.store.tenant(&id).is_none() {
+        return crate::openai::error_response(StatusCode::NOT_FOUND, "tenant not found");
+    }
     let mut patch = TenantPatch::default();
     if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
         patch.name = Some(name.to_string());
@@ -379,7 +523,16 @@ pub async fn update_tenant(
     }
     let store = state.store.clone();
     match tokio::task::spawn_blocking(move || store.update_tenant(&id, patch)).await {
-        Ok(Ok(record)) => Json(tenant_json(&state, &record)).into_response(),
+        Ok(Ok(record)) => {
+            audit(
+                &state,
+                &principal,
+                Some(record.id()),
+                "tenant.update",
+                record.id(),
+            );
+            Json(tenant_json(&state, &record)).into_response()
+        }
         Ok(Err(e)) => tenant_error_response(e),
         Err(_) => {
             crate::openai::error_response(StatusCode::INTERNAL_SERVER_ERROR, "tenant update failed")
@@ -387,17 +540,31 @@ pub async fn update_tenant(
     }
 }
 
-pub async fn delete_tenant(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn delete_tenant(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authorize(&principal, Action::TenantWrite, Some(&id)) {
+        return rbac_response(e);
+    }
+    if state.store.tenant(&id).is_none() {
+        return crate::openai::error_response(StatusCode::NOT_FOUND, "tenant not found");
+    }
     if state.registry.count_for_tenant(&id) > 0 {
         return crate::openai::error_response(
             StatusCode::CONFLICT,
             "tenant still has registered agents",
         );
     }
+    if state.store.user_count_for_tenant(&id) > 0 {
+        return crate::openai::error_response(StatusCode::CONFLICT, "tenant still has users");
+    }
     let store = state.store.clone();
     let deleted_id = id.clone();
     match tokio::task::spawn_blocking(move || store.delete_tenant(&deleted_id)).await {
         Ok(Ok(())) => {
+            audit(&state, &principal, Some(&id), "tenant.delete", &id);
             state.tenant_limiter.evict(&id);
             state.tenant_rate_limiter.evict(&id);
             StatusCode::NO_CONTENT.into_response()
@@ -410,10 +577,24 @@ pub async fn delete_tenant(State(state): State<AppState>, Path(id): Path<String>
     }
 }
 
-pub async fn rotate_agent_token(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn rotate_agent_token(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = authorize(&principal, Action::AgentTokenRotate, Some(&id)) {
+        return rbac_response(e);
+    }
+    if state.store.tenant(&id).is_none() {
+        return crate::openai::error_response(StatusCode::NOT_FOUND, "tenant not found");
+    }
     let store = state.store.clone();
-    match tokio::task::spawn_blocking(move || store.rotate_agent_token(&id)).await {
-        Ok(Ok(token)) => Json(json!({ "agent_token": token })).into_response(),
+    let rotated_id = id.clone();
+    match tokio::task::spawn_blocking(move || store.rotate_agent_token(&rotated_id)).await {
+        Ok(Ok(token)) => {
+            audit(&state, &principal, Some(&id), "agent_token.rotate", &id);
+            Json(json!({ "agent_token": token })).into_response()
+        }
         Ok(Err(e)) => tenant_error_response(e),
         Err(_) => crate::openai::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -447,6 +628,10 @@ mod tests {
     }
 
     /// 文件库版的 state（SL-P3-20 要造"落库真失败"）：另外给出库路径，好让测试挂触发器。
+    fn super_principal() -> Extension<Principal> {
+        Extension(Principal::break_glass())
+    }
+
     fn file_backed_state() -> (AppState, tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keys.db");
@@ -640,7 +825,7 @@ mod tests {
         assert!(rl.try_acquire(&id), "前提：先让这个 key 建出一个桶");
         assert_eq!(rl.bucket_count(), 1);
 
-        let resp = delete_key(State(state), HeaderMap::new(), Path(id)).await;
+        let resp = delete_key(State(state), super_principal(), HeaderMap::new(), Path(id)).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT, "吊销应当成功");
 
         assert_eq!(rl.bucket_count(), 0, "吊销后应立即可回收桶，不等空闲清扫");
@@ -651,6 +836,7 @@ mod tests {
         let state = test_state();
         let resp = create_key(
             State(state),
+            super_principal(),
             HeaderMap::new(),
             Json(serde_json::json!({ "name": "x".repeat(65) })),
         )
@@ -788,6 +974,7 @@ mod tests {
         let state = test_state();
         let resp = create_key(
             State(state.clone()),
+            super_principal(),
             HeaderMap::new(),
             Json(serde_json::json!({ "name": "my-key" })),
         )
@@ -798,13 +985,147 @@ mod tests {
         assert!(full_key.starts_with("sk-"));
 
         // 列表脱敏：含名称与固定掩码，不暴露明文，也不暴露 argon2 哈希
-        let listed = list_keys(State(state)).await;
-        let text = listed.0.to_string();
+        let listed = list_keys(State(state), super_principal()).await;
+        let text = body_json(listed).await.to_string();
         assert!(text.contains("my-key"));
         assert!(
             !text.contains(&full_key),
             "list must not leak plaintext key"
         );
         assert!(!text.contains("$argon2id$"), "list must not leak key hash");
+    }
+}
+
+#[cfg(test)]
+mod rbac_tests {
+    use super::*;
+    use crate::{
+        metrics::Metrics, options::Options, rbac::AuthSource, registry::Registry, state::AppState,
+        storage::hash::CheapArgon2, storage::Storage,
+    };
+
+    fn cheap() -> CheapArgon2 {
+        CheapArgon2::install()
+    }
+
+    fn setup() -> (AppState, Storage, String, String, String, String) {
+        let opts = Options {
+            admin_token: Some("admin-token".into()),
+            ..Options::default()
+        };
+        let store = Storage::new(None);
+        let a = store.create_tenant("alpha".into(), 0, 0).unwrap().record;
+        let b = store.create_tenant("beta".into(), 0, 0).unwrap().record;
+        let ta = store
+            .create_user(
+                "tenantadmin".into(),
+                "correct horse battery".into(),
+                UserRole::TenantAdmin,
+                Some(a.id().to_string()),
+                None,
+            )
+            .unwrap()
+            .record;
+        let user = store
+            .create_user(
+                "alice".into(),
+                "correct horse battery".into(),
+                UserRole::User,
+                Some(a.id().to_string()),
+                None,
+            )
+            .unwrap()
+            .record;
+        store
+            .create_in(a.id(), Some(user.id()), "owned".into())
+            .unwrap();
+        store.create_in(b.id(), None, "other".into()).unwrap();
+        let state = AppState::new_for_test(
+            Registry::default(),
+            store.clone(),
+            Metrics::default(),
+            &opts,
+        );
+        (
+            state,
+            store,
+            a.id().to_string(),
+            b.id().to_string(),
+            ta.id().to_string(),
+            user.id().to_string(),
+        )
+    }
+
+    fn ext(role: UserRole, tenant: Option<&str>, id: &str) -> Extension<Principal> {
+        Extension(Principal {
+            user_id: Some(id.into()),
+            username: "actor".into(),
+            role,
+            tenant_id: tenant.map(str::to_string),
+            source: AuthSource::Session,
+        })
+    }
+
+    async fn body(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tenant_admin_key_and_usage_are_scoped_and_foreign_filter_is_404() {
+        let _cheap = cheap();
+        let (state, _store, a, b, ta, _user) = setup();
+        let p = ext(UserRole::TenantAdmin, Some(&a), &ta);
+        let own = list_keys(State(state.clone()), p.clone()).await;
+        assert_eq!(own.status(), StatusCode::OK);
+        let rows = body(own).await;
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["tenant_id"], a);
+
+        let foreign = list_keys_filtered(
+            State(state.clone()),
+            p.clone(),
+            Query(TenantFilter {
+                tenant_id: Some(b.clone()),
+            }),
+        )
+        .await;
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+
+        let foreign_usage =
+            usage_filtered(State(state), p, Query(TenantFilter { tenant_id: Some(b) })).await;
+        assert_eq!(foreign_usage.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn user_sees_only_owned_keys_and_cannot_read_agents() {
+        let _cheap = cheap();
+        let (state, _store, a, _b, _ta, user) = setup();
+        let p = ext(UserRole::User, Some(&a), &user);
+        let keys = list_keys(State(state.clone()), p.clone()).await;
+        assert_eq!(keys.status(), StatusCode::OK);
+        let rows = body(keys).await;
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["owner_user_id"].as_str(), Some(user.as_str()));
+
+        let agents = list_agents(State(state), p, Query(AgentQuery { tenant_id: None })).await;
+        assert_eq!(agents.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn only_super_admin_can_write_tenants() {
+        let _cheap = cheap();
+        let (state, _store, a, _b, ta, _user) = setup();
+        let p = ext(UserRole::TenantAdmin, Some(&a), &ta);
+        let resp = create_tenant(
+            State(state),
+            p,
+            HeaderMap::new(),
+            Json(serde_json::json!({ "name": "nope" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

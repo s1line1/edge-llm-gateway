@@ -115,6 +115,12 @@ pub struct ConfigFile {
     /// 迁移期接受 legacy `Register`（归入 default）；默认 false。
     #[serde(default)]
     allow_legacy_agent_registration: bool,
+    /// dashboard session 绝对有效期（秒）；默认 43200（12h）。
+    #[serde(default = "default_session_ttl_secs")]
+    session_ttl_secs: u64,
+    /// session cookie 的 Secure 属性。不写 = 有 HTTPS 时自动开启。
+    #[serde(default)]
+    session_cookie_secure: Option<bool>,
     /// 客户端"完全停滞"多久就放弃（秒）：请求体读不动、或响应体客户端不消费。
     ///
     /// 为什么必须有：准入票据（`max_concurrent_requests` 那道闸）的释放挂在 Drop 上，
@@ -176,6 +182,9 @@ fn default_keys_file() -> Option<PathBuf> {
 /// （原生部署因此要显式写自己的目录，`gateway-config.example.yml` 里给的就是那种写法。）
 fn default_ui_dir() -> Option<PathBuf> {
     Some(PathBuf::from("/usr/local/share/home-llm-gateway/web"))
+}
+fn default_session_ttl_secs() -> u64 {
+    Options::DEFAULT_SESSION_TTL_SECS
 }
 fn default_timeout_secs() -> u64 {
     Options::DEFAULT_REQUEST_TIMEOUT.as_secs()
@@ -301,6 +310,8 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
             // 原样带过去：`0 → 默认值`的归一只有一处，在 `Options::stream_ceiling()`。
             max_open_tunnel_streams: cfg.max_open_tunnel_streams,
             allow_legacy_agent_registration: cfg.allow_legacy_agent_registration,
+            session_ttl_secs: cfg.session_ttl_secs,
+            session_cookie_secure: cfg.session_cookie_secure,
         },
     })
 }

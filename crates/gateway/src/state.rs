@@ -14,10 +14,12 @@
 //! 所以每个派生量在整仓库只存在一处；调用方只给一个 [`Options`]。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
 
+use crate::login_limiter::LoginLimiter;
 use crate::metrics::Metrics;
 use crate::options::Options;
 use crate::ratelimit::{RateLimiter, TenantRateLimiter};
@@ -88,11 +90,17 @@ pub struct AppState {
     pub store: Storage,
     /// Admin token（None 表示不启用 /admin/*）。
     pub admin_token: Option<String>,
+    /// dashboard session 的绝对有效期与 cookie Secure 派生值。
+    pub session_ttl_secs: u64,
+    pub session_cookie_secure: bool,
+    /// 首次 bootstrap 的串行锁：两个并发请求不能各创建一个 super_admin。
+    pub bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
     /// 请求路径策略（超时、并发上限、流额度）；派生只在 [`RequestPolicy::from_options`]。
     pub policy: RequestPolicy,
     pub rate_limiter: Option<RateLimiter>,
     pub tenant_rate_limiter: TenantRateLimiter,
     pub tenant_limiter: TenantLimiter,
+    pub login_limiter: LoginLimiter,
     pub metrics: Metrics,
     /// React UI 静态目录（None = `/` 显示构建提示页）。
     pub ui: Option<PathBuf>,
@@ -152,10 +160,14 @@ impl AppState {
                 .admin_token
                 .as_deref()
                 .map(|token| token.trim_matches([' ', '\t', '\r', '\n']).to_owned()),
+            session_ttl_secs: opts.session_ttl_secs,
+            session_cookie_secure: opts.session_cookie_secure.unwrap_or(opts.https.is_some()),
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             policy: RequestPolicy::from_options(opts),
             rate_limiter: RateLimiter::new(opts.rate_limit_per_min),
             tenant_rate_limiter: TenantRateLimiter::new(),
             tenant_limiter: TenantLimiter::new(),
+            login_limiter: LoginLimiter::new(),
             metrics,
             ui,
             ui_index,
