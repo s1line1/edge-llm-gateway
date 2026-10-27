@@ -160,3 +160,50 @@ fn usage_in_memory_only_store() {
     assert_eq!(store.usage_snapshot().len(), 1);
     assert!(store.usage_of("ghost").is_none());
 }
+
+/// 规格（S2-5）：`key_usage` 载入失败时**禁用落库**，不能带着空账本把历史总量覆盖掉。
+#[test]
+fn usage_load_failure_disables_persistence() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::storage::usage::UsageStore;
+    use rusqlite::Connection;
+
+    let conn = Connection::open_in_memory().unwrap();
+    // 缺列 => `load_usage` 的 SELECT 失败，但连接本身仍能执行写语句。
+    conn.execute_batch("CREATE TABLE key_usage (key_id TEXT PRIMARY KEY)")
+        .unwrap();
+    let store = UsageStore::new(Arc::new(Mutex::new(Some(conn))));
+    store.accumulate(
+        "k",
+        "name",
+        &UsageDelta {
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            estimated: false,
+        },
+    );
+    assert_eq!(
+        store.flush_once(true),
+        0,
+        "载入失败后必须禁用落库，绝不能写绝对值"
+    );
+
+    // 对照：正常 schema 仍然能落库（防止把上面修成"永远不 flush"）。
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(Some(dir.path().join("keys.db")));
+    let created = storage.create("control".into()).unwrap();
+    storage.record_usage(
+        &created.record.id,
+        "control",
+        &UsageDelta {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            estimated: false,
+        },
+    );
+    assert!(
+        storage.inner.usage.flush_once(true) > 0,
+        "valid schema must still flush"
+    );
+}

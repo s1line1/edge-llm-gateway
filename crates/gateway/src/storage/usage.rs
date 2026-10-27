@@ -87,8 +87,9 @@ pub struct UsageDelta {
 pub(crate) struct UsageStore {
     usage: RwLock<HashMap<String, UsageRecord>>,
     db: Arc<Mutex<Option<Connection>>>,
-    /// 库是否可用。**构造时定死**：`db` 里的 `Option` 一旦建成就不再变（打不开的库降级成
-    /// `None`，而 `None` 不会被重新填上），所以"有没有库"是这个模块的**静态事实**。
+    /// 是否允许落库。**构造时定死**：`db` 里的 `Option` 一旦建成就不再变（打不开的库降级成
+    /// `None`，而 `None` 不会被重新填上）；`key_usage` 载入失败也会把这里置为 `false`。
+    /// 于是 `false` = **不要落库**（没有库，或载入失败必须保留旧行），
     /// 缓存它让 [`Self::has_pending`] 不必去抢那把同步 `db` 锁——见那里的说明（复扫 C2-2）。
     has_db: bool,
     /// [`Self::flush_once`] 的串行化闸门（复扫 C1）。
@@ -100,22 +101,24 @@ pub(crate) struct UsageStore {
 }
 
 impl UsageStore {
-    /// 建实例：库可用则从 `key_usage` 载入（失败只告警、按空账本继续，与凭据存储同风格），
-    /// 库不可用（`None`）则纯内存记账。
+    /// 建实例：库可用则从 `key_usage` 载入；库不可用（`None`）则纯内存记账。
+    ///
+    /// `key_usage` 载入失败时**禁用落库**而不是带着空账本继续：空账本 + 绝对值 upsert 会
+    /// 在下次 flush 时把库里已有的历史总量覆盖成重启后的小值（S2-5）。禁用落库保留旧行，
+    /// 新用量只留在本进程内存；`Storage::persistence_state` 不把这个失败算作凭据 fail-fast。
     pub(crate) fn new(db: Arc<Mutex<Option<Connection>>>) -> Self {
         let (usage, has_db) = {
             let guard = lock_or_recover(&db);
             match guard.as_ref() {
-                Some(conn) => {
-                    let usage = match load_usage(conn) {
-                        Ok(map) => map,
-                        Err(e) => {
-                            tracing::warn!("usage db load failed: {e}; using empty usage store");
-                            HashMap::new()
-                        }
-                    };
-                    (usage, true)
-                }
+                Some(conn) => match load_usage(conn) {
+                    Ok(map) => (map, true),
+                    Err(e) => {
+                        tracing::error!(
+                            "usage db load failed: {e}; usage persistence disabled to preserve existing totals"
+                        );
+                        (HashMap::new(), false)
+                    }
+                },
                 None => (HashMap::new(), false),
             }
         };
