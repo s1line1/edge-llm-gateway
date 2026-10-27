@@ -36,6 +36,7 @@ use crate::sync::{lock_or_recover, read_or_recover, write_or_recover};
 #[derive(Debug, Clone)]
 pub struct KeyUsageInfo {
     pub key_id: String,
+    pub tenant_id: String,
     /// key 名称快照（吊销后仍可审计名称）。
     pub name: String,
     pub prompt_tokens: u64,
@@ -52,6 +53,7 @@ pub struct KeyUsageInfo {
 /// 这样落库天然幂等、重启后不会重复累加，也不会像增量那样"丢一条就永久少一条"。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct UsageSnapshot {
+    tenant_id: String,
     name: String,
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -136,16 +138,19 @@ impl UsageStore {
     /// （`usage_flush::spawn`）与关闭前的强制 flush。这里保留同步组合是为了让
     /// 测试能一步写完就读库断言，因此用 `cfg(test)` 挡在生产代码之外。
     #[cfg(test)]
-    pub(crate) fn record(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        self.accumulate(key_id, name, delta);
-        self.persist(key_id, name, delta);
+    pub(crate) fn record(&self, key_id: &str, tenant_id: &str, name: &str, delta: &UsageDelta) {
+        self.accumulate(key_id, tenant_id, name, delta);
+        self.persist(key_id, tenant_id, name, delta);
     }
 
     /// 只做内存累加：纳秒级、无 IO，用于让 `/admin/usage`（读的正是这份内存计数）
     /// 在响应返回时立即一致。
-    pub(crate) fn accumulate(&self, key_id: &str, name: &str, delta: &UsageDelta) {
+    pub(crate) fn accumulate(&self, key_id: &str, tenant_id: &str, name: &str, delta: &UsageDelta) {
         let mut usage = write_or_recover(&self.usage);
         let rec = usage.entry(key_id.to_string()).or_default();
+        if rec.current.tenant_id.is_empty() {
+            rec.current.tenant_id = tenant_id.to_string();
+        }
         if rec.current.name.is_empty() {
             rec.current.name = name.to_string();
         }
@@ -233,9 +238,10 @@ impl UsageStore {
         for (key_id, snap) in &batch {
             let r = tx.execute(
                 "INSERT INTO key_usage
-                 (key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 (key_id, tenant_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(key_id) DO UPDATE SET
+                   tenant_id = excluded.tenant_id,
                    name = excluded.name,
                    prompt_tokens = excluded.prompt_tokens,
                    completion_tokens = excluded.completion_tokens,
@@ -244,6 +250,7 @@ impl UsageStore {
                    last_used_at = excluded.last_used_at",
                 rusqlite::params![
                     key_id,
+                    snap.tenant_id,
                     snap.name,
                     snap.prompt_tokens as i64,
                     snap.completion_tokens as i64,
@@ -292,13 +299,14 @@ impl UsageStore {
     /// 摁在约 190 QPS（云端 515 线程 / 514 个卡在 futex 等锁），所以这里只留给测试
     /// 构造"库里已有某值"的场景。**阻塞调用**，不要放回请求路径。
     #[cfg(test)]
-    pub(crate) fn persist(&self, key_id: &str, name: &str, delta: &UsageDelta) {
+    pub(crate) fn persist(&self, key_id: &str, tenant_id: &str, name: &str, delta: &UsageDelta) {
         if let Some(conn) = lock_or_recover(&self.db).as_mut() {
             let r = conn.execute(
                 "INSERT INTO key_usage
-                 (key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 (key_id, tenant_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(key_id) DO UPDATE SET
+                   tenant_id = excluded.tenant_id,
                    name = excluded.name,
                    prompt_tokens = key_usage.prompt_tokens + excluded.prompt_tokens,
                    completion_tokens = key_usage.completion_tokens + excluded.completion_tokens,
@@ -307,6 +315,7 @@ impl UsageStore {
                    last_used_at = excluded.last_used_at",
                 rusqlite::params![
                     key_id,
+                    tenant_id,
                     name,
                     delta.prompt_tokens as i64,
                     delta.completion_tokens as i64,
@@ -338,12 +347,41 @@ impl UsageStore {
         out.sort_by(|a, b| a.key_id.cmp(&b.key_id));
         out
     }
+
+    /// 某 tenant 的每 key 用量（按 key_id 排序）。
+    pub(crate) fn usage_for_tenant(&self, tenant_id: &str) -> Vec<KeyUsageInfo> {
+        let usage = read_or_recover(&self.usage);
+        let mut out: Vec<KeyUsageInfo> = usage
+            .iter()
+            .filter(|(_, rec)| rec.current.tenant_id == tenant_id)
+            .map(|(id, rec)| cell_to_info(id, &rec.current))
+            .collect();
+        out.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        out
+    }
+
+    /// 某 tenant 的 (prompt, completion, total, requests) 汇总。
+    pub(crate) fn tenant_totals(&self, tenant_id: &str) -> (u64, u64, u64, u64) {
+        let usage = read_or_recover(&self.usage);
+        usage
+            .values()
+            .filter(|rec| rec.current.tenant_id == tenant_id)
+            .fold((0, 0, 0, 0), |(p, c, t, r), rec| {
+                (
+                    p + rec.current.prompt_tokens,
+                    c + rec.current.completion_tokens,
+                    t + rec.current.prompt_tokens + rec.current.completion_tokens,
+                    r + rec.current.requests,
+                )
+            })
+    }
 }
 
 /// 把原子单元转成可序列化的明细。
 fn cell_to_info(key_id: &str, snap: &UsageSnapshot) -> KeyUsageInfo {
     KeyUsageInfo {
         key_id: key_id.to_string(),
+        tenant_id: snap.tenant_id.clone(),
         name: snap.name.clone(),
         prompt_tokens: snap.prompt_tokens,
         completion_tokens: snap.completion_tokens,
@@ -358,19 +396,20 @@ fn cell_to_info(key_id: &str, snap: &UsageSnapshot) -> KeyUsageInfo {
 fn load_usage(conn: &Connection) -> rusqlite::Result<HashMap<String, UsageRecord>> {
     let mut out = HashMap::new();
     let mut stmt = conn.prepare(
-        "SELECT key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at
+        "SELECT key_id, tenant_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at
          FROM key_usage",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             UsageSnapshot {
-                name: r.get::<_, String>(1)?,
-                prompt_tokens: r.get::<_, i64>(2)?.max(0) as u64,
-                completion_tokens: r.get::<_, i64>(3)?.max(0) as u64,
-                requests: r.get::<_, i64>(4)?.max(0) as u64,
-                estimated_requests: r.get::<_, i64>(5)?.max(0) as u64,
-                last_used_at: r.get::<_, i64>(6)?.max(0) as u64,
+                tenant_id: r.get::<_, String>(1)?,
+                name: r.get::<_, String>(2)?,
+                prompt_tokens: r.get::<_, i64>(3)?.max(0) as u64,
+                completion_tokens: r.get::<_, i64>(4)?.max(0) as u64,
+                requests: r.get::<_, i64>(5)?.max(0) as u64,
+                estimated_requests: r.get::<_, i64>(6)?.max(0) as u64,
+                last_used_at: r.get::<_, i64>(7)?.max(0) as u64,
             },
         ))
     })?;

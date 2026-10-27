@@ -12,7 +12,7 @@
 任何地方用标准的 OpenAI SDK 调它，同时**不把本地推理端点直接暴露到公网**。
 
 <p align="center">
-  <img alt="测试" src="https://img.shields.io/badge/tests-401%20passed-brightgreen">
+  <img alt="测试" src="https://img.shields.io/badge/tests-418%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -95,6 +95,17 @@ agent 只做一件事：把隧道里收到的请求帧，变成一次对本地 L
 - 按请求 `model` 过滤候选：精确声明优先于 `models: ["*"]` 通配兜底
 - 同组内选**在途最少**者；心跳过期者不再参与路由
 - 无可用 agent → 503；无人能服务该模型 → 404；容量已满 → 429（三类成因在指标里分开记）
+
+**Multi-tenancy**
+- Tenant owns API keys and edge agents；一个 key 只能路由到**同 tenant** 的 agent，`/v1/models`
+  也只展示本 tenant 的模型；不同 tenant 即使声明同名模型也互不可见
+- 旧 key / 旧 agent 在升级时归入内置 `default` tenant（不可删除/禁用）；legacy `Register`
+  只在 `allow_legacy_agent_registration: true` 的迁移窗口内接受
+- 每 tenant 可配 `requests_per_minute` 与 `max_concurrent_requests`，与 per-key 限流叠加；
+  并发票持有到响应 body 结束
+- Agent 注册使用一次性 `agent_token`（只存 sha256；见 `/admin/tenants`），一条 QUIC 连接只属于一个 tenant
+- 管理面：`/admin/tenants` CRUD、agent-token rotate，`/admin/keys`、`/admin/usage`、`/admin/agents`
+  支持 tenant 过滤；tenant 不进 metric label（避免高基数），进结构化日志
 
 **Security**
 - API Key：`sha256(token)` 快速索引定位 + **argon2id** 校验，**明文不落盘**
@@ -303,8 +314,8 @@ fmt · clippy -D warnings · nextest · e2e 接线 · toolchain-check · check-r
 
 `make check` 在它之外再加 `cargo deny` 与前端四项（web-format / web-lint / web-test / web-build）。
 
-> **当前规模（`cargo nextest run --workspace` 实测）**：**401 个被执行且通过的测试（0 skipped）**，其中
-> **73 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
+> **当前规模（`cargo nextest run --workspace` 实测）**：**418 个被执行且通过的测试（0 skipped）**，其中
+> **76 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
 >
 > 两点与 `cargo test` 不同的行为要知道：**nextest 每条测试一个进程**，所以 `serial_test` 的
 > `#[serial]`（进程内锁）在它下面失效——e2e 的串行改由 `.config/nextest.toml` 的 `test-group`

@@ -5,6 +5,9 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+#[cfg(test)]
+use crate::storage::DEFAULT_TENANT_ID;
+
 /// 一个 agent-node 的身份：对端自报的 `agent_id` + **socket 上看到的来源 IP**。
 ///
 /// **为什么键要含 IP**（2026-10-16 决策 D1）：原来键只有 `agent_id`，于是两台机器用同一个
@@ -18,13 +21,21 @@ use std::net::{IpAddr, SocketAddr};
 /// 机器会因为"v4 连接看到 `127.0.0.1`、双栈连接看到 `::ffff:127.0.0.1`"被当成两个节点。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct AgentKey {
+    pub(crate) tenant_id: String,
     pub(crate) agent_id: String,
     pub(crate) peer_ip: IpAddr,
 }
 
 impl AgentKey {
+    /// 测试/旧调用：归入 `default` tenant。
+    #[cfg(test)]
     pub(crate) fn new(agent_id: &str, peer_ip: IpAddr) -> Self {
+        Self::new_in_tenant(DEFAULT_TENANT_ID, agent_id, peer_ip)
+    }
+
+    pub(crate) fn new_in_tenant(tenant_id: &str, agent_id: &str, peer_ip: IpAddr) -> Self {
         Self {
+            tenant_id: tenant_id.to_string(),
             agent_id: agent_id.to_string(),
             peer_ip: normalize_ip(peer_ip),
         }

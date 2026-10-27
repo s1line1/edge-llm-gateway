@@ -67,12 +67,13 @@ pub(super) async fn healthz(State(state): State<AppState>) -> Response {
 /// （`["*"]` 全匹配的 agent 不贡献条目——它接受任意请求，但具体能跑什么
 /// 只有上游知道，列出会误导客户端）。与代理入口同级的认证 + 限流。
 pub(super) async fn models_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(rejection) = auth::authenticate(&state, &headers).await {
-        return rejection.into_response();
-    }
+    let key = match auth::authenticate(&state, &headers).await {
+        Ok(key) => key,
+        Err(rejection) => return rejection.into_response(),
+    };
     let data: Vec<_> = state
         .registry
-        .healthy_models(state.policy.agent_stale_after)
+        .healthy_models_for_tenant(&key.tenant_id, state.policy.agent_stale_after)
         .into_iter()
         .map(|id| {
             json!({

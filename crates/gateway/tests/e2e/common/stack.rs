@@ -50,6 +50,7 @@ pub fn e2e_options(keys_file: Option<PathBuf>) -> Options {
         head_timeout: Duration::from_secs(5),
         agent_stale_after: Duration::from_secs(10),
         client_stall: Duration::from_secs(60),
+        allow_legacy_agent_registration: true,
         ..Options::default()
     }
 }

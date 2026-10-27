@@ -22,10 +22,14 @@ use tracing::warn;
 /// **不含明文 token**（评估记录 P2-19）：限流桶按 [`Self::key_id`] 作键，明文只在与
 /// keystore 校验的那一刻存在于栈上。把它留在这里等于给每个 handler 一个把凭据写进日志 /
 /// 指标标签 / 错误响应的机会，而 keystore 那边是"只存哈希、明文不落盘"的姿态。
+#[derive(Debug)]
 pub struct AuthenticatedKey {
     /// 用量计量的归属（`/admin/usage` 按它聚合），也是限流桶的键。
     pub key_id: String,
     pub key_name: String,
+    /// 所属租户；路由与模型发现只允许看到同 tenant 的 agent。
+    pub tenant_id: String,
+    pub tenant_name: String,
 }
 
 /// 认证 / 限流被拒的原因。
@@ -41,6 +45,10 @@ pub enum AuthRejection {
     /// 超过该 key 的每分钟配额 → 429，带**按回填速度算出的** `Retry-After`（复扫 A4：
     /// 不再是写死的 60s，见 [`crate::ratelimit::RateLimiter::retry_after_secs`]）。
     RateLimited { retry_after_secs: u64 },
+    /// tenant 不存在或被禁用 → 403。
+    TenantDisabled,
+    /// 超过 tenant 的每分钟配额 → 429。
+    TenantRateLimited { retry_after_secs: u64 },
 }
 
 impl AuthRejection {
@@ -52,6 +60,12 @@ impl AuthRejection {
             }
             AuthRejection::RateLimited { retry_after_secs } => {
                 rate_limited("rate limit exceeded", retry_after_secs)
+            }
+            AuthRejection::TenantDisabled => {
+                error_response(StatusCode::FORBIDDEN, "tenant disabled")
+            }
+            AuthRejection::TenantRateLimited { retry_after_secs } => {
+                rate_limited("tenant rate limit exceeded", retry_after_secs)
             }
         }
     }
@@ -68,6 +82,22 @@ pub async fn authenticate(
     let Some(key) = verify_api_key(state, headers).await else {
         return Err(AuthRejection::InvalidKey);
     };
+    let Some(tenant) = state.store.tenant(&key.tenant_id) else {
+        return Err(AuthRejection::TenantDisabled);
+    };
+    if !tenant.enabled() {
+        return Err(AuthRejection::TenantDisabled);
+    }
+    if !state
+        .tenant_rate_limiter
+        .try_acquire(tenant.id(), tenant.requests_per_minute())
+    {
+        return Err(AuthRejection::TenantRateLimited {
+            retry_after_secs: state
+                .tenant_rate_limiter
+                .retry_after_secs(tenant.requests_per_minute()),
+        });
+    }
     if let Some(rl) = &state.rate_limiter {
         // 桶键是 key id，**不是明文 token**（P2-19）：限流器只增不减，拿明文作键等于把它
         // 常驻进程内存（`/proc/<pid>/mem`、core dump 都带着它）。同一条身份对同一个桶
@@ -78,7 +108,12 @@ pub async fn authenticate(
             });
         }
     }
-    Ok(key)
+    Ok(AuthenticatedKey {
+        key_id: key.key_id,
+        key_name: key.key_name,
+        tenant_id: tenant.id().to_string(),
+        tenant_name: tenant.name().to_string(),
+    })
 }
 
 /// 从 `Authorization` 头里取出 Bearer 凭据（`/v1` 认证与 `/admin` 鉴权共用这一套解析）。
@@ -117,8 +152,10 @@ async fn verify_api_key(state: &AppState, headers: &HeaderMap) -> Option<Authent
         }
     };
     Some(AuthenticatedKey {
-        key_id: record.id,
-        key_name: record.name,
+        key_id: record.id.clone(),
+        key_name: record.name.clone(),
+        tenant_id: record.tenant_id.clone(),
+        tenant_name: String::new(),
     })
 }
 
@@ -296,5 +333,98 @@ mod tests {
                 "`{header}` 不该通过认证"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::*;
+    use crate::{
+        metrics::Metrics, options::Options, registry::Registry, storage::Storage,
+        storage::TenantPatch,
+    };
+
+    fn key_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn default_tenant_is_resolved_for_existing_keys() {
+        let store = Storage::new(None);
+        let created = store.create("tenant-default".into()).unwrap();
+        let state = AppState::new_for_test(
+            Registry::default(),
+            store,
+            Metrics::default(),
+            &Options::default(),
+        );
+        let identity = authenticate(&state, &key_headers(&created.plaintext))
+            .await
+            .expect("default key should authenticate");
+        assert_eq!(identity.tenant_id, "default");
+        assert_eq!(identity.tenant_name, "default");
+    }
+
+    #[tokio::test]
+    async fn disabled_tenant_returns_forbidden() {
+        let store = Storage::new(None);
+        let created = store.create_tenant("disabled".into(), 0, 0).unwrap();
+        let tenant_id = created.record.id().to_string();
+        let key = store.create_in(&tenant_id, "disabled-key".into()).unwrap();
+        store
+            .update_tenant(
+                &tenant_id,
+                TenantPatch {
+                    enabled: Some(false),
+                    ..TenantPatch::default()
+                },
+            )
+            .unwrap();
+        let state = AppState::new_for_test(
+            Registry::default(),
+            store,
+            Metrics::default(),
+            &Options::default(),
+        );
+        let rejection = authenticate(&state, &key_headers(&key.plaintext))
+            .await
+            .expect_err("disabled tenant must be rejected");
+        assert_eq!(rejection, AuthRejection::TenantDisabled);
+        let resp = rejection.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn tenant_rate_limit_returns_429_with_retry_after() {
+        let store = Storage::new(None);
+        let created = store.create_tenant("limited".into(), 0, 1).unwrap();
+        let tenant_id = created.record.id().to_string();
+        let key = store.create_in(&tenant_id, "limited-key".into()).unwrap();
+        let state = AppState::new_for_test(
+            Registry::default(),
+            store,
+            Metrics::default(),
+            &Options::default(),
+        );
+        authenticate(&state, &key_headers(&key.plaintext))
+            .await
+            .expect("first request should pass");
+        let rejection = authenticate(&state, &key_headers(&key.plaintext))
+            .await
+            .expect_err("second request should hit the tenant bucket");
+        match rejection {
+            AuthRejection::TenantRateLimited { retry_after_secs } => {
+                assert!(retry_after_secs >= 1);
+            }
+            other => panic!("unexpected rejection: {other:?}"),
+        }
+        let resp = rejection.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
     }
 }

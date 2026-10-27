@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-use super::schema::{migrate_legacy_keys, table_has_column, API_KEY_SCHEMA, USAGE_SCHEMA};
+use super::schema::{
+    add_column_if_missing, ensure_default_tenant, migrate_legacy_keys, table_has_column,
+    API_KEY_SCHEMA, TENANT_SCHEMA, USAGE_SCHEMA,
+};
 
 /// 打开后的库：连接（内存模式为 `None`）与持久化三态。
 ///
@@ -46,12 +49,28 @@ pub(super) fn open(file: Option<&Path>) -> OpenedDb {
                 let init = (|| {
                     conn.execute_batch(API_KEY_SCHEMA)?;
                     conn.execute_batch(USAGE_SCHEMA)?;
+                    conn.execute_batch(TENANT_SCHEMA)?;
+                    ensure_default_tenant(&conn)?;
                     // 老库（无 cred_version 列）→ 补列；新库上 API_KEY_SCHEMA 已建好，这里跳过。
                     if !table_has_column(&conn, "api_keys", "cred_version")? {
                         conn.execute_batch(
                             "ALTER TABLE api_keys ADD COLUMN cred_version INTEGER NOT NULL DEFAULT 1",
                         )?;
                     }
+                    // 多租户迁移：老表补 tenant_id；新表已带该列，这里跳过。
+                    add_column_if_missing(
+                        &conn,
+                        "api_keys",
+                        "tenant_id",
+                        "TEXT NOT NULL DEFAULT 'default'",
+                    )?;
+                    add_column_if_missing(
+                        &conn,
+                        "key_usage",
+                        "tenant_id",
+                        "TEXT NOT NULL DEFAULT 'default'",
+                    )?;
+                    ensure_default_tenant(&conn)?;
                     Ok::<_, rusqlite::Error>(())
                 })();
                 match init {

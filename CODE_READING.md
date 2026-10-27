@@ -62,7 +62,8 @@ crates/proto/src/headers.rs  逐跳头过滤（gateway/agent 共享）
 ③ gateway/src/proxy/            ★ 最重要
    prepare（认证→路径守卫→body→隧道帧）→ routing/head（选路、等响应头）→ forward（流式回写）
 ④ gateway/src/quic.rs
-   服务端：accept_loop、Register / Heartbeat 控制流
+   服务端：accept_loop、Register / RegisterWithTenant / Heartbeat 控制流；
+   agent 按 tenant 注册并校验 agent_token
 ⑤ agent/src/main.rs → lib.rs → session.rs   ★ 另一端
    拨号 → 注册 → 心跳 → accept_bi → handle_stream（转发上游 + Cancel 传播）；
    重连退避在 backoff.rs，本机并发闸门在 gate.rs
@@ -80,9 +81,11 @@ gateway/src/registry/    agent 注册表（table/entry/routing/eviction/admissio
                           模型过滤/精确优先排序 + SlotGuard 并发占位（admission control）
 gateway/src/storage/       SQLite 存储（db 打开/迁移 + schema + usage/verified）+ argon2 哈希
                           + sha256 lookup 快速索引（+ hash.rs 哈希原语）
-gateway/src/admin.rs        Admin API（key 管理 + agents 列表 + usage 查询）
+                          storage/tenant.rs: TenantRecord/default/agent token；storage/usage.rs 带 tenant_id
+gateway/src/admin.rs        Admin API（tenant CRUD + agent token + tenant 过滤的 keys/agents/usage）
 gateway/src/usage_meter.rs        per-key token 用量提取 / 无 usage 时估算（纯函数，由 proxy 调用）
-gateway/src/ratelimit.rs    令牌桶
+gateway/src/ratelimit.rs    令牌桶（per-key + per-tenant）
+gateway/src/tenant_limits.rs tenant 并发票（随响应 body 持有）
 gateway/src/metrics/        Prometheus 指标：计数器/准入票据/文本渲染分工（mod/admission/render）
 gateway/src/error.rs        GatewayError（thiserror；anyhow 仍用于 config/quic/tls 与 agent 侧）
 gateway/src/tls.rs          mTLS 配置（动态信任根方向见 TODO P1 多 CA 方案）

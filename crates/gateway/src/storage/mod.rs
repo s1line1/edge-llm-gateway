@@ -36,19 +36,25 @@ use rusqlite::Connection;
 use crate::error::GatewayError;
 
 pub mod hash;
+mod tenant;
 mod usage;
 mod verified;
+
+pub(crate) use tenant::DEFAULT_TENANT_ID;
+pub use tenant::{CreatedTenant, TenantError, TenantPatch, TenantRecord};
 
 /// 用量记账/落库的类型由私有模块 `usage` 定义，路径 `crate::storage::UsageDelta` 保持不变。
 pub use usage::{KeyUsageInfo, UsageDelta};
 
-use crate::storage::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
+use crate::storage::hash::{
+    constant_time_eq, generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2,
+};
 use crate::sync::{lock_or_recover, read_or_recover, write_or_recover};
 
 mod db;
 mod schema;
 
-use schema::load_keys;
+use schema::{load_keys, load_tenants};
 
 #[derive(Clone)]
 pub struct Storage {
@@ -58,6 +64,8 @@ pub struct Storage {
 struct StoreInner {
     /// 动态 key，key = lookup（sha256(token) 十六进制），value = 记录。
     runtime: RwLock<HashMap<String, KeyRecord>>,
+    /// 租户；`default` 始终存在。
+    tenants: RwLock<HashMap<String, tenant::TenantRecord>>,
     /// SQLite 持久化连接（None = 仅内存，如 db 打开失败时降级）。
     ///
     /// **与用量记账共享**（`Arc`）：连接是**资源**（凭据写穿与用量落库都用它），
@@ -100,6 +108,7 @@ pub struct KeyRecord {
     /// 凭据版本：写入时取当时代数。任何凭据相关变更（吊销/轮换）都会让代数自增，
     /// 从而让基于旧版本建立的已验证缓存**立即失效**（见 `verified` 模块）。
     pub(crate) cred_version: u64,
+    pub(crate) tenant_id: String,
 }
 
 impl KeyRecord {
@@ -122,6 +131,11 @@ impl KeyRecord {
     /// [`Storage::delete`]），所以"查得到 + enabled"才代表可用。
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// 所属租户 id。
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
     }
 }
 
@@ -154,18 +168,35 @@ fn is_unique_key_collision(err: &rusqlite::Error) -> bool {
 
 fn insert_api_key(conn: &Connection, record: &KeyRecord) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO api_keys (id, lookup, key_hash, name, created_at, enabled)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO api_keys (id, lookup, key_hash, name, created_at, enabled, tenant_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             record.id,
             record.lookup,
             record.key_hash,
             record.name,
             record.created_at as i64,
-            1i64
+            1i64,
+            record.tenant_id
         ],
     )
     .map(|_| ())
+}
+
+fn validate_tenant_name(name: &str) -> Result<String, TenantError> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 64 {
+        return Err(TenantError::InvalidName);
+    }
+    Ok(name.to_string())
+}
+
+fn is_unique_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if e.code == rusqlite::ErrorCode::ConstraintViolation
+    )
 }
 
 impl Storage {
@@ -180,6 +211,222 @@ impl Storage {
     /// （S2-5），不会因为用量账本读不出来而让一个仍能授权/转发的网关拒绝启动。
     pub fn persistence_state(&self) -> Option<Result<(), String>> {
         self.inner.persistence.clone()
+    }
+
+    /// 按 id 取租户快照。
+    pub fn tenant(&self, id: &str) -> Option<TenantRecord> {
+        read_or_recover(&self.inner.tenants).get(id).cloned()
+    }
+
+    /// 全部租户（按 created_at 排序）。
+    pub fn tenants(&self) -> Vec<TenantRecord> {
+        let mut v: Vec<TenantRecord> = read_or_recover(&self.inner.tenants)
+            .values()
+            .cloned()
+            .collect();
+        v.sort_by_key(|t| t.created_at());
+        v
+    }
+
+    /// key id → tenant id。
+    pub fn tenant_of_key(&self, key_id: &str) -> Option<String> {
+        read_or_recover(&self.inner.runtime)
+            .values()
+            .find(|r| r.id == key_id)
+            .map(|r| r.tenant_id.clone())
+    }
+
+    /// 某 tenant 的当前 key 数（吊销后的 key 不在 runtime 里）。
+    pub fn key_count_for_tenant(&self, tenant_id: &str) -> usize {
+        read_or_recover(&self.inner.runtime)
+            .values()
+            .filter(|r| r.tenant_id == tenant_id)
+            .count()
+    }
+
+    /// 校验 agent 注册 token：tenant 必须存在且启用，token 的 sha256 必须匹配。
+    /// `default` 的 hash 为空，因此任何 token 都不匹配（legacy Register 走另一条路）。
+    pub(crate) fn verify_agent_token(
+        &self,
+        tenant_id: &str,
+        token: &str,
+    ) -> Result<TenantRecord, TenantError> {
+        let tenant = self.tenant(tenant_id).ok_or(TenantError::NotFound)?;
+        if !tenant.enabled() {
+            return Err(TenantError::Disabled);
+        }
+        let hash = tenant.agent_token_hash();
+        if hash.is_empty() || token.is_empty() {
+            return Err(TenantError::BadToken);
+        }
+        if constant_time_eq(lookup_of(token).as_bytes(), hash.as_bytes()) {
+            Ok(tenant)
+        } else {
+            Err(TenantError::BadToken)
+        }
+    }
+
+    /// 创建 tenant；返回一次性明文 agent token。
+    pub fn create_tenant(
+        &self,
+        name: String,
+        max_concurrent_requests: u32,
+        requests_per_minute: u32,
+    ) -> Result<CreatedTenant, TenantError> {
+        let name = validate_tenant_name(&name)?;
+        if read_or_recover(&self.inner.tenants)
+            .values()
+            .any(|t| t.name() == name)
+        {
+            return Err(TenantError::NameTaken);
+        }
+        let id = tenant::generate_tenant_id();
+        let agent_token = tenant::generate_agent_token();
+        let agent_token_hash = lookup_of(&agent_token);
+        let record = TenantRecord::new(
+            id.clone(),
+            name.clone(),
+            now_secs(),
+            true,
+            max_concurrent_requests,
+            requests_per_minute,
+            agent_token_hash,
+        );
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            if let Err(e) = conn.execute(
+                "INSERT INTO tenants
+                 (id, name, created_at, enabled, max_concurrent_requests, requests_per_minute, agent_token_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    record.id(),
+                    record.name(),
+                    record.created_at() as i64,
+                    i64::from(record.enabled()),
+                    record.max_concurrent_requests() as i64,
+                    record.requests_per_minute() as i64,
+                    record.agent_token_hash(),
+                ],
+            ) {
+                if is_unique_violation(&e) {
+                    return Err(TenantError::NameTaken);
+                }
+                return Err(TenantError::Database(e.to_string()));
+            }
+        }
+        write_or_recover(&self.inner.tenants).insert(id, record.clone());
+        Ok(CreatedTenant {
+            record,
+            agent_token,
+        })
+    }
+
+    /// 更新 tenant；id/name 之外的字段可改。`default` 不能禁用或改名。
+    pub fn update_tenant(&self, id: &str, patch: TenantPatch) -> Result<TenantRecord, TenantError> {
+        let mut record = self.tenant(id).ok_or(TenantError::NotFound)?;
+        if id == tenant::DEFAULT_TENANT_ID {
+            if patch.enabled == Some(false) {
+                return Err(TenantError::DefaultTenant);
+            }
+            if let Some(name) = &patch.name {
+                if name != record.name() {
+                    return Err(TenantError::DefaultTenant);
+                }
+            }
+        }
+        let name = match patch.name {
+            Some(name) => validate_tenant_name(&name)?,
+            None => record.name().to_string(),
+        };
+        if name != record.name()
+            && read_or_recover(&self.inner.tenants)
+                .values()
+                .any(|t| t.id() != id && t.name() == name)
+        {
+            return Err(TenantError::NameTaken);
+        }
+        let enabled = patch.enabled.unwrap_or(record.enabled());
+        let max = patch
+            .max_concurrent_requests
+            .unwrap_or(record.max_concurrent_requests());
+        let rpm = patch
+            .requests_per_minute
+            .unwrap_or(record.requests_per_minute());
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            if let Err(e) = conn.execute(
+                "UPDATE tenants SET name = ?1, enabled = ?2, max_concurrent_requests = ?3, requests_per_minute = ?4 WHERE id = ?5",
+                rusqlite::params![name, i64::from(enabled), max as i64, rpm as i64, id],
+            ) {
+                return Err(TenantError::Database(e.to_string()));
+            }
+        }
+        record = TenantRecord::new(
+            record.id().to_string(),
+            name,
+            record.created_at(),
+            enabled,
+            max,
+            rpm,
+            record.agent_token_hash().to_string(),
+        );
+        write_or_recover(&self.inner.tenants).insert(id.to_string(), record.clone());
+        Ok(record)
+    }
+
+    /// 删除 tenant：`default` 与仍有 key 的 tenant 拒绝；agent 存在性由 admin 层检查。
+    pub fn delete_tenant(&self, id: &str) -> Result<(), TenantError> {
+        if id == tenant::DEFAULT_TENANT_ID {
+            return Err(TenantError::DefaultTenant);
+        }
+        if self.tenant(id).is_none() {
+            return Err(TenantError::NotFound);
+        }
+        if self.key_count_for_tenant(id) > 0 {
+            return Err(TenantError::HasKeys);
+        }
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            if let Err(e) = conn.execute("DELETE FROM tenants WHERE id = ?1", rusqlite::params![id])
+            {
+                return Err(TenantError::Database(e.to_string()));
+            }
+        }
+        write_or_recover(&self.inner.tenants).remove(id);
+        Ok(())
+    }
+
+    /// 重新生成 tenant agent token；返回一次性明文。`default` 也允许（显式启用 token 注册）。
+    pub fn rotate_agent_token(&self, id: &str) -> Result<String, TenantError> {
+        let mut record = self.tenant(id).ok_or(TenantError::NotFound)?;
+        let token = tenant::generate_agent_token();
+        let hash = lookup_of(&token);
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            if let Err(e) = conn.execute(
+                "UPDATE tenants SET agent_token_hash = ?1 WHERE id = ?2",
+                rusqlite::params![hash, id],
+            ) {
+                return Err(TenantError::Database(e.to_string()));
+            }
+        }
+        record = TenantRecord::new(
+            record.id().to_string(),
+            record.name().to_string(),
+            record.created_at(),
+            record.enabled(),
+            record.max_concurrent_requests(),
+            record.requests_per_minute(),
+            hash,
+        );
+        write_or_recover(&self.inner.tenants).insert(id.to_string(), record);
+        Ok(token)
+    }
+
+    /// tenant 的每 key 用量。
+    pub fn usage_for_tenant(&self, tenant_id: &str) -> Vec<KeyUsageInfo> {
+        self.inner.usage.usage_for_tenant(tenant_id)
+    }
+
+    /// tenant 汇总 (prompt, completion, total, requests)。
+    pub fn tenant_totals(&self, tenant_id: &str) -> (u64, u64, u64, u64) {
+        self.inner.usage.tenant_totals(tenant_id)
     }
 
     pub fn new(file: Option<PathBuf>) -> Self {
@@ -220,11 +467,28 @@ impl Storage {
         // 连接是**资源**：凭据写穿与用量落库共用它，因此包一层 `Arc`；
         // 而状态各自独占——`runtime` 留在这里，用量账本交给 `usage::UsageStore`
         //（它在构造时自己从 `key_usage` 载入，失败只告警并按空账本继续）。
+        let mut tenants = match &db {
+            Some(conn) => match load_tenants(conn) {
+                Ok(map) => map,
+                Err(e) => {
+                    tracing::warn!("tenants db load failed: {e}; using only the default tenant");
+                    if matches!(persistence, Some(Ok(()))) {
+                        persistence = Some(Err(format!("cannot load the tenants db: {e}")));
+                    }
+                    HashMap::new()
+                }
+            },
+            None => HashMap::new(),
+        };
+        tenants
+            .entry(tenant::DEFAULT_TENANT_ID.to_string())
+            .or_insert_with(tenant::default_tenant);
         let db = Arc::new(Mutex::new(db));
         let usage = usage::UsageStore::new(db.clone());
         Self {
             inner: Arc::new(StoreInner {
                 runtime: RwLock::new(runtime),
+                tenants: RwLock::new(tenants),
                 db,
                 usage,
                 verified: verified::VerifiedCache::new(max, ttl),
@@ -285,6 +549,18 @@ impl Storage {
     ///
     /// 纯内存模式（`db = None`，库打不开时的降级）没有可落库的对象，直接成功。
     pub fn create(&self, name: String) -> Result<CreatedKey, GatewayError> {
+        self.create_in(tenant::DEFAULT_TENANT_ID, name)
+    }
+
+    /// 在指定 tenant 下创建 key。tenant 必须存在且启用。
+    pub fn create_in(&self, tenant_id: &str, name: String) -> Result<CreatedKey, GatewayError> {
+        if let Some(t) = self.tenant(tenant_id) {
+            if !t.enabled() {
+                return Err(GatewayError::Other("tenant is disabled".into()));
+            }
+        } else {
+            return Err(GatewayError::Other("tenant not found".into()));
+        }
         for _ in 0..3 {
             let (id, plaintext) = generate_id_key();
             let lookup = lookup_of(&plaintext);
@@ -298,6 +574,7 @@ impl Storage {
                 enabled: true,
                 // 成功落库后才 bump；重试不能浪费凭据代数。
                 cred_version: 0,
+                tenant_id: tenant_id.to_string(),
             };
             // ① 先落库。失败 → 直接把错误交给调用方（admin 映射 500），内存一个字都不改。
             if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
@@ -325,6 +602,17 @@ impl Storage {
     pub fn list(&self) -> Vec<KeyRecord> {
         let mut v: Vec<KeyRecord> = read_or_recover(&self.inner.runtime)
             .values()
+            .cloned()
+            .collect();
+        v.sort_by_key(|r| r.created_at);
+        v
+    }
+
+    /// 只列指定 tenant 的 key。
+    pub fn list_for_tenant(&self, tenant_id: &str) -> Vec<KeyRecord> {
+        let mut v: Vec<KeyRecord> = read_or_recover(&self.inner.runtime)
+            .values()
+            .filter(|r| r.tenant_id == tenant_id)
             .cloned()
             .collect();
         v.sort_by_key(|r| r.created_at);
@@ -379,7 +667,10 @@ impl Storage {
     /// 仅测试使用：生产路径只做内存累加，见 [`Self::accumulate_usage`]。
     #[cfg(test)]
     pub fn record_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        self.inner.usage.record(key_id, name, delta);
+        let tenant_id = self
+            .tenant_of_key(key_id)
+            .unwrap_or_else(|| tenant::DEFAULT_TENANT_ID.to_string());
+        self.inner.usage.record(key_id, &tenant_id, name, delta);
     }
 
     /// 本实例累计跑过多少次 argon2（测试断言用）。
@@ -397,7 +688,10 @@ impl Storage {
     ///
     /// 实现与契约见 `usage::UsageStore::accumulate`：**这里只是转发**，不保留独立逻辑。
     pub fn accumulate_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        self.inner.usage.accumulate(key_id, name, delta);
+        let tenant_id = self
+            .tenant_of_key(key_id)
+            .unwrap_or_else(|| tenant::DEFAULT_TENANT_ID.to_string());
+        self.inner.usage.accumulate(key_id, &tenant_id, name, delta);
     }
 
     /// 是否有"内存值尚未落库"的 key（静默期返回 false，调用方可跳过整轮 flush）。
@@ -425,7 +719,10 @@ impl Storage {
     /// 所以只留给测试构造"库里已有某值"的场景。**阻塞调用**，不要放回请求路径。
     #[cfg(test)]
     pub fn persist_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        self.inner.usage.persist(key_id, name, delta);
+        let tenant_id = self
+            .tenant_of_key(key_id)
+            .unwrap_or_else(|| tenant::DEFAULT_TENANT_ID.to_string());
+        self.inner.usage.persist(key_id, &tenant_id, name, delta);
     }
 
     /// 单个 key 的用量快照（无记录 → None）。

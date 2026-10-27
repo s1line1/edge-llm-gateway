@@ -63,6 +63,8 @@ pub(super) struct Prepared {
     pub prompt_est: u64,
     pub key_id: String,
     pub key_name: String,
+    pub tenant_id: String,
+    pub tenant_slot: crate::tenant_limits::TenantSlot,
 }
 
 /// 按固定顺序准备一次代理请求；任何一步失败都返回已经渲染好的响应。
@@ -81,6 +83,22 @@ pub(super) async fn prepare(state: &AppState, req: Request) -> Result<Prepared, 
     let key = match authenticate(state, &headers).await {
         Ok(key) => key,
         Err(rejection) => return Err(rejection.into_response()),
+    };
+
+    let Some(tenant) = state.store.tenant(&key.tenant_id) else {
+        return Err(error_response(StatusCode::FORBIDDEN, "tenant disabled"));
+    };
+    let tenant_slot = match state
+        .tenant_limiter
+        .try_enter(tenant.id(), tenant.max_concurrent_requests())
+    {
+        Ok(slot) => slot,
+        Err(_) => {
+            return Err(error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "tenant concurrency limit reached",
+            ))
+        }
     };
 
     // 路径守卫：**认证之后、读 body 之前**。放在这里有两个理由：① 未认证的探测拿不到
@@ -180,6 +198,8 @@ pub(super) async fn prepare(state: &AppState, req: Request) -> Result<Prepared, 
         prompt_est,
         key_id: key.key_id,
         key_name: key.key_name,
+        tenant_id: key.tenant_id,
+        tenant_slot,
     })
 }
 

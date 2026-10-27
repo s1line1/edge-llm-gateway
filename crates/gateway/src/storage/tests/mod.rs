@@ -11,4 +11,5 @@ mod cache;
 mod keys;
 mod persistence;
 mod poison;
+mod tenants;
 mod usage;

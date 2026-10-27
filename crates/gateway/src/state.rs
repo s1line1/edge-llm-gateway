@@ -20,9 +20,10 @@ use tokio::sync::watch;
 
 use crate::metrics::Metrics;
 use crate::options::Options;
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{RateLimiter, TenantRateLimiter};
 use crate::registry::Registry;
 use crate::storage::Storage;
+use crate::tenant_limits::TenantLimiter;
 use crate::ui::{resolve_ui, IndexHtml};
 
 // 关闭阶段的所有权在 `crate::shutdown`（唯一发送端 + 单向推进 + 等待窗口）。
@@ -90,6 +91,8 @@ pub struct AppState {
     /// 请求路径策略（超时、并发上限、流额度）；派生只在 [`RequestPolicy::from_options`]。
     pub policy: RequestPolicy,
     pub rate_limiter: Option<RateLimiter>,
+    pub tenant_rate_limiter: TenantRateLimiter,
+    pub tenant_limiter: TenantLimiter,
     pub metrics: Metrics,
     /// React UI 静态目录（None = `/` 显示构建提示页）。
     pub ui: Option<PathBuf>,
@@ -151,6 +154,8 @@ impl AppState {
                 .map(|token| token.trim_matches([' ', '\t', '\r', '\n']).to_owned()),
             policy: RequestPolicy::from_options(opts),
             rate_limiter: RateLimiter::new(opts.rate_limit_per_min),
+            tenant_rate_limiter: TenantRateLimiter::new(),
+            tenant_limiter: TenantLimiter::new(),
             metrics,
             ui,
             ui_index,

@@ -44,6 +44,7 @@ type Routed = (Entry, SlotGuard, ReceiveStream, SendStream);
 
 pub(super) async fn open_and_send(
     state: &AppState,
+    tenant_id: &str,
     model: &str,
     request: &Frame,
     request_id: u64,
@@ -62,10 +63,12 @@ pub(super) async fn open_and_send(
     let mut last_failure: Option<String> = None;
 
     let (entry, slot, recv, send) = loop {
-        let acquired =
-            state
-                .registry
-                .try_acquire_excluding(state.policy.agent_stale_after, model, &tried);
+        let acquired = state.registry.try_acquire_excluding_for_tenant(
+            tenant_id,
+            state.policy.agent_stale_after,
+            model,
+            &tried,
+        );
         let (mut entry, slot) = match acquired {
             Ok(x) => x,
             // 三种拒绝**必须分开记录**：它们的运维含义完全不同，而客户端看到的
@@ -81,6 +84,7 @@ pub(super) async fn open_and_send(
                 let (why, status, message) = rejection_response(reason, st.registered);
                 state.metrics.record_agent_rejection(why);
                 warn!(
+                    tenant = %tenant_id,
                     model = %model,
                     reason = why,
                     registered = st.registered,
@@ -147,6 +151,7 @@ pub(super) async fn open_and_send(
                     state.metrics.record_tunnel_open_timeout("busy");
                     warn!(
                         request_id,
+                        tenant = %tenant_id,
                         agent = %entry.agent_id(),
                         inflight = entry.inflight(),
                         max_concurrency = entry.max_concurrency(),

@@ -136,6 +136,9 @@ pub struct Options {
     /// **0 不是"不限"**：s2n-quic 里 0 意味着一条双向流都不许开（agent 连注册流都开不出来），
     /// 所以 0 会被 [`Options::stream_ceiling`] 归一到默认值。
     pub max_open_tunnel_streams: u32,
+    /// 迁移期：接受不带 tenant 的 legacy `Register` 帧并归入 `default`。
+    /// **默认 false**；只有升级旧 agent 时临时打开。
+    pub allow_legacy_agent_registration: bool,
     /// 关闭时强制落库的**等待上限**：超过它就放弃等待、继续 abort 任务。
     ///
     /// 为什么需要：`Gateway::shutdown` 的强制落库是阻塞式 SQLite 写，而
@@ -433,6 +436,7 @@ impl Default for Options {
             max_concurrent_requests: 0,
             max_entry_connections: Self::DEFAULT_MAX_ENTRY_CONNECTIONS,
             max_open_tunnel_streams: Self::DEFAULT_MAX_OPEN_TUNNEL_STREAMS,
+            allow_legacy_agent_registration: false,
             shutdown_flush_timeout: Self::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
             shutdown_grace: Self::DEFAULT_SHUTDOWN_GRACE,
         }

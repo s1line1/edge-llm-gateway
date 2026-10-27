@@ -89,6 +89,55 @@ impl TestCerts {
         max_concurrency: u32,
         request_log: bool,
     ) -> Agent {
+        self.agent_with_identity(
+            gw,
+            agent_id,
+            models,
+            upstream,
+            max_concurrency,
+            request_log,
+            None,
+            None,
+        )
+    }
+
+    /// 起一个带 tenant 归属的 agent（发送 `RegisterWithTenant`）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_for_tenant(
+        &self,
+        gw: &Gateway,
+        agent_id: &str,
+        models: &[&str],
+        upstream: SocketAddr,
+        max_concurrency: u32,
+        request_log: bool,
+        tenant_id: &str,
+        agent_token: &str,
+    ) -> Agent {
+        self.agent_with_identity(
+            gw,
+            agent_id,
+            models,
+            upstream,
+            max_concurrency,
+            request_log,
+            Some(tenant_id),
+            Some(agent_token),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn agent_with_identity(
+        &self,
+        gw: &Gateway,
+        agent_id: &str,
+        models: &[&str],
+        upstream: SocketAddr,
+        max_concurrency: u32,
+        request_log: bool,
+        tenant_id: Option<&str>,
+        agent_token: Option<&str>,
+    ) -> Agent {
         Agent::start(AgentConfig {
             cloud_addr: gw.quic_addr,
             server_name: "localhost".into(),
@@ -101,6 +150,8 @@ impl TestCerts {
             upstream_base: format!("http://{upstream}"),
             heartbeat_interval: Duration::from_millis(200),
             request_log,
+            tenant_id: tenant_id.map(str::to_string),
+            tenant_agent_token: agent_token.map(str::to_string),
         })
         .unwrap()
     }

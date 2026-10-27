@@ -37,10 +37,12 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         prompt_est,
         key_id,
         key_name,
+        tenant_id,
+        tenant_slot,
     } = prepared;
 
     let (entry, slot, recv, mut send) =
-        match routing::open_and_send(&state, &model, &request, request_id).await {
+        match routing::open_and_send(&state, &tenant_id, &model, &request, request_id).await {
             Ok(routed) => routed,
             Err(failure) => return error_response(failure.status, failure.message),
         };
@@ -89,6 +91,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             client_stall: state_client_stall,
             op_timeout,
             slot,
+            tenant_slot,
             metrics,
             store,
             key_id,

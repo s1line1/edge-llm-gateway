@@ -78,6 +78,17 @@ pub enum Frame {
         code: u16,
         message: String,
     },
+    /// agent → cloud：带租户归属的注册（追加在末尾，旧变体序号不变）。
+    ///
+    /// `agent_token` 是 bearer secret，**不得**进入日志/`kind()`/错误消息。
+    RegisterWithTenant {
+        agent_id: String,
+        tenant_id: String,
+        agent_token: String,
+        models: Vec<String>,
+        max_concurrency: u32,
+        version: String,
+    },
 }
 
 impl Frame {
@@ -99,6 +110,7 @@ impl Frame {
             Frame::ProxyResponseEnd { .. } => "ProxyResponseEnd",
             Frame::Cancel { .. } => "Cancel",
             Frame::Error { .. } => "Error",
+            Frame::RegisterWithTenant { .. } => "RegisterWithTenant",
         }
     }
 }
@@ -194,6 +206,14 @@ mod tests {
                 request_id: None,
                 code: 500,
                 message: "boom".into(),
+            },
+            Frame::RegisterWithTenant {
+                agent_id: "a".into(),
+                tenant_id: "t".into(),
+                agent_token: "x".into(),
+                models: vec!["m".into()],
+                max_concurrency: 1,
+                version: "v".into(),
             },
         ];
 

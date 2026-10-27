@@ -17,4 +17,5 @@ mod nofile;
 mod signals;
 mod stalls;
 mod takeover;
+mod tenants;
 mod write_backpressure;

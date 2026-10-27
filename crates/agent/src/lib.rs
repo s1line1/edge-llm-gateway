@@ -34,6 +34,10 @@ pub struct AgentConfig {
     /// 是否打印每请求的转发日志（received/responded/done/cancelled）。
     /// 高并发/压测时建议关闭，避免日志刷屏；连接/注册等低频日志不受此开关影响。
     pub request_log: bool,
+    /// 所属 tenant；`None` 表示 legacy `Register`（仅迁移期允许）。
+    pub tenant_id: Option<String>,
+    /// tenant agent token；绝不能进日志。
+    pub tenant_agent_token: Option<String>,
 }
 
 /// `Agent` 的运行结局。

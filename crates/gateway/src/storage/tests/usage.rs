@@ -176,6 +176,7 @@ fn usage_load_failure_disables_persistence() {
     let store = UsageStore::new(Arc::new(Mutex::new(Some(conn))));
     store.accumulate(
         "k",
+        "default",
         "name",
         &UsageDelta {
             prompt_tokens: 3,

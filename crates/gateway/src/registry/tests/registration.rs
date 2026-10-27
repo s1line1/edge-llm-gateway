@@ -256,3 +256,42 @@ async fn remove_if_same_guards_stable_id() {
     // 对不存在的 agent 移除 → 无害
     reg.remove_if_same("ghost", IP, id2);
 }
+
+/// 规格（SEC-005）：同 `agent_id` + 同来源 IP 在不同 tenant 下是两条独立条目，
+/// 不会互相接管；tenant 路由只能拿到自己的那条。
+#[tokio::test]
+async fn same_agent_id_and_ip_coexist_in_different_tenants() {
+    let reg = Registry::default();
+    let a = reg.register_in_tenant(
+        "tenant-a",
+        "same".into(),
+        IP,
+        vec!["m".into()],
+        4,
+        test_connection().await,
+    );
+    let b = reg.register_in_tenant(
+        "tenant-b",
+        "same".into(),
+        IP,
+        vec!["m".into()],
+        4,
+        test_connection().await,
+    );
+    assert_ne!(a, b);
+    assert_eq!(reg.snapshot(Duration::from_secs(10)).len(), 2);
+    assert_eq!(reg.count_for_tenant("tenant-a"), 1);
+    assert_eq!(reg.count_for_tenant("tenant-b"), 1);
+
+    let (entry_a, _slot_a) = reg
+        .try_acquire_excluding_for_tenant("tenant-a", Duration::from_secs(10), "m", &[])
+        .unwrap();
+    assert_eq!(entry_a.stable_id, a);
+    assert_eq!(entry_a.tenant_id(), "tenant-a");
+
+    let (entry_b, _slot_b) = reg
+        .try_acquire_excluding_for_tenant("tenant-b", Duration::from_secs(10), "m", &[])
+        .unwrap();
+    assert_eq!(entry_b.stable_id, b);
+    assert_eq!(entry_b.tenant_id(), "tenant-b");
+}

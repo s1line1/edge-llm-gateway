@@ -12,8 +12,10 @@ use std::{
 };
 
 use super::entry::{now_millis, Entry};
-use super::routing::{pick, AcquireError};
+use super::routing::{pick_for_tenant, AcquireError};
 use super::Registry;
+#[cfg(test)]
+use crate::storage::DEFAULT_TENANT_ID;
 use crate::sync::read_or_recover;
 
 /// Drop 时自动归还并发槽位。
@@ -49,15 +51,34 @@ impl Registry {
     /// 同 `try_acquire`（测试便利入口，见下），但**跳过 `exclude` 里列出的连接**（按 `stable_id`）。
     ///
     /// 用于"换一个 agent 重试"：刚失败的那条连接不该再被选中（否则重试没有意义）。
+    #[cfg(test)]
     pub(crate) fn try_acquire_excluding(
         &self,
         stale_after: Duration,
         model: &str,
         exclude: &[usize],
     ) -> Result<(Entry, SlotGuard), AcquireError> {
+        self.try_acquire_excluding_for_tenant(DEFAULT_TENANT_ID, stale_after, model, exclude)
+    }
+
+    /// 只从指定 tenant 的 agent 中占位。
+    pub(crate) fn try_acquire_excluding_for_tenant(
+        &self,
+        tenant_id: &str,
+        stale_after: Duration,
+        model: &str,
+        exclude: &[usize],
+    ) -> Result<(Entry, SlotGuard), AcquireError> {
         let inner = read_or_recover(&self.inner);
-        // 规则全在 [`pick`] 里（纯函数）：这里只负责"按序号占位、占不到就换下一个"。
-        let candidates = pick(inner.values(), now_millis(), stale_after, model, exclude)?;
+        // 规则全在 [`pick_for_tenant`] 里（纯函数）：这里只负责"按序号占位、占不到就换下一个"。
+        let candidates = pick_for_tenant(
+            inner.values(),
+            now_millis(),
+            stale_after,
+            tenant_id,
+            model,
+            exclude,
+        )?;
         for candidate in candidates {
             let entry = candidate.clone();
             // `max_concurrency == 0` = 不限：**不做上限判定**，但自增必须照做。

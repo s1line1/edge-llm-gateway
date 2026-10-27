@@ -22,6 +22,8 @@ fn start_rejects_invalid_client_key() {
         upstream_base: "http://127.0.0.1:1".into(),
         heartbeat_interval: Duration::from_millis(50),
         request_log: true,
+        tenant_id: None,
+        tenant_agent_token: None,
     };
     assert!(Agent::start(cfg).is_err(), "invalid key should fail start");
 }

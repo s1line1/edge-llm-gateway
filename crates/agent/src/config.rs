@@ -18,7 +18,7 @@ use serde::Deserialize;
 pub const ASSUMED_GATEWAY_STALE_SECS: u64 = 15;
 
 /// YAML 配置文件结构。`cloud_addr`/`ca`/`cert`/`key` 必填，其余有默认值。
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     /// 云端网关 QUIC 地址（IP:端口）— 必填
@@ -54,6 +54,32 @@ pub struct ConfigFile {
     /// 每请求转发日志开关（received/responded/done；高并发时建议关闭）
     #[serde(default = "default_request_log")]
     request_log: bool,
+    /// 所属 tenant；与 `tenant_agent_token` 必须同时出现或同时省略。
+    #[serde(default)]
+    tenant_id: Option<String>,
+    /// tenant agent token；仅在启动时读取，**不得**打日志。
+    #[serde(default)]
+    tenant_agent_token: Option<String>,
+}
+
+impl std::fmt::Debug for ConfigFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigFile")
+            .field("cloud_addr", &self.cloud_addr)
+            .field("server_name", &self.server_name)
+            .field("ca", &self.ca)
+            .field("cert", &self.cert)
+            .field("key", &self.key)
+            .field("agent_id", &self.agent_id)
+            .field("upstream", &self.upstream)
+            .field("heartbeat_secs", &self.heartbeat_secs)
+            .field("models", &self.models)
+            .field("max_concurrency", &self.max_concurrency)
+            .field("request_log", &self.request_log)
+            .field("tenant_id", &self.tenant_id)
+            .field("tenant_agent_token", &"<redacted>")
+            .finish()
+    }
 }
 
 fn default_server_name() -> String {
@@ -124,6 +150,22 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<AgentConfig> {
     }
     // 复扫 E2：心跳偏慢不会报错，只会让网关**周期性**把本 agent 判成失联——现象是"周期性
     // 503/404 而两侧进程与注册表都正常"，排障时没有任何线索指向真因，所以必须在这里吵一声。
+    match (&cfg.tenant_id, &cfg.tenant_agent_token) {
+        (None, None) => {}
+        (Some(tenant_id), Some(token)) => {
+            if tenant_id.trim().is_empty() {
+                anyhow::bail!("config: tenant_id must not be empty");
+            }
+            if token.len() != 64
+                || !token
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            {
+                anyhow::bail!("config: tenant_agent_token must be 64 lowercase hex characters");
+            }
+        }
+        _ => anyhow::bail!("config: tenant_id and tenant_agent_token must be provided together"),
+    }
     if let Some(advice) = slow_heartbeat_warning(cfg.heartbeat_secs) {
         tracing::warn!(
             heartbeat_secs = cfg.heartbeat_secs,
@@ -149,6 +191,8 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<AgentConfig> {
         upstream_base: normalize_upstream(&cfg.upstream)?,
         heartbeat_interval: Duration::from_secs(cfg.heartbeat_secs),
         request_log: cfg.request_log,
+        tenant_id: cfg.tenant_id,
+        tenant_agent_token: cfg.tenant_agent_token,
     })
 }
 
@@ -466,5 +510,67 @@ max_concurrency: 2
     #[test]
     fn from_path_missing_file_errors() {
         assert!(from_path(&PathBuf::from("/nonexistent/agent-config.yml")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tenant_config_tests {
+    use super::*;
+
+    fn parse_yaml(yaml: &str) -> ConfigFile {
+        serde_yaml_ng::from_str(yaml).unwrap()
+    }
+
+    fn yaml_with_tenant(tenant: Option<(&str, &str)>) -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = test_support::pki::write_cert_files(dir.path());
+        let mut yaml = format!(
+            "cloud_addr: \"127.0.0.1:4433\"\nca: {}\ncert: {}\nkey: {}\n",
+            ca.to_str().unwrap(),
+            cert.to_str().unwrap(),
+            key.to_str().unwrap(),
+        );
+        if let Some((tenant_id, token)) = tenant {
+            yaml.push_str(&format!(
+                "tenant_id: {tenant_id}\ntenant_agent_token: {token}\n"
+            ));
+        }
+        (yaml, dir)
+    }
+
+    #[test]
+    fn tenant_fields_must_be_provided_together_and_token_must_be_hex() {
+        let (yaml, _dir) = yaml_with_tenant(None);
+        let cfg = from_file(parse_yaml(&yaml)).unwrap();
+        assert!(cfg.tenant_id.is_none());
+
+        let token = "a".repeat(64);
+        let (yaml, _dir) = yaml_with_tenant(Some(("t1", &token)));
+        let cfg = from_file(parse_yaml(&yaml)).unwrap();
+        assert_eq!(cfg.tenant_id.as_deref(), Some("t1"));
+        assert_eq!(cfg.tenant_agent_token.as_deref(), Some(token.as_str()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = test_support::pki::write_cert_files(dir.path());
+        let only_tenant = format!(
+            "cloud_addr: \"127.0.0.1:4433\"\nca: {}\ncert: {}\nkey: {}\ntenant_id: t1\n",
+            ca.to_str().unwrap(),
+            cert.to_str().unwrap(),
+            key.to_str().unwrap(),
+        );
+        assert!(from_file(parse_yaml(&only_tenant)).is_err());
+
+        let (bad_token, _dir) = yaml_with_tenant(Some(("t1", "short")));
+        assert!(from_file(parse_yaml(&bad_token)).is_err());
+    }
+
+    #[test]
+    fn config_debug_redacts_agent_token() {
+        let token = "b".repeat(64);
+        let (yaml, _dir) = yaml_with_tenant(Some(("t1", &token)));
+        let cfg = parse_yaml(&yaml);
+        let rendered = format!("{cfg:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(&token));
     }
 }

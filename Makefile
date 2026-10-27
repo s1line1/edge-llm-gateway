@@ -22,7 +22,7 @@ LIMIT ?= 20
 # e2e 测试条数（接线守卫）：`.config/nextest.toml` 用 filter='binary(e2e)' 把 e2e 限成
 # 一次一条。改测试文件名/二进制名/拆分 `tests/e2e` 都会让这个 filter 匹配不到，串行化
 # **静默**失效（进程级 `#[serial]` 在 nextest 下本来就失效）。改条数时同步改这里。
-E2E_TEST_COUNT ?= 73
+E2E_TEST_COUNT ?= 76
 
 .PHONY: help setup certs certs-required web-install web-build web-dev build build-debug fmt clippy check test bench bench-k6 \
         bench-admission bench-admission-local release release-strict check-rust check-records check-e2e-wiring \
@@ -87,8 +87,20 @@ deny: ##（advisories/bans/licenses/sources 全跑，与 pre-commit hook / CI �
 check-records: ## 记录↔代码漂移（指针越界 / 提交号不实；扫的是工作树里的 docs/，那两份记录不在仓库里）
 	python3 scripts/check-records.py
 
-check-e2e-wiring: ## e2e 接线守卫（必须仍是单个 `e2e` 二进制、70 条测试）
-	@count=$$(cargo nextest list -E 'binary(e2e)' 2>/dev/null | grep -c '^    [a-z_]*::' || true); \
+check-e2e-wiring: ## e2e 接线守卫（必须仍是单个 `e2e` 二进制、当前条数）
+	@err=$$(mktemp); \
+	output=$$(cargo nextest list -E 'binary(e2e)' --message-format json 2>"$$err"); status=$$?; \
+	if [ "$$status" -ne 0 ]; then \
+		cat "$$err"; rm -f "$$err"; \
+		echo "e2e wiring: nextest list failed (build/test discovery error), not a test-count mismatch"; \
+		exit 1; \
+	fi; \
+	count=$$(printf '%s' "$$output" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(len(s.get("testcases", [])) for s in d["rust-suites"].values() if s.get("binary-name") == "e2e"))') || { \
+		cat "$$err"; rm -f "$$err"; \
+		echo "e2e wiring: cannot parse nextest JSON output"; \
+		exit 1; \
+	}; \
+	rm -f "$$err"; \
 	if [ "$$count" -ne $(E2E_TEST_COUNT) ]; then \
 		echo "e2e wiring changed: expected $(E2E_TEST_COUNT) tests in binary(e2e), found $$count"; \
 		echo "if intentional, update E2E_TEST_COUNT and .config/nextest.toml together"; \

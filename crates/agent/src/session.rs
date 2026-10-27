@@ -190,16 +190,24 @@ pub(crate) async fn register(
 
     let (recv, mut send) = stream.split();
 
-    write_frame(
-        &mut send,
-        &Frame::Register {
+    let register = match (&cfg.tenant_id, &cfg.tenant_agent_token) {
+        (Some(tenant_id), Some(agent_token)) => Frame::RegisterWithTenant {
+            agent_id: cfg.agent_id.clone(),
+            tenant_id: tenant_id.clone(),
+            agent_token: agent_token.clone(),
+            models: cfg.models.clone(),
+            max_concurrency: cfg.max_concurrency,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        (None, None) => Frame::Register {
             agent_id: cfg.agent_id.clone(),
             models: cfg.models.clone(),
             max_concurrency: cfg.max_concurrency,
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
-    )
-    .await?;
+        _ => anyhow::bail!("tenant_id and tenant_agent_token must be provided together"),
+    };
+    write_frame(&mut send, &register).await?;
     send.finish()?;
     // // 网关不发 ack；读到 EOF 即可
     let mut reader = FrameReader::new(recv);

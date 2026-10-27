@@ -17,6 +17,12 @@ key: /etc/home-llm-gateway/client.key
 # agent 标识（多台机器区分用）
 agent_id: "home-1"
 
+# 多租户：tenant_id 与 tenant_agent_token 必须同时提供或同时省略。
+# token 由 `POST /admin/tenants` 或 `/admin/tenants/{id}/agent-token` 生成，只显示一次；
+# **不得**提交到仓库或写进日志。省略两项 = legacy Register（仅迁移窗口允许）。
+# tenant_id: "0123456789abcdef0123456789abcdef"
+# tenant_agent_token: "<64 lowercase hex chars>"
+
 # 本地 LLM 的 OpenAI 兼容地址。必须是**不带路径的 http(s) origin**（启动时校验）：
 # 请求路径会被直接拼在后面，所以这里写了路径就会前置到每个请求上；尾斜杠会被规范化掉
 # （`…:8000/` 等价于 `…:8000`），而缺 scheme（`127.0.0.1:8000`）在启动时报错，

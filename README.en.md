@@ -13,7 +13,7 @@ port), and you want to call it from anywhere with a standard OpenAI SDK — **wi
 local inference endpoint to the public Internet.**
 
 <p align="center">
-  <img alt="tests" src="https://img.shields.io/badge/tests-401%20passed-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-418%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -109,6 +109,18 @@ the local LLM, and stream the response back. Point `upstream` at your local serv
 - Least-in-flight within the group; agents with stale heartbeats stop being candidates
 - No agent available → 503; nobody serves that model → 404; capacity full → 429 (the three causes are
   counted separately in metrics)
+
+**Multi-tenancy**
+- A tenant owns API keys and edge agents; a key can route only to agents of the same tenant, and
+  `/v1/models` is tenant-scoped. Identically named models in different tenants are isolated.
+- Existing keys/agents migrate to the built-in `default` tenant (cannot be deleted/disabled);
+  legacy `Register` is accepted only while `allow_legacy_agent_registration: true`.
+- Each tenant can set `requests_per_minute` and `max_concurrent_requests`; the concurrency ticket
+  is held through the response body, alongside the per-key rate limit.
+- Agent registration uses a one-time `agent_token` (sha256 stored only; `/admin/tenants`); one QUIC
+  connection belongs to exactly one tenant.
+- Admin: `/admin/tenants` CRUD and agent-token rotation; `/admin/keys`, `/admin/usage`, and
+  `/admin/agents` accept tenant filters. Tenant IDs are logged, not used as metric labels.
 
 **Security**
 - API keys: `sha256(token)` fast index lookup + **argon2id** verification, **plaintext never stored**
@@ -344,8 +356,8 @@ fmt · clippy -D warnings · nextest · e2e wiring · toolchain-check · check-r
 
 `make check` adds `cargo deny` and the four web targets on top (web-format / web-lint / web-test / web-build).
 
-> **Current scale (`cargo nextest run --workspace`, measured)**: **401 tests executed and passed (0 skipped)**, of which
-> **73 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
+> **Current scale (`cargo nextest run --workspace`, measured)**: **418 tests executed and passed (0 skipped)**, of which
+> **76 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
 > per commit; trust the actual run output.
 >
 > Two behaviours differ from `cargo test` and are worth knowing: **nextest runs one process per test**,

@@ -170,6 +170,7 @@ fn duplicate_id_insert_is_rejected_not_replaced() {
         created_at: 1,
         enabled: true,
         cred_version: 1,
+        tenant_id: "default".into(),
     };
     let mut second = first.clone();
     second.lookup = "lookup-second".into();

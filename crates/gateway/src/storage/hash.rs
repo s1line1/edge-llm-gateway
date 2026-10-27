@@ -99,7 +99,7 @@ pub fn verify_argon2(token: &str, encoded: &str) -> bool {
 /// SL-P3-14：原来是 `.map(|b| format!("{b:02x}")).collect()` —— sha256 的 32 个字节各分配一个
 /// `String` 再拼起来，而 `lookup_of` 在**每个**认证请求上都要跑（含无效 token，即凭据喷洒时
 /// 也一样）。这里用 nibble 表往一个预分配好的字符串里直接写。
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {

@@ -349,6 +349,8 @@ fn test_agent_config(
         upstream_base: "http://127.0.0.1:1".into(),
         heartbeat_interval: Duration::from_millis(50),
         request_log: true,
+        tenant_id: None,
+        tenant_agent_token: None,
     }
 }
 

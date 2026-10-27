@@ -13,6 +13,20 @@
 > 测试补齐、以及不改变对外行为的重构。判断标准：这一条的目的是"**让已有行为更正确/更可观测**"
 > （做）还是"**让网关多一个本事**"（不做）。新功能条目只做登记，不排期、不开工。
 
+## 2026-10-27 多租户（已实施）
+
+人工指示新增：tenant 拥有 API key 与 edge agent；key 只能路由到同 tenant 的 agent，
+`/v1/models` 按 tenant 过滤；tenant 级 rate/concurrency 与 usage 记账。
+- 默认 `default` tenant 承接旧 key/旧 agent；旧 agent 的 `Register` 只在
+  `allow_legacy_agent_registration: true` 的迁移窗口内接受。
+- 新 agent 使用 `RegisterWithTenant` + 一次性 `agent_token`；token 只存 sha256，一条 QUIC 连接
+  只属于一个 tenant；同 `agent_id`/来源 IP 在不同 tenant 下是两条独立条目。
+- Admin：`/admin/tenants` CRUD + agent-token rotate；keys/agents/usage 支持 `tenant_id` 过滤。
+- 明确未做（见计划 CON-004）：tenant 管理 Web 页面、tenant 级模型白名单、tenant 独立
+  admin 身份、每 tenant 独立库/进程。
+- 回归：storage tenant/migration、auth tenant rate/disabled、agent token、tenant routing/model
+  隔离、tenant concurrency、admin flow；完整 `make check-rust` 通过。
+
 ## P0 — 工具接入（DSH / Codex / Claude Code 直连）
 
 背景：cloud-gateway 需作为 DeepSeek Harness、Codex CLI、Claude Code 等工具的 LLM 后端。
@@ -502,7 +516,7 @@
 |---|---|---|
 | 发号 | `storage/hash.rs:119` | key 恒为 `sk-` + 24 随机字节（**192 位熵**）；`/admin/keys` 只收 `name`，**不存在"运维自己填 key"的入口**（`admin.rs:98`） |
 | 存储 | `storage/mod.rs:155` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
-| 校验 | `storage/mod.rs:266` → `hash.rs:87` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
+| 校验 | `storage/mod.rs:530` → `hash.rs:87` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
 | 缓存 | `storage/verified.rs:55` | `(lookup, cred_version)` 命中即跳过校验；有 TTL 与上限（`verified_cache_max: 1650`） |
 | 单飞 | `storage/verified.rs:73` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
 

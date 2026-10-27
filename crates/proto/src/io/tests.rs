@@ -518,7 +518,7 @@ async fn a_timed_out_write_leaves_only_a_strict_prefix_of_the_frame() {
     );
 }
 
-/// Phase 0 表征测试：**8 个 `Frame` 变体的线格式逐字节固定**。
+/// Phase 0 表征测试：**9 个 `Frame` 变体的线格式逐字节固定**。
 ///
 /// 为什么需要它：线格式是 `[u32 BE 长度][postcard]`，而 postcard 的**枚举变体序号就是
 /// 编码本身**（`frame.rs` 的声明顺序 = tag）。以前只有 `frame_reader_roundtrip_all_frame_types`
@@ -539,6 +539,7 @@ async fn all_frame_variants_have_stable_wire_bytes() {
         ("ProxyResponseEnd", "00000003050101"),
         ("Cancel", "000000020601"),
         ("Error", "000000060700f4030165"),
+        ("RegisterWithTenant", "0000000d0801610174017801016d010176"),
     ];
 
     for (frame, (kind, hex)) in golden_frames().iter().zip(expected) {
@@ -599,6 +600,14 @@ fn golden_frames() -> Vec<Frame> {
             request_id: None,
             code: 500,
             message: "e".into(),
+        },
+        Frame::RegisterWithTenant {
+            agent_id: "a".into(),
+            tenant_id: "t".into(),
+            agent_token: "x".into(),
+            models: vec!["m".into()],
+            max_concurrency: 1,
+            version: "v".into(),
         },
     ]
 }

@@ -6,6 +6,8 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
 use super::entry::{is_fresh, Entry};
+#[cfg(test)]
+use crate::storage::DEFAULT_TENANT_ID;
 
 /// 一次隧道失败的**处置**：注册表判定，调用方只负责渲染。
 ///
@@ -35,6 +37,7 @@ pub enum Disposition {
 /// 为什么抽成纯函数：规则以前与"占位 + 返回槽位"的副作用揉在 `try_acquire_excluding` 里，
 /// 只能靠注册表端到端测；现在规则本身可以直接用一组条目断言（见单测
 /// `pick_orders_exact_over_wildcard_then_lightest`）。
+#[cfg(test)]
 pub(super) fn pick<'a>(
     entries: impl Iterator<Item = &'a Entry>,
     now: u64,
@@ -42,8 +45,23 @@ pub(super) fn pick<'a>(
     model: &str,
     exclude: &[usize],
 ) -> Result<Vec<&'a Entry>, AcquireError> {
+    pick_for_tenant(entries, now, stale_after, DEFAULT_TENANT_ID, model, exclude)
+}
+
+/// 同 [`pick`]，但只允许指定 tenant 的条目。路由隔离的唯一入口。
+pub(super) fn pick_for_tenant<'a>(
+    entries: impl Iterator<Item = &'a Entry>,
+    now: u64,
+    stale_after: Duration,
+    tenant_id: &str,
+    model: &str,
+    exclude: &[usize],
+) -> Result<Vec<&'a Entry>, AcquireError> {
     let mut candidates: Vec<&Entry> = entries
-        .filter(|e| is_fresh(e.last_seen_millis.load(Ordering::Relaxed), now, stale_after))
+        .filter(|e| {
+            e.tenant_id == tenant_id
+                && is_fresh(e.last_seen_millis.load(Ordering::Relaxed), now, stale_after)
+        })
         .collect();
     if candidates.is_empty() {
         return Err(AcquireError::NoAgent);

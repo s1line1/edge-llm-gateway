@@ -36,6 +36,7 @@ pub struct Entry {
     /// 而隧道写超时后需要按 stable_id 把这条坏连接摘掉（内部走 `Registry::evict`），
     /// 所以 id 必须随条目一起带出来。
     pub(super) agent_id: String,
+    pub(super) tenant_id: String,
     pub(super) models: Vec<String>,
     pub(super) max_concurrency: u32,
     /// 当前在途请求数（admission control）。
@@ -157,6 +158,11 @@ impl Entry {
     /// 注册时声明的 agent_id。
     pub fn agent_id(&self) -> &str {
         &self.agent_id
+    }
+
+    /// 所属 tenant。
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
     }
 
     /// agent 声明的并发上限（`0` = 不限）。只用于日志/展示。
