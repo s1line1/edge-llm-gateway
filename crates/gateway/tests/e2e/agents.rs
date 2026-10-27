@@ -744,3 +744,93 @@ async fn e2e_more_concurrent_tunnels_than_the_default_quic_stream_ceiling() {
     agent.shutdown().await;
     gw.shutdown().await;
 }
+
+/// 规格（B1）：唯一 agent 的开流额度被两条长 SSE 占满时，第三个请求必须收到 429
+/// `agent at capacity`（`AllExcluded`），而不是 404/502；两条长流仍要正常跑完。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_single_agent_open_timeout_busy_returns_429() {
+    async fn send_sse(
+        client: &reqwest::Client,
+        base: &str,
+        key: &str,
+        content: &str,
+    ) -> reqwest::Response {
+        client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({
+                "model": "mock-llm",
+                "stream": true,
+                "messages": [{"role": "user", "content": content}]
+            }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, base, key) = start_stack(0, |o| {
+        o.admin_token = Some("admin-token".into());
+        o.max_open_tunnel_streams = 2;
+        o.tunnel_op_timeout = Duration::from_secs(1);
+        o.request_timeout = Duration::from_secs(20);
+        o.head_timeout = Duration::from_secs(5);
+    })
+    .await;
+    let client = test_client();
+    let content = "x".repeat(600);
+
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let client = client.clone();
+        let base = base.clone();
+        let key = key.clone();
+        let content = content.clone();
+        held.push(tokio::spawn(async move {
+            let resp = send_sse(&client, &base, &key, &content).await;
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap();
+            (status, body)
+        }));
+    }
+    wait_for_any_agent_inflight(&base, 2).await;
+
+    let resp = send_sse(&client, &base, &key, &content).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the third tunnel must time out as busy and map to 429"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("capacity"),
+        "429 message must identify capacity, got {body}"
+    );
+
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains("hlmg_agent_rejections_total{reason=\"all-candidates-at-capacity\"} 1"),
+        "the rejection must be recorded as all-candidates-at-capacity:\n{text}"
+    );
+
+    for task in held {
+        let (status, body) = task.await.unwrap();
+        assert_eq!(status, 200, "held SSE streams must not be disturbed");
+        assert!(
+            body.contains("[DONE]"),
+            "held stream must complete normally"
+        );
+    }
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+}
