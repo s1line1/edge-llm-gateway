@@ -137,6 +137,37 @@ pub const DEFAULT_VERIFIED_MAX: usize = 1650;
 /// 它只决定"多久之后重新付一次 argon2 的钱"。
 const DEFAULT_VERIFIED_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// 写入一条 key 记录；**普通 INSERT**，冲突（id/lookup 重复）交给调用方重试。
+///
+/// 不能用 `INSERT OR REPLACE`：id 或 lookup 冲突时它会静默删掉另一行（S2-4）。
+/// 只把 id/lookup 的 UNIQUE 冲突当作可重试；触发器 ABORT 等其它约束必须原样上报
+/// （admin 需要把 `debug: forced insert failure` 这类诊断信息写进日志）。
+fn is_unique_key_collision(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(e, Some(message)) => {
+            e.code == rusqlite::ErrorCode::ConstraintViolation
+                && (message.contains("api_keys.id") || message.contains("api_keys.lookup"))
+        }
+        _ => false,
+    }
+}
+
+fn insert_api_key(conn: &Connection, record: &KeyRecord) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO api_keys (id, lookup, key_hash, name, created_at, enabled)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            record.id,
+            record.lookup,
+            record.key_hash,
+            record.name,
+            record.created_at as i64,
+            1i64
+        ],
+    )
+    .map(|_| ())
+}
+
 impl Storage {
     /// 启动期持久化自检的结果：`None` = 没配 `keys_file`；`Some(Ok(()))` = 就绪；
     /// `Some(Err(why))` = 已降级为内存模式（磁盘/权限/损坏/迁移失败…）。
@@ -144,6 +175,9 @@ impl Storage {
     /// 为什么单独暴露：构造器**刻意保持不可失败**（库与测试里"内存模式"是合法用法），
     /// 而**生产启动必须 fail-fast**——一个载不出任何 key 的网关是个空壳（每个请求 401），
     /// 却会一直报健康。判据由 [`crate::Gateway::start`] 执行。
+    ///
+    /// 注意：usage 表的载入失败**不**进入这个结果。它由 `UsageStore` 自己禁用落库
+    /// （S2-5），不会因为用量账本读不出来而让一个仍能授权/转发的网关拒绝启动。
     pub fn persistence_state(&self) -> Option<Result<(), String>> {
         self.inner.persistence.clone()
     }
@@ -251,37 +285,40 @@ impl Storage {
     ///
     /// 纯内存模式（`db = None`，库打不开时的降级）没有可落库的对象，直接成功。
     pub fn create(&self, name: String) -> Result<CreatedKey, GatewayError> {
-        let (id, plaintext) = generate_id_key();
-        let lookup = lookup_of(&plaintext);
-        let key_hash = hash_argon2(&plaintext);
-        let record = KeyRecord {
-            id,
-            key_hash,
-            lookup,
-            name,
-            created_at: now_secs(),
-            enabled: true,
-            cred_version: self.bump_cred_generation(),
-        };
-        // ① 先落库。失败 → 直接把错误交给调用方（admin 映射 500），内存一个字都不改。
-        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
-            conn.execute(
-                "INSERT OR REPLACE INTO api_keys (id, lookup, key_hash, name, created_at, enabled)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    record.id,
-                    record.lookup,
-                    record.key_hash,
-                    record.name,
-                    record.created_at as i64,
-                    1i64
-                ],
-            )?;
+        for _ in 0..3 {
+            let (id, plaintext) = generate_id_key();
+            let lookup = lookup_of(&plaintext);
+            let key_hash = hash_argon2(&plaintext);
+            let mut record = KeyRecord {
+                id,
+                key_hash,
+                lookup,
+                name: name.clone(),
+                created_at: now_secs(),
+                enabled: true,
+                // 成功落库后才 bump；重试不能浪费凭据代数。
+                cred_version: 0,
+            };
+            // ① 先落库。失败 → 直接把错误交给调用方（admin 映射 500），内存一个字都不改。
+            if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+                match insert_api_key(conn, &record) {
+                    Ok(()) => {}
+                    Err(e) if is_unique_key_collision(&e) => {
+                        // id 或 lookup 撞了：换一组随机值重试，绝不能 REPLACE 掉已有行。
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            record.cred_version = self.bump_cred_generation();
+            // ② 再进内存：此后授权立即可用。
+            write_or_recover(&self.inner.runtime).insert(record.lookup.clone(), record.clone());
+            tracing::info!(id = %record.id, name = %record.name, "api key created");
+            return Ok(CreatedKey { record, plaintext });
         }
-        // ② 再进内存：此后授权立即可用。
-        write_or_recover(&self.inner.runtime).insert(record.lookup.clone(), record.clone());
-        tracing::info!(id = %record.id, name = %record.name, "api key created");
-        Ok(CreatedKey { record, plaintext })
+        Err(GatewayError::Other(
+            "could not allocate a unique key id".into(),
+        ))
     }
 
     /// 列出动态 key（不含明文；由调用方决定展示形式）。

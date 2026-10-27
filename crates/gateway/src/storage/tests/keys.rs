@@ -155,3 +155,71 @@ fn verify_rejects_malformed_hash() {
     assert!(!verify_argon2("sk-anything", "not-a-phc-hash"));
     assert!(!verify_argon2("sk-anything", ""));
 }
+
+/// 规格（S2-4）：id 冲突必须报错并保留第一行，不能 `INSERT OR REPLACE` 静默替换。
+#[test]
+fn duplicate_id_insert_is_rejected_not_replaced() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("keys.db");
+    let store = Storage::new(Some(path));
+    let first = KeyRecord {
+        id: "0123456789abcdef0123456789abcdef".into(),
+        lookup: "lookup-first".into(),
+        key_hash: "hash-first".into(),
+        name: "first".into(),
+        created_at: 1,
+        enabled: true,
+        cred_version: 1,
+    };
+    let mut second = first.clone();
+    second.lookup = "lookup-second".into();
+    second.key_hash = "hash-second".into();
+    second.name = "second".into();
+
+    let mut guard = store.inner.db.lock().unwrap();
+    let conn = guard.as_mut().unwrap();
+    insert_api_key(conn, &first).unwrap();
+    let err = insert_api_key(conn, &second).expect_err("duplicate id must fail");
+    assert!(
+        matches!(
+            err,
+            rusqlite::Error::SqliteFailure(ref e, _)
+                if e.code == rusqlite::ErrorCode::ConstraintViolation
+        ),
+        "expected a constraint violation, got {err:?}"
+    );
+    let name: String = conn
+        .query_row(
+            "SELECT name FROM api_keys WHERE id = ?1",
+            [&first.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(name, "first", "the original row must not be replaced");
+}
+
+/// 规格（CON-002）：历史库里的 8 字符 id 仍能通过 `Storage::new` 载入。
+#[test]
+fn eight_character_legacy_id_still_loads() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("keys.db");
+    let store = Storage::new(Some(path.clone()));
+    {
+        let mut guard = store.inner.db.lock().unwrap();
+        let conn = guard.as_mut().unwrap();
+        conn.execute(
+            "INSERT INTO api_keys (id, lookup, key_hash, name, created_at, enabled)
+             VALUES ('deadbeef', 'legacy-lookup', 'legacy-hash', 'legacy', 1, 1)",
+            [],
+        )
+        .unwrap();
+    }
+    drop(store);
+
+    let reloaded = Storage::new(Some(path));
+    assert!(
+        reloaded.list().iter().any(|r| r.id == "deadbeef"),
+        "8-character legacy id must still load"
+    );
+    assert!(reloaded.usage_of("deadbeef").is_none());
+}

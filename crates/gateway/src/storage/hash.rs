@@ -117,11 +117,11 @@ pub fn lookup_of(token: &str) -> String {
 }
 
 pub fn generate_id_key() -> (String, String) {
-    let mut id_buf = [0u8; 4];
+    let mut id_buf = [0u8; 16];
     let mut key_buf = [0u8; 24];
     getrandom::fill(&mut id_buf).expect("os rng");
     getrandom::fill(&mut key_buf).expect("os rng");
-    let id = format!("{:08x}", u32::from_be_bytes(id_buf));
+    let id = hex_lower(&id_buf);
     // 同一个编码器（SL-P3-14）：这里以前也是"每字节一个 `String`"（24 次）。
     let key = format!("sk-{}", hex_lower(&key_buf));
     (id, key)
@@ -221,7 +221,12 @@ mod tests {
     #[test]
     fn generate_id_key_format() {
         let (id, key) = generate_id_key();
-        assert_eq!(id.len(), 8);
+        assert_eq!(id.len(), 32);
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "id must be lowercase hex: {id}"
+        );
         assert!(key.starts_with("sk-"));
         assert_eq!(key.len(), 3 + 48, "24 random bytes as hex");
         // 两次生成不同
