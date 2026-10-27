@@ -62,7 +62,7 @@ Bearer 认证 + 限流）；`["*"]` 不贡献条目。✅
 
 | # | 文件 | 改动 |
 |---|---|---|
-| 1 | `crates/gateway/src/registry.rs` | `try_acquire(stale_after, model)`；模型过滤候选；精确优先排序；`AcquireError::NoModel`；`healthy_models()` 聚合辅助 |
+| 1 | `crates/gateway/src/registry/table.rs` | `try_acquire(stale_after, model)`；模型过滤候选；精确优先排序；`AcquireError::NoModel`；`healthy_models()` 聚合辅助 |
 | 2 | `crates/gateway/src/proxy/mod.rs` | `extract_model`；proxy 用 model 调 try_acquire；NoModel→404（认证限流已移到 `crates/gateway/src/auth.rs` 的 `authenticate`） |
 | 3 | `crates/gateway/src/http/mod.rs` | `/v1/models` 静态路由（优先于 `/v1/{*rest}`）；`models_route` 聚合 + 认证限流 |
 | 4 | `crates/agent/src/config.rs` + `agent-config.example.yml` | `models` 字段语义注释更新（edge 能力声明、`*` 兜底） |

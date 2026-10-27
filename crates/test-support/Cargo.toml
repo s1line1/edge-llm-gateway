@@ -1,0 +1,18 @@
+[package]
+name = "test-support"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# 只给本仓库的测试用，永不发布；它不是运行时依赖。
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+s2n-quic = { workspace = true }
+
+[lints]
+workspace = true

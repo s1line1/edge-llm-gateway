@@ -72,11 +72,24 @@ pub fn app(state: AppState) -> Router {
         let admin = Router::new()
             .route(
                 "/keys",
-                get(crate::admin::list_keys).post(crate::admin::create_key),
+                get(crate::admin::list_keys_filtered).post(crate::admin::create_key),
             )
             .route("/keys/{id}", delete(crate::admin::delete_key))
+            .route(
+                "/tenants",
+                get(crate::admin::list_tenants).post(crate::admin::create_tenant),
+            )
+            .route(
+                "/tenants/{id}",
+                axum::routing::patch(crate::admin::update_tenant)
+                    .delete(crate::admin::delete_tenant),
+            )
+            .route(
+                "/tenants/{id}/agent-token",
+                axum::routing::post(crate::admin::rotate_agent_token),
+            )
             .route("/agents", get(crate::admin::list_agents))
-            .route("/usage", get(crate::admin::usage_route))
+            .route("/usage", get(crate::admin::usage_filtered))
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 crate::admin::admin_auth,

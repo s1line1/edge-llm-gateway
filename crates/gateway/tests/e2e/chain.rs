@@ -601,8 +601,6 @@ async fn e2e_client_disconnect_while_upstream_is_silent_releases_the_slot() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn e2e_tunnel_request_id_is_unique_across_x_request_id_shapes() {
-    use std::sync::Arc;
-
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let TestGateway {
         gw,
@@ -613,24 +611,16 @@ async fn e2e_tunnel_request_id_is_unique_across_x_request_id_shapes() {
     } = start_gateway(|_| {}).await;
 
     // 裸 s2n-quic 客户端：注册成唯一 agent，随后每收到一条代理流就把它的 request_id 报回来
-    let client = s2n_quic::Client::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
-            agent::tls::rustls_client_tls(
-                &certs.ca,
-                certs.client_cert.clone(),
-                certs.client_key.clone_key(),
-            )
-            .unwrap(),
-        )))
-        .unwrap()
-        .with_io("0.0.0.0:0")
-        .unwrap()
-        .start()
-        .unwrap();
-    let mut conn = client
-        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
-        .await
-        .unwrap();
+    let client_config = agent::tls::rustls_client_tls(
+        &certs.ca,
+        certs.client_cert.clone(),
+        certs.client_key.clone_key(),
+    )
+    .unwrap();
+    let mut conn =
+        test_support::tunnel::connect(gw.quic_addr, "localhost", client_config, "0.0.0.0:0")
+            .await
+            .unwrap();
     let stream = conn.open_bidirectional_stream().await.unwrap();
     let (mut rr, mut rs) = stream.split();
     write_frame(
@@ -859,7 +849,6 @@ async fn e2e_large_upstream_chunks_survive_the_byte_bound() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn e2e_an_oversized_response_chunk_is_refused() {
-    use std::sync::Arc;
     use tokio::io::AsyncWriteExt as _;
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
@@ -872,24 +861,16 @@ async fn e2e_an_oversized_response_chunk_is_refused() {
     } = start_gateway(|_| {}).await;
 
     // 裸 QUIC agent：注册（声明一个模型），然后对每个代理流回"超标的响应块"
-    let client = s2n_quic::Client::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
-            agent::tls::rustls_client_tls(
-                &certs.ca,
-                certs.client_cert.clone(),
-                certs.client_key.clone_key(),
-            )
-            .unwrap(),
-        )))
-        .unwrap()
-        .with_io("0.0.0.0:0")
-        .unwrap()
-        .start()
-        .unwrap();
-    let mut conn = client
-        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
-        .await
-        .unwrap();
+    let client_config = agent::tls::rustls_client_tls(
+        &certs.ca,
+        certs.client_cert.clone(),
+        certs.client_key.clone_key(),
+    )
+    .unwrap();
+    let mut conn =
+        test_support::tunnel::connect(gw.quic_addr, "localhost", client_config, "0.0.0.0:0")
+            .await
+            .unwrap();
     let stream = conn.open_bidirectional_stream().await.unwrap();
     let (mut reg_recv, mut reg_send) = stream.split();
     write_frame(
@@ -912,7 +893,7 @@ async fn e2e_an_oversized_response_chunk_is_refused() {
     wait_for_agents(&gw, 1, Duration::from_secs(5)).await;
 
     tokio::spawn(async move {
-        let _keep_alive = (client, reg_recv);
+        let _keep_alive = reg_recv;
         while let Ok(Some(stream)) = conn.accept_bidirectional_stream().await {
             let (mut recv, mut send) = stream.split();
             let _ = FrameReader::new(&mut recv).next().await; // 丢弃 ProxyRequest
@@ -1008,6 +989,71 @@ async fn e2e_an_oversized_response_chunk_is_refused() {
         body.len() < proto::frame::MAX_RESPONSE_CHUNK,
         "客户端的 body 必须远小于上限（收到 {} 字节）",
         body.len()
+    );
+
+    gw.shutdown().await;
+}
+
+/// 规格（S2-1）：上游 body 流中途出错时，agent 发 `ProxyResponseEnd { ok: false }`；
+/// 网关必须让 SSE 客户端看到 `event: error`，且**绝不能**发 `[DONE]`。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_truncated_sse_is_not_reported_as_complete() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let TestGateway {
+        gw,
+        certs,
+        key,
+        base,
+        ..
+    } = start_gateway(|_| {}).await;
+    spawn_truncating_agent(&gw, &certs, "truncating").await;
+
+    let client = test_client();
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({
+            "model": "mock-llm",
+            "stream": true,
+            "messages": [{"role": "user", "content": "truncate"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "head must already be committed");
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("event: error"), "missing error event: {body}");
+    assert!(
+        body.contains("incomplete"),
+        "missing incomplete reason: {body}"
+    );
+    assert!(
+        !body.contains("[DONE]"),
+        "must not claim normal completion: {body}"
+    );
+
+    // 记录 SEC-002：截断必须有独立标签，且不能记成 upstream_end。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let text = loop {
+        let text = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if text.contains("hlmg_forward_ends_total{kind=\"upstream_truncated\"}")
+            || tokio::time::Instant::now() >= deadline
+        {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        text.contains("hlmg_forward_ends_total{kind=\"upstream_truncated\"}"),
+        "missing upstream_truncated label:\n{text}"
     );
 
     gw.shutdown().await;

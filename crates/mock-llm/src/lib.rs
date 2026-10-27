@@ -40,6 +40,7 @@ async fn flood(
     State(st): State<AppState>,
     Query(p): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    st.requests.fetch_add(1, Ordering::Relaxed);
     let num = |k: &str, d: u64| p.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
     let chunks = num("chunks", 100_000) as usize;
     let kb = (num("kb", 64) as usize).clamp(1, 1024);
@@ -101,6 +102,8 @@ struct AppState {
     name: Arc<str>,
     /// 被中途丢弃的响应体数（= 上游观察到的取消次数），见 [`CancelGuard`]。
     cancelled: Arc<AtomicU64>,
+    /// 收到的 POST 请求数（e2e 用来证明 504 之后没有偷偷重试）。
+    requests: Arc<AtomicU64>,
 }
 
 pub fn router(name: &str) -> Router {
@@ -123,6 +126,7 @@ pub fn router(name: &str) -> Router {
         .with_state(AppState {
             name: Arc::from(name),
             cancelled: Arc::new(AtomicU64::new(0)),
+            requests: Arc::new(AtomicU64::new(0)),
         })
 }
 
@@ -131,6 +135,7 @@ async fn stats(State(st): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "name": st.name.as_ref(),
         "cancelled": st.cancelled.load(Ordering::Relaxed),
+        "requests": st.requests.load(Ordering::Relaxed),
     }))
 }
 
@@ -142,6 +147,7 @@ async fn models(State(st): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn chat(State(st): State<AppState>, Json(req): Json<serde_json::Value>) -> Response {
+    st.requests.fetch_add(1, Ordering::Relaxed);
     let model = req
         .get("model")
         .and_then(|v| v.as_str())
@@ -221,6 +227,7 @@ async fn embeddings(
     State(st): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    st.requests.fetch_add(1, Ordering::Relaxed);
     let model = req
         .get("model")
         .and_then(|v| v.as_str())
@@ -241,6 +248,7 @@ async fn slow(
     State(st): State<AppState>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
+    st.requests.fetch_add(1, Ordering::Relaxed);
     let ms = q.get("ms").and_then(|v| v.parse().ok()).unwrap_or(800);
     tokio::time::sleep(Duration::from_millis(ms)).await;
     Json(serde_json::json!({ "ok": true, "slow": true, "server": st.name.as_ref() }))
@@ -254,6 +262,7 @@ pub const SLOW_BODY_STALL: Duration = Duration::from_secs(3);
 /// 慢**正文**端点：响应头立刻返回（SSE），正文在 [`SLOW_BODY_STALL`] 后才出第一块。
 /// 用于测「响应体逐帧空闲超时」——与 /v1/slow（卡响应头）语义不同。
 async fn slow_body(State(st): State<AppState>) -> Response {
+    st.requests.fetch_add(1, Ordering::Relaxed);
     let name = st.name.clone();
     let s = stream! {
         tokio::time::sleep(SLOW_BODY_STALL).await;

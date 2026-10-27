@@ -16,10 +16,20 @@ use rustls::{
 use crate::error::GatewayError;
 
 /// HTTPS 证书 PEM 内容。
-#[derive(Debug)]
 pub struct TlsPem {
     pub cert: Vec<u8>,
     pub key: Vec<u8>,
+}
+
+impl std::fmt::Debug for TlsPem {
+    /// **不打印私钥字节**：`Options`/`GatewayConfig` 都 derive `Debug`，而 `TlsPem` 的 `key`
+    /// 是 `Vec<u8>`——派生 Debug 会把整段私钥写进日志/panic 报文。只报长度与一个哨兵。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsPem")
+            .field("cert_len", &self.cert.len())
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl TlsPem {
@@ -55,12 +65,22 @@ impl TlsPem {
 ///
 /// 字段**私有** + 只有一个校验构造器 [`TunnelTls::from_der`]：光靠"没有 `Default`"挡不住
 /// 空的 CA（那正是上面那个反面例子），所以这个不变量由构造点兜住。
-#[derive(Debug)]
 pub struct TunnelTls {
     /// 签发 agent 客户端证书的 CA 证书。
     ca_cert: Vec<CertificateDer<'static>>,
     server_cert: Vec<CertificateDer<'static>>,
     server_key: PrivateKeyDer<'static>,
+}
+
+impl std::fmt::Debug for TunnelTls {
+    /// 与 [`TlsPem`] 同理：只报材料条数/哨兵，不把私钥交给 `{:?}`。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunnelTls")
+            .field("ca_certs", &self.ca_cert.len())
+            .field("server_certs", &self.server_cert.len())
+            .field("server_key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl TunnelTls {
@@ -259,5 +279,36 @@ mod tests {
         let config = rustls_server_tls(&ca, cert, key).unwrap();
         // mTLS 服务端配置构造成功（不校验握手细节）
         let _ = config;
+    }
+
+    /// 规格：`{:?}` 不得打印私钥材料。`Options`/`GatewayConfig` 都 derive Debug，
+    /// 一旦有人把配置打进日志，派生 Debug 会把 `TlsPem.key` / `TunnelTls.server_key` 原样带出。
+    #[test]
+    fn debug_never_prints_private_key_material() {
+        let pem = TlsPem {
+            cert: b"CERT".to_vec(),
+            key: b"TOP-SECRET-KEY".to_vec(),
+        };
+        let rendered = format!("{pem:?}");
+        assert!(
+            !rendered.contains("TOP-SECRET-KEY"),
+            "TlsPem 的 Debug 泄漏了私钥：{rendered}"
+        );
+        assert!(rendered.contains("redacted"), "{rendered}");
+
+        let tls = TunnelTls::from_der(
+            vec![CertificateDer::from(vec![1u8])],
+            vec![CertificateDer::from(vec![2u8])],
+            PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(vec![
+                0xde, 0xad, 0xbe, 0xef,
+            ])),
+        )
+        .unwrap();
+        let rendered = format!("{tls:?}");
+        assert!(
+            !rendered.contains("deadbeef") && !rendered.contains("222, 173, 190, 239"),
+            "TunnelTls 的 Debug 泄漏了私钥：{rendered}"
+        );
+        assert!(rendered.contains("redacted"), "{rendered}");
     }
 }

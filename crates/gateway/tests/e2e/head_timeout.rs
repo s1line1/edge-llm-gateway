@@ -251,3 +251,79 @@ async fn e2e_uniformly_slow_traffic_does_not_evict_a_heartbeating_agent() {
     agent.shutdown().await;
     gw.shutdown().await;
 }
+
+/// 规格（504 不重试）：响应头超时后**不得**换另一个 agent 重发请求——请求可能已在模型侧
+/// 执行，重试会重复计费/重复生成。用两个 mock 的 `/stats.requests` 总和钉住"只发出一次"。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_head_timeout_is_not_retried() {
+    async fn requests(addr: SocketAddr) -> u64 {
+        test_client()
+            .get(format!("http://{addr}/stats"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["requests"]
+            .as_u64()
+            .unwrap_or(0)
+    }
+
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let TestGateway {
+        gw,
+        certs,
+        key,
+        base,
+        ..
+    } = start_gateway(|o| {
+        o.head_timeout = Duration::from_millis(100);
+        o.client_stall = Duration::from_secs(5);
+        o.admin_token = Some("admin-token".into());
+    })
+    .await;
+    let mock_a = start_mock_llm("mock-a").await;
+    let mock_b = start_mock_llm("mock-b").await;
+    let a = certs.agent(&gw, "a", &["mock-llm"], mock_a, 4, false);
+    let b = certs.agent(&gw, "b", &["mock-llm"], mock_b, 4, false);
+    wait_for_agents(&gw, 2, Duration::from_secs(10)).await;
+
+    let baseline = requests(mock_a).await + requests(mock_b).await;
+    let client = test_client();
+    let resp = client
+        .post(format!("{base}/v1/slow?ms=1500"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({ "model": "mock-llm" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 504, "slow head must be 504");
+
+    // 让任何（错误的）第二次发送也有时间落到 mock 上，再取稳定值。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let total = requests(mock_a).await + requests(mock_b).await;
+    assert_eq!(
+        total,
+        baseline + 1,
+        "head timeout must not be retried: two upstreams saw {} requests, expected exactly one",
+        total - baseline
+    );
+
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !text.contains("hlmg_tunnel_retries_total{outcome=\"failed\"}"),
+        "a head timeout must not enter the tunnel-retry path:\n{text}"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    gw.shutdown().await;
+}

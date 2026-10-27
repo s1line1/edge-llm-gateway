@@ -1,11 +1,12 @@
-//! 注册表本身：`agent_id → Entry` 的增删查、快照、并发占位，以及绑定在连接上的摘除守卫。
+//! 注册表本身：`(agent_id, peer_ip) → Entry` 的增删查与快照，以及绑定在连接上的摘除守卫。
 //!
-//! 本模块只回答「谁在表里、它新鲜吗、还有额度吗」；**选路规则**在 [`super::routing`]、
-//! **失败记账与摘除**在 [`super::eviction`]——三者的变更理由不同（表几乎不变，路由随模型
-//! 匹配需求变，摘除策略随事故证据变）。
+//! 本模块只回答「谁在表里、它新鲜吗」；**选路规则**在 [`super::routing`]、**并发占位**在
+//! [`super::admission`]、**失败记账与摘除**在 [`super::eviction`]、**节点身份**在
+//! [`super::keys`]——各自的变更理由不同（表几乎不变，路由随模型匹配需求变，准入随并发
+//! 策略变，摘除策略随事故证据变）。
 
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
@@ -17,64 +18,15 @@ use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use super::entry::{is_fresh, now_millis, since_millis, Entry, NEVER};
-use super::routing::{pick, AcquireError};
-use super::{Registry, SlotGuard, NEXT_CONN_ID};
+use super::keys::{normalize_ip, AgentKey};
+use super::{Registry, NEXT_CONN_ID};
+use crate::storage::DEFAULT_TENANT_ID;
 use crate::sync::{read_or_recover, write_or_recover};
-
-/// 一个 agent-node 的身份：对端自报的 `agent_id` + **socket 上看到的来源 IP**。
-///
-/// **为什么键要含 IP**（2026-10-16 决策 D1）：原来键只有 `agent_id`，于是两台机器用同一个
-/// `agent_id` 时会互相顶替（后注册的立刻关掉先注册的），而"同一台机器重连"与"另一台机器
-/// 冒用同名"在网关看来完全一样。加上来源 IP 之后：**同 `(id, ip)` = 同一节点重连（接管）**，
-/// **同 `id` 不同 `ip` = 两个并存的节点**（各自独立路由）。
-///
-/// **不含端口**：每次重连源端口都会变，把它放进键等于让接管永不触发——注册表只增不减，
-/// 正是刚修完的幽灵条目换个入口重现。
-/// **IP 已归一**（[`normalize_ip`]）：v4-mapped IPv6 折叠成 IPv4，否则双栈监听下同一台
-/// 机器会因为"v4 连接看到 `127.0.0.1`、双栈连接看到 `::ffff:127.0.0.1`"被当成两个节点。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct AgentKey {
-    pub(crate) agent_id: String,
-    pub(crate) peer_ip: IpAddr,
-}
-
-impl AgentKey {
-    pub(crate) fn new(agent_id: &str, peer_ip: IpAddr) -> Self {
-        Self {
-            agent_id: agent_id.to_string(),
-            peer_ip: normalize_ip(peer_ip),
-        }
-    }
-}
-
-/// 把 socket 看到的对端地址归一成"裸 IP"。
-///
-/// 两步，各自都有非做不可的理由：
-/// 1. **剥端口**：重连必换源端口，带端口 = 接管永不触发（见 [`AgentKey`]）。
-/// 2. **v4-mapped IPv6 折叠**：双栈 socket（绑 `::`）对 IPv4 对端报的是
-///    `::ffff:a.b.c.d`。不折叠时同一台机器在"v4 监听"与"双栈监听"下拿到两个不同的 IP，
-///    于是被当成**两个并存节点**（D1 的误判形态，而不是安全退化）。
-///
-/// 归一**只此一处**：`/admin/agents` 的 `ip` 字符串也走它，避免"键里归一、展示里没归一"
-/// 的劈叉。纯函数，好单测。
-pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6(v6),
-        },
-        v4 => v4,
-    }
-}
-
-/// 从 `SocketAddr` 取归一后的 IP（注册与心跳的唯一入口）。
-pub(crate) fn normalize_socket_addr(addr: SocketAddr) -> IpAddr {
-    normalize_ip(addr.ip())
-}
 
 /// agent 明细快照（供 /admin/agents 管理接口序列化）。
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentInfo {
+    pub tenant_id: String,
     pub agent_id: String,
     /// 来源 IP（已归一、**不含端口**，见 [`AgentKey`]）。
     ///
@@ -134,13 +86,15 @@ pub struct Registration<'a> {
     /// **为什么这里要带 `peer_ip`**：摘除得按**同一个键**去找条目（[`Registry::remove_if_same`]
     /// 按 `(agent_id, peer_ip)` 定位）。同名的两个节点是两条独立条目，只按 `agent_id` 摘会在
     /// 双节点场景里摘错人（或摘不掉）。
-    agent: Vec<(String, IpAddr, usize)>,
+    tenant: Option<String>,
+    agent: Vec<(String, String, IpAddr, usize)>,
 }
 
 impl<'a> Registration<'a> {
     pub fn new(registry: &'a Registry) -> Self {
         Self {
             registry,
+            tenant: None,
             agent: Vec::new(),
         }
     }
@@ -151,10 +105,18 @@ impl<'a> Registration<'a> {
     /// **必须在 `Registry::register` 之前问**（调用点顺序见 `quic.rs`）：注册已经插表之后再
     /// 拒绝，那条 `Entry` 就没人负责摘了——正是本守卫要防的幽灵条目。
     pub fn accepts(&self, agent_id: &str, peer_ip: IpAddr) -> bool {
+        self.accepts_for_tenant(DEFAULT_TENANT_ID, agent_id, peer_ip)
+    }
+
+    /// 同 [`Self::accepts`]，并检查"一条连接只属于一个 tenant"。
+    pub fn accepts_for_tenant(&self, tenant_id: &str, agent_id: &str, peer_ip: IpAddr) -> bool {
+        if self.tenant.as_deref().is_some_and(|t| t != tenant_id) {
+            return false;
+        }
         let ip = normalize_ip(peer_ip);
         self.agent
             .iter()
-            .any(|(id, kip, _)| id == agent_id && *kip == ip)
+            .any(|(tid, id, kip, _)| tid == tenant_id && id == agent_id && *kip == ip)
             || self.agent.len() < MAX_REGISTRATIONS_PER_CONNECTION
     }
 
@@ -163,14 +125,27 @@ impl<'a> Registration<'a> {
     /// 同一 `(agent_id, peer_ip)` 重新注册时**覆盖**：只有最后一次的 `stable_id` 才匹配当前
     /// 条目，用旧的 stable_id 摘除是 no-op（`remove_if_same` 会比对）。
     pub fn note(&mut self, agent_id: String, peer_ip: IpAddr, stable_id: usize) {
+        self.note_for_tenant(DEFAULT_TENANT_ID, agent_id, peer_ip, stable_id);
+    }
+
+    pub fn note_for_tenant(
+        &mut self,
+        tenant_id: &str,
+        agent_id: String,
+        peer_ip: IpAddr,
+        stable_id: usize,
+    ) {
+        self.tenant.get_or_insert_with(|| tenant_id.to_string());
         let ip = normalize_ip(peer_ip);
         match self
             .agent
             .iter_mut()
-            .find(|(id, kip, _)| id == &agent_id && *kip == ip)
+            .find(|(tid, id, kip, _)| tid == tenant_id && id == &agent_id && *kip == ip)
         {
-            Some(slot) => slot.2 = stable_id,
-            None => self.agent.push((agent_id, ip, stable_id)),
+            Some(slot) => slot.3 = stable_id,
+            None => self
+                .agent
+                .push((tenant_id.to_string(), agent_id, ip, stable_id)),
         }
     }
 
@@ -180,12 +155,25 @@ impl<'a> Registration<'a> {
     /// [`Registry::heartbeat_if_same`]。**必须按每个 id 查**（不能只比最后一条）：一条连接可以
     /// 注册多个 id，只认最后一条时，其余 id 的心跳会被当成越权而丢弃（或反过来，让越权的心跳
     /// 替别人的死条目续命）。
+    pub fn tenant(&self) -> Option<&str> {
+        self.tenant.as_deref()
+    }
+
     pub fn owned_stable_id(&self, agent_id: &str, peer_ip: IpAddr) -> Option<usize> {
+        self.owned_stable_id_for_tenant(DEFAULT_TENANT_ID, agent_id, peer_ip)
+    }
+
+    pub fn owned_stable_id_for_tenant(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        peer_ip: IpAddr,
+    ) -> Option<usize> {
         let ip = normalize_ip(peer_ip);
         self.agent
             .iter()
-            .find(|(id, kip, _)| id == agent_id && *kip == ip)
-            .map(|(_, _, sid)| *sid)
+            .find(|(tid, id, kip, _)| tid == tenant_id && id == agent_id && *kip == ip)
+            .map(|(_, _, _, sid)| *sid)
     }
 }
 
@@ -193,8 +181,9 @@ impl Drop for Registration<'_> {
     fn drop(&mut self) {
         // 逐个摘：判据仍是 `stable_id` 比对，所以**只摘仍属于本连接的那些**——被新连接接管的
         // id 在这里是 no-op，不会误删活条目。
-        for (agent_id, peer_ip, stable_id) in &self.agent {
-            self.registry.remove_if_same(agent_id, *peer_ip, *stable_id);
+        for (tenant_id, agent_id, peer_ip, stable_id) in &self.agent {
+            self.registry
+                .remove_if_same_for_tenant(tenant_id, agent_id, *peer_ip, *stable_id);
         }
     }
 }
@@ -208,7 +197,8 @@ impl Registry {
     ///
     /// `peer_ip` 是 **socket 上看到的**对端地址（调用方传 `Handle::remote_addr()` 的 IP），
     /// 不是帧里自报的——自报字段没有可信度。它经 [`normalize_ip`] 归一后参与键。
-    pub fn register(
+    #[cfg(test)]
+    pub(crate) fn register(
         &self,
         agent_id: String,
         peer_ip: IpAddr,
@@ -216,7 +206,29 @@ impl Registry {
         max_concurrency: u32,
         conn: s2n_quic::connection::Handle,
     ) -> usize {
-        self.register_with_grace(
+        self.register_in_tenant(
+            DEFAULT_TENANT_ID,
+            agent_id,
+            peer_ip,
+            models,
+            max_concurrency,
+            conn,
+        )
+    }
+
+    /// 在指定 tenant 下注册；返回 stable_id。
+    #[cfg(test)]
+    pub(crate) fn register_in_tenant(
+        &self,
+        tenant_id: &str,
+        agent_id: String,
+        peer_ip: IpAddr,
+        models: Vec<String>,
+        max_concurrency: u32,
+        conn: s2n_quic::connection::Handle,
+    ) -> usize {
+        self.register_with_grace_in_tenant(
+            tenant_id,
             agent_id,
             peer_ip,
             models,
@@ -253,8 +265,32 @@ impl Registry {
         close_grace: Duration,
         on_superseded_closed: Option<crate::evict_close::CloseObserver>,
     ) -> usize {
+        self.register_with_grace_in_tenant(
+            DEFAULT_TENANT_ID,
+            agent_id,
+            peer_ip,
+            models,
+            max_concurrency,
+            conn,
+            close_grace,
+            on_superseded_closed,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_grace_in_tenant(
+        &self,
+        tenant_id: &str,
+        agent_id: String,
+        peer_ip: IpAddr,
+        models: Vec<String>,
+        max_concurrency: u32,
+        conn: s2n_quic::connection::Handle,
+        close_grace: Duration,
+        on_superseded_closed: Option<crate::evict_close::CloseObserver>,
+    ) -> usize {
         let peer_ip = normalize_ip(peer_ip);
-        let key = AgentKey::new(&agent_id, peer_ip);
+        let key = AgentKey::new_in_tenant(tenant_id, &agent_id, peer_ip);
         // 锁外的分层日志要用它，而 `agent_id` 在锁内被移进 `Entry`（每连接一次克隆，可忽略）。
         let logged_agent_id = agent_id.clone();
         let stable_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
@@ -269,7 +305,9 @@ impl Registry {
             // 这个信号本身，值得 warn 一次；而"同名同源"只是重连（接管），不该报。
             let other_ips: Vec<IpAddr> = inner
                 .keys()
-                .filter(|k| k.agent_id == agent_id && k.peer_ip != peer_ip)
+                .filter(|k| {
+                    k.tenant_id == tenant_id && k.agent_id == agent_id && k.peer_ip != peer_ip
+                })
                 .map(|k| k.peer_ip)
                 .collect();
             // `stable_id` 是本调用刚发的新号（单调、永不复用），表里那条一定属于**另一条**
@@ -295,7 +333,7 @@ impl Registry {
                     conn,
                     stable_id,
                     agent_id,
-                    peer_ip,
+                    tenant_id: tenant_id.to_string(),
                     models,
                     max_concurrency,
                     inflight,
@@ -392,7 +430,17 @@ impl Registry {
     /// `peer_ip` 参与查找：同名的两个节点各有自己的条目，心跳必须落在**本连接**那一条上
     /// （`stable_id` 才是最终判据；IP 只是把查找收窄到正确的键）。
     pub fn heartbeat_if_same(&self, agent_id: &str, peer_ip: IpAddr, stable_id: usize) -> bool {
-        let key = AgentKey::new(agent_id, peer_ip);
+        self.heartbeat_if_same_for_tenant(DEFAULT_TENANT_ID, agent_id, peer_ip, stable_id)
+    }
+
+    pub fn heartbeat_if_same_for_tenant(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        peer_ip: IpAddr,
+        stable_id: usize,
+    ) -> bool {
+        let key = AgentKey::new_in_tenant(tenant_id, agent_id, peer_ip);
         if let Some(e) = read_or_recover(&self.inner).get(&key) {
             if e.stable_id == stable_id {
                 let now = now_millis();
@@ -410,7 +458,17 @@ impl Registry {
     /// 按 `(agent_id, peer_ip)` 定位：同名的两个节点是两条独立条目，本连接只能摘自己那条。
     /// 判据仍是 `stable_id`（IP 只是键的一半）。
     pub fn remove_if_same(&self, agent_id: &str, peer_ip: IpAddr, stable_id: usize) {
-        let key = AgentKey::new(agent_id, peer_ip);
+        self.remove_if_same_for_tenant(DEFAULT_TENANT_ID, agent_id, peer_ip, stable_id);
+    }
+
+    pub fn remove_if_same_for_tenant(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        peer_ip: IpAddr,
+        stable_id: usize,
+    ) {
+        let key = AgentKey::new_in_tenant(tenant_id, agent_id, peer_ip);
         let mut inner = write_or_recover(&self.inner);
         if let Some(e) = inner.get(&key) {
             if e.stable_id == stable_id {
@@ -521,6 +579,7 @@ impl Registry {
                 let last_seen = e.last_seen_millis.load(Ordering::Relaxed);
                 AgentInfo {
                     // 取键里的那份（键与 `Entry` 同值，但键在 map 迭代里天然可用）
+                    tenant_id: k.tenant_id.clone(),
                     agent_id: k.agent_id.clone(),
                     ip: k.peer_ip.to_string(),
                     models: e.models.clone(),
@@ -532,7 +591,34 @@ impl Registry {
             })
             .collect();
         // 稳定序：先 id 后 ip（两者都是字符串序，确定性够用，不引入 IP 数值序的额外语义）。
-        out.sort_by(|a, b| (&a.agent_id, &a.ip).cmp(&(&b.agent_id, &b.ip)));
+        out.sort_by(|a, b| {
+            (&a.tenant_id, &a.agent_id, &a.ip).cmp(&(&b.tenant_id, &b.agent_id, &b.ip))
+        });
+        out
+    }
+
+    /// 某 tenant 的已注册（含心跳过期）条目数。
+    pub fn count_for_tenant(&self, tenant_id: &str) -> usize {
+        read_or_recover(&self.inner)
+            .keys()
+            .filter(|k| k.tenant_id == tenant_id)
+            .count()
+    }
+
+    /// 某 tenant 的健康 agent 显式声明的模型（去重、排序）。
+    pub fn healthy_models_for_tenant(&self, tenant_id: &str, stale_after: Duration) -> Vec<String> {
+        let inner = read_or_recover(&self.inner);
+        let now = now_millis();
+        let mut out: Vec<String> = inner
+            .values()
+            .filter(|e| {
+                e.tenant_id == tenant_id
+                    && is_fresh(e.last_seen_millis.load(Ordering::Relaxed), now, stale_after)
+            })
+            .flat_map(|e| e.models.iter().filter(|m| m.as_str() != "*").cloned())
+            .collect();
+        out.sort();
+        out.dedup();
         out
     }
 
@@ -549,76 +635,6 @@ impl Registry {
         out.sort();
         out.dedup();
         out
-    }
-}
-
-impl Registry {
-    /// 在**能服务指定模型**的健康 agent 中挑选一个并原子占用并发槽位；
-    /// 返回的 [`SlotGuard`] 期间该请求计入在途数。
-    ///
-    /// 模型匹配语义：agent 声明的 `models` 含 `"*"`（全匹配/兜底）或含 `model`。
-    /// 优先级：**精确声明该模型者优先于仅 `*` 通配者**（通配是兜底，不抢单）；
-    /// 同级内按负载最轻优先，同等负载取最近心跳者（多 agent 均衡）。
-    ///
-    /// **生产路径走的是 [`Self::try_acquire_excluding`]**：`routing.rs` 总要把"刚失败的那条
-    /// 连接"排除掉（否则重试没有意义），所以本方法在 `crates/gateway/src` 里没有调用者。
-    /// 它是**单测的便利入口**（24 处调用，省掉一个 `&[]`），因此收进 `#[cfg(test)]`：
-    /// 不进非测试构建，也不占 `Registry` 的公开 API（评估 §7 步骤 6 的"死 API"清理）。
-    #[cfg(test)]
-    pub fn try_acquire(
-        &self,
-        stale_after: Duration,
-        model: &str,
-    ) -> Result<(Entry, SlotGuard), AcquireError> {
-        self.try_acquire_excluding(stale_after, model, &[])
-    }
-
-    /// 同 `try_acquire`（测试便利入口，见下），但**跳过 `exclude` 里列出的连接**（按 `stable_id`）。
-    ///
-    /// 用于"换一个 agent 重试"：刚失败的那条连接不该再被选中（否则重试没有意义）。
-    pub fn try_acquire_excluding(
-        &self,
-        stale_after: Duration,
-        model: &str,
-        exclude: &[usize],
-    ) -> Result<(Entry, SlotGuard), AcquireError> {
-        let inner = read_or_recover(&self.inner);
-        // 规则全在 [`pick`] 里（纯函数）：这里只负责"按序号占位、占不到就换下一个"。
-        let candidates = pick(inner.values(), now_millis(), stale_after, model, exclude)?;
-        for candidate in candidates {
-            let entry = candidate.clone();
-            // `max_concurrency == 0` = 不限：**不做上限判定**，但自增必须照做。
-            // `inflight` 不只是准入闸门，它同时是另外三处的输入：开流超时的忙/死判据
-            // （[`Entry::open_timeout_is_fatal`]，`0` 时以端点流额度为上限）、摘除时
-            // "是否还有别人在途"（[`Registry::evict`] 的 `inflight <= 1`）、以及下面
-            // `sort_by_key` 的负载排序键。
-            //
-            // 曾经写成 `entry.max_concurrency == 0 || …fetch_update(…)`：短路使"不增"，
-            // 而 `SlotGuard::drop` 仍然"减" → `AtomicU32` 下溢回绕成 4294967295。
-            // 后果是开流判据对该连接永久失效、每次摘除都白等满宽限期、这台 agent 永远排
-            // 最后、`/admin/agents` 显示天文数字。回归测试：
-            // `max_concurrency_zero_always_acquires_and_still_counts_inflight`。
-            //
-            // 用 `try_update` 而不是 `fetch_update`：后者在 nightly 1.100.0 起被标记为
-            // `deprecated: renamed to try_update for consistency`（纯改名，签名与返回值
-            // 语义一致），`try_update` 在 stable 1.97.1 就有（见 `TODO.md` 的那条）。
-            let acquired = if entry.max_concurrency == 0 {
-                let _ = entry.inflight.fetch_add(1, Ordering::Relaxed);
-                true
-            } else {
-                entry
-                    .inflight
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        (n < entry.max_concurrency).then_some(n + 1)
-                    })
-                    .is_ok()
-            };
-            if acquired {
-                let guard = SlotGuard(entry.inflight.clone());
-                return Ok((entry, guard));
-            }
-        }
-        Err(AcquireError::AtCapacity)
     }
 }
 

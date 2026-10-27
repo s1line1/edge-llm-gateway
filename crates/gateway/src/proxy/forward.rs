@@ -26,7 +26,7 @@ use proto::{io::FrameReader, Frame};
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
-use crate::state::ShutdownPhase;
+use crate::shutdown::ShutdownPhase;
 
 use super::tunnel::tunnel_cancel;
 use super::usage::UsageCollector;
@@ -59,14 +59,16 @@ pub(super) enum SendOutcome {
 /// `Gateway::shutdown` 早返回了（并集报告 H5）。
 const SHUTDOWN_EVENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// 响应转发结束的方式。**十个出口各自的处置不同**（九个变体，`ClientGone` 在两处返回），
+/// 响应转发结束的方式。**十一个出口各自的处置不同**（十个变体，`ClientGone` 在两处返回），
 /// 以前它们只是散落的 `return`——
 /// 日志能看出差别，返回值看不出来。显式化之后：调用方拿到一个可匹配的结论，
 /// 而第 9 步要修的那个缺口（客户端断开却因上游静默而未察觉）就落在 `ClientGone` 上。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ForwardEnd {
-    /// 上游正常结束（收到 `ProxyResponseEnd`）。
+    /// 上游正常结束（收到 `ProxyResponseEnd { ok: true }`）。
     UpstreamEnd,
+    /// 上游发了 `ProxyResponseEnd { ok: false }`：响应体不完整，已向客户端发明确信号。
+    UpstreamTruncated,
     /// 上游自己报错（`Frame::Error`），已把错误送给客户端。
     UpstreamError,
     /// 上游未发 End 就关了流。
@@ -96,6 +98,7 @@ impl ForwardEnd {
     pub(super) fn label(&self) -> &'static str {
         match self {
             ForwardEnd::UpstreamEnd => "upstream_end",
+            ForwardEnd::UpstreamTruncated => "upstream_truncated",
             ForwardEnd::UpstreamError => "upstream_error",
             ForwardEnd::UpstreamClosed => "upstream_closed",
             ForwardEnd::TunnelError => "tunnel_error",
@@ -110,7 +113,7 @@ impl ForwardEnd {
 
 /// 转发任务的收尾守卫（复扫 B3）。
 ///
-/// **为什么需要一个 Drop 守卫**：`forward_body` 有十个**返回**出口（九个变体），而 panic 是另
+/// **为什么需要一个 Drop 守卫**：`forward_body` 有十一个**返回**出口（十个变体），而 panic 是另
 /// 一条路——它不走
 /// 任何一条返回路径。`tx` 会随栈展开被 drop，于是 `rx` 干净地结束，客户端拿到一份**看似完整的
 /// 200 截断体**（HTTP 层看不出少了东西），而 `record_forward_end` 只在正常返回后调用 ⇒ 指标里
@@ -182,6 +185,24 @@ impl Drop for ForwardGuard {
 /// 谎报"模型答完了"——客户端会把残缺结果当完整结果记账/计费。所以这里发一个明确的 error 事件。
 const SHUTDOWN_SSE_EVENT: &[u8] = b"event: error\ndata: {\"error\":{\"message\":\"gateway is shutting down; this response is incomplete\",\"type\":\"server_error\"}}\n\n";
 
+/// 上游流中途出错（`ProxyResponseEnd { ok: false }`）时写给 SSE 客户端的终止事件。
+///
+/// 与 [`SHUTDOWN_SSE_EVENT`] 同一条原则：**绝不能**用 `[DONE]` 收尾；这里必须让客户端
+/// 看出"模型没有答完"。非 SSE 走 [`upstream_end_signal`] 的错误项，由响应体层中止。
+const TRUNCATED_SSE_EVENT: &[u8] = b"event: error\ndata: {\"error\":{\"message\":\"upstream ended the response early; this response is incomplete\",\"type\":\"server_error\"}}\n\n";
+
+/// `ok=false` 时给客户端的那一项；`ok=true` 返回 `None`（正常收尾，不额外发送）。
+pub(super) fn upstream_end_signal(ok: bool, is_stream: bool) -> Option<Result<Bytes, String>> {
+    if ok {
+        return None;
+    }
+    Some(if is_stream {
+        Ok(Bytes::from_static(TRUNCATED_SSE_EVENT))
+    } else {
+        Err("upstream ended the response early; this response is incomplete".into())
+    })
+}
+
 /// 带停滞超时地往客户端送一块。
 ///
 /// 语义与请求体侧一致（见 `read_body_with_stall`）：**有进展就不超时**。客户端只要还在
@@ -232,9 +253,6 @@ async fn send_to_client_or_shutdown(
 /// `op_timeout` 只用于取消帧的写——隧道坏掉时连 Cancel 都可能写不出去，绝不能在这里
 /// 阻塞（这正是"客户端已断开却发现不了"的死角）。
 ///
-/// 参数确实多（流的两半、通道、三个超时、票据、指标、用量记账、请求元信息），但它们都是
-/// 这个后台任务**必须独占持有**的资源；打包成 struct 只是把同一张清单换个地方写，不会让
-/// 这个函数更难懂。
 /// `Terminating` 阶段，或发送端已消失（`Gateway` 被 drop）→ 该收尾了。
 ///
 /// 判据是**阶段**而不是"是否变过"：`changed()` 只保证"变过"，而 `Draining` 阶段只停接新
@@ -243,27 +261,70 @@ fn shutdown_terminating(rx: &watch::Receiver<ShutdownPhase>) -> bool {
     *rx.borrow() == ShutdownPhase::Terminating || rx.has_changed().is_err()
 }
 
-#[allow(clippy::too_many_arguments)]
+/// 一次响应转发任务必须独占持有的资源。
+///
+/// 为什么是一个 struct 而不是 15 个位置参数：参数清单本身没有变，但**顺序**不再由调用点
+/// 靠记忆保证；新增一个资源时只改结构体与一个构造点。`slot` 必须活到本函数结束（它代表
+/// agent 在途槽位），因此由 `ctx` 持有、在函数末尾随局部绑定 drop，不能提前释放。
+pub(super) struct ForwardCtx {
+    pub(super) request_id: u64,
+    pub(super) tx: mpsc::Sender<Result<Bytes, String>>,
+    pub(super) idle_timeout: Duration,
+    pub(super) client_stall: Duration,
+    pub(super) op_timeout: Duration,
+    /// 该请求占用的 agent 在途槽位；随任务结束释放。
+    pub(super) slot: crate::registry::SlotGuard,
+    /// 该请求占用的 tenant 并发槽位；随任务结束释放。
+    pub(super) tenant_slot: crate::tenant_limits::TenantSlot,
+    pub(super) metrics: crate::metrics::Metrics,
+    pub(super) store: crate::storage::Storage,
+    pub(super) key_id: String,
+    pub(super) key_name: String,
+    pub(super) prompt_est: u64,
+    pub(super) is_stream: bool,
+    pub(super) shutdown: watch::Receiver<ShutdownPhase>,
+}
+
+/// 放弃一个**还活着**的请求时的统一收尾：先取消上游，再半关，最后结算已转发用量。
+///
+/// P3-3 的不变量（"每一处放弃请求的 finish 前必须有一次 tunnel_cancel"）原先靠复制粘贴维持；
+/// 收成一个函数后，六条出口共用同一个顺序，新增出口也不会漏掉 Cancel。
+async fn abandon(
+    send: &mut s2n_quic::stream::SendStream,
+    request_id: u64,
+    op_timeout: Duration,
+    usage: UsageCollector,
+) {
+    tunnel_cancel(send, request_id, op_timeout).await;
+    let _ = send.finish();
+    usage.finish();
+}
+
+/// 把上游的帧流转成客户端响应体；失败/取消路径的收尾见 [`abandon`]。
 pub(super) async fn forward_body<R>(
     reader: &mut FrameReader<R>,
     send: &mut s2n_quic::stream::SendStream,
-    request_id: u64,
-    tx: mpsc::Sender<Result<Bytes, String>>,
-    idle_timeout: Duration,
-    client_stall: Duration,
-    op_timeout: Duration,
-    _slot: crate::registry::SlotGuard,
-    metrics: crate::metrics::Metrics,
-    store: crate::storage::Storage,
-    key_id: String,
-    key_name: String,
-    prompt_est: u64,
-    is_stream: bool,
-    mut shutdown: watch::Receiver<ShutdownPhase>,
+    ctx: ForwardCtx,
 ) -> ForwardEnd
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let ForwardCtx {
+        request_id,
+        tx,
+        idle_timeout,
+        client_stall,
+        op_timeout,
+        slot: _slot,
+        tenant_slot: _tenant_slot,
+        metrics,
+        store,
+        key_id,
+        key_name,
+        prompt_est,
+        is_stream,
+        mut shutdown,
+    } = ctx;
     let mut usage = UsageCollector::new(store, key_id, key_name, prompt_est, is_stream);
     // reader 由调用方（`proxy::mod` 的响应编排）创建并**贯穿响应头与响应体两个阶段**
     // （记录 R3）：所以下面这个 `select!` 里 `shutdown.changed()` 分支的 `continue`
@@ -313,9 +374,7 @@ where
                     }
                 }
             }
-            tunnel_cancel(send, request_id, op_timeout).await;
-            let _ = send.finish();
-            usage.finish();
+            abandon(send, request_id, op_timeout, usage).await;
             return ForwardEnd::GatewayShutdown;
         }
         let frame = tokio::select! {
@@ -325,9 +384,7 @@ where
                     request_id,
                     "client disconnected while the upstream was silent; cancelling upstream"
                 );
-                tunnel_cancel(send, request_id, op_timeout).await;
-                let _ = send.finish();
-                usage.finish();
+                abandon(send, request_id, op_timeout, usage).await;
                 return ForwardEnd::ClientGone;
             }
             changed = shutdown.changed() => {
@@ -355,9 +412,7 @@ where
                         &mut shutdown,
                     )
                     .await;
-                    tunnel_cancel(send, request_id, op_timeout).await;
-                    let _ = send.finish();
-                    usage.finish();
+                    abandon(send, request_id, op_timeout, usage).await;
                     return ForwardEnd::ProtocolViolation;
                 }
                 match send_to_client_or_shutdown(
@@ -379,9 +434,7 @@ where
                         // 客户端已断开 → 取消上游；仍结算已转发部分
                         warn!(request_id, "client disconnected, cancelling upstream");
                         usage.observe(&chunk);
-                        tunnel_cancel(send, request_id, op_timeout).await;
-                        let _ = send.finish();
-                        usage.finish();
+                        abandon(send, request_id, op_timeout, usage).await;
                         return ForwardEnd::ClientGone;
                     }
                     SendOutcome::Stalled => {
@@ -396,19 +449,25 @@ where
                             "client stopped consuming the response body; cancelling upstream and releasing the slot"
                         );
                         usage.observe(&chunk);
-                        tunnel_cancel(send, request_id, op_timeout).await;
-                        let _ = send.finish();
-                        usage.finish();
+                        abandon(send, request_id, op_timeout, usage).await;
                         return ForwardEnd::ClientStalled;
                     }
                 }
                 usage.observe(&chunk);
                 metrics.add_bytes_out(chunk.len());
             }
-            Ok(Ok(Some(Frame::ProxyResponseEnd { .. }))) => {
+            Ok(Ok(Some(Frame::ProxyResponseEnd { ok, .. }))) => {
+                if let Some(item) = upstream_end_signal(ok, is_stream) {
+                    let _ =
+                        send_to_client_or_shutdown(&tx, item, client_stall, &mut shutdown).await;
+                }
                 let _ = send.finish();
                 usage.finish();
-                return ForwardEnd::UpstreamEnd;
+                return if ok {
+                    ForwardEnd::UpstreamEnd
+                } else {
+                    ForwardEnd::UpstreamTruncated
+                };
             }
             Ok(Ok(Some(Frame::Error { code, message, .. }))) => {
                 let _ = send_to_client_or_shutdown(
@@ -455,9 +514,7 @@ where
                     &mut shutdown,
                 )
                 .await;
-                tunnel_cancel(send, request_id, op_timeout).await;
-                let _ = send.finish();
-                usage.finish();
+                abandon(send, request_id, op_timeout, usage).await;
                 return ForwardEnd::IdleTimeout;
             }
         }
@@ -524,6 +581,29 @@ mod tests {
         );
     }
 
+    /// 规格（S2-1）：`ok=false` 不能被当成正常结束。
+    #[test]
+    fn upstream_end_signal_distinguishes_truncation_from_completion() {
+        assert!(upstream_end_signal(true, false).is_none());
+        assert!(upstream_end_signal(true, true).is_none());
+
+        let err = upstream_end_signal(false, false)
+            .expect("non-SSE truncation must produce an item")
+            .expect_err("non-SSE truncation must be an error item");
+        assert!(err.contains("incomplete"), "{err}");
+
+        let bytes = upstream_end_signal(false, true)
+            .expect("SSE truncation must produce an item")
+            .expect("SSE truncation must be a normal item");
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("incomplete"), "{text}");
+        assert!(
+            !text.contains("[DONE]"),
+            "must not claim normal completion: {text}"
+        );
+    }
+
     /// 规格（记录 P2-14）：**每条退出路径都要有自己的指标标签**，且互不相同。
     ///
     /// 标签就是 `hlmg_forward_ends_total{kind=...}` 的取值，混在一起就分不出"客户端走了"
@@ -532,6 +612,7 @@ mod tests {
     fn every_forward_end_has_its_own_label() {
         let all = [
             ForwardEnd::UpstreamEnd,
+            ForwardEnd::UpstreamTruncated,
             ForwardEnd::UpstreamError,
             ForwardEnd::UpstreamClosed,
             ForwardEnd::TunnelError,

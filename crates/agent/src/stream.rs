@@ -1,7 +1,7 @@
 use anyhow::Context as _;
 use futures_util::StreamExt;
 use proto::{
-    headers::{is_client_credential, is_hop_by_hop},
+    headers::{connection_tokens, is_connection_named, is_forwardable, is_hop_by_hop},
     io::{write_frame, FrameReader},
     Frame,
 };
@@ -226,11 +226,16 @@ async fn forward(
     request_log: bool,
     signals: &RequestSignals,
 ) -> anyhow::Result<()> {
+    let connection = connection_tokens(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
     for (k, v) in headers {
-        // 逐跳头 + 调用方凭据都不转发：凭据只属于「客户端 ↔ 网关」那一跳，不该到上游
-        // （网关侧已经剥过一层，这里是纵深防御，也覆盖"新 agent 配旧网关"的混版本场景）。
+        // 逐跳头 + `Connection` 点名头 + 调用方凭据都不转发：凭据只属于「客户端 ↔ 网关」
+        // 那一跳，不该到上游（网关侧已经剥过一层，这里是纵深防御，也覆盖"新 agent 配旧网关"）。
         let name = k.as_str();
-        if !is_hop_by_hop(name) && !is_client_credential(name) {
+        if is_forwardable(name, &connection) {
             if let Ok(v) = HeaderValue::from_str(&v) {
                 rb = rb.header(k, v);
             }
@@ -269,10 +274,15 @@ async fn forward(
 
     // ③ 响应头 → ProxyResponseHead 帧
     let status = resp.status().as_u16();
+    let connection = connection_tokens(
+        resp.headers()
+            .iter()
+            .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value))),
+    );
     let mut out_headers = Vec::new();
     for (k, v) in resp.headers() {
         let name = k.as_str();
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name) || is_connection_named(name, &connection) {
             continue;
         }
         // 记录 P3-16：`to_str()` 只认可见 ASCII，中文响应头值会被整条丢掉。帧里装的是

@@ -24,8 +24,10 @@
 跳过；真正生效的是四份**已跟踪**的登记表：`TODO.md`、`OPTIMIZATION.md`、`REBUILD.md`、
 `EDGE_REBRAND.md`。
 
-**谁在跑它**（重扫 H1-5 补齐）：`make check-records`（已挂进 `make check` 的前置）与
-`.git/hooks/pre-commit`。**CI 上没有它**；但没有 python3 时 hook 会明确打印"跳过"而不是
+**谁在跑它**（重扫 H1-5 补齐）：`make check-records`（已挂进 `make check` 与
+`make check-rust` 的前置）、`.git/hooks/pre-commit`，以及 CI Rust job 的
+`make check-rust`。CI checkout 必须用 `fetch-depth: 0`：commit 声明要查完整历史；
+shallow clone 下脚本会直接报错而不是把历史 hash 全判成"不存在"。没有 python3 时 hook 会明确打印"跳过"而不是
 静默通过。
 
 用法：
@@ -92,6 +94,12 @@ def commit_exists(sha: str) -> bool:
     return git("cat-file", "-e", f"{sha}^{{commit}}").returncode == 0
 
 
+def is_shallow_clone() -> bool:
+    """shallow clone 里历史 commit 不可达，继续检查只会产出假阳性。"""
+    out = git("rev-parse", "--is-shallow-repository")
+    return out.returncode == 0 and out.stdout.strip() == "true"
+
+
 def is_ignored(path: Path) -> bool:
     """该路径是否被 `.gitignore` 忽略。
 
@@ -150,6 +158,12 @@ def line_count(path: Path) -> int:
 
 
 def main() -> int:
+    if is_shallow_clone():
+        print(
+            "check-records: 当前是 shallow clone，无法验证历史提交声明；"
+            "请用完整历史（CI: actions/checkout fetch-depth: 0，本地: git fetch --unshallow）"
+        )
+        return 1
     verbose = "--verbose" in sys.argv
     pointer_drift: list[str] = []
     commit_drift: list[str] = []

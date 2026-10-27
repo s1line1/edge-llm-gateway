@@ -36,21 +36,25 @@ use rusqlite::Connection;
 use crate::error::GatewayError;
 
 pub mod hash;
+mod tenant;
 mod usage;
 mod verified;
+
+pub(crate) use tenant::DEFAULT_TENANT_ID;
+pub use tenant::{CreatedTenant, TenantError, TenantPatch, TenantRecord};
 
 /// 用量记账/落库的类型由私有模块 `usage` 定义，路径 `crate::storage::UsageDelta` 保持不变。
 pub use usage::{KeyUsageInfo, UsageDelta};
 
-use crate::storage::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
+use crate::storage::hash::{
+    constant_time_eq, generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2,
+};
 use crate::sync::{lock_or_recover, read_or_recover, write_or_recover};
 
+mod db;
 mod schema;
 
-use schema::{
-    load_keys, migrate_legacy_keys, table_has_column, tighten_db_to_owner, API_KEY_SCHEMA,
-    USAGE_SCHEMA,
-};
+use schema::{load_keys, load_tenants};
 
 #[derive(Clone)]
 pub struct Storage {
@@ -60,6 +64,8 @@ pub struct Storage {
 struct StoreInner {
     /// 动态 key，key = lookup（sha256(token) 十六进制），value = 记录。
     runtime: RwLock<HashMap<String, KeyRecord>>,
+    /// 租户；`default` 始终存在。
+    tenants: RwLock<HashMap<String, tenant::TenantRecord>>,
     /// SQLite 持久化连接（None = 仅内存，如 db 打开失败时降级）。
     ///
     /// **与用量记账共享**（`Arc`）：连接是**资源**（凭据写穿与用量落库都用它），
@@ -102,6 +108,7 @@ pub struct KeyRecord {
     /// 凭据版本：写入时取当时代数。任何凭据相关变更（吊销/轮换）都会让代数自增，
     /// 从而让基于旧版本建立的已验证缓存**立即失效**（见 `verified` 模块）。
     pub(crate) cred_version: u64,
+    pub(crate) tenant_id: String,
 }
 
 impl KeyRecord {
@@ -125,6 +132,11 @@ impl KeyRecord {
     pub fn enabled(&self) -> bool {
         self.enabled
     }
+
+    /// 所属租户 id。
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
 }
 
 /// `create()` 的返回：记录 + 仅此一次的明文 key（之后不再可获取）。
@@ -139,6 +151,54 @@ pub const DEFAULT_VERIFIED_MAX: usize = 1650;
 /// 它只决定"多久之后重新付一次 argon2 的钱"。
 const DEFAULT_VERIFIED_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// 写入一条 key 记录；**普通 INSERT**，冲突（id/lookup 重复）交给调用方重试。
+///
+/// 不能用 `INSERT OR REPLACE`：id 或 lookup 冲突时它会静默删掉另一行（S2-4）。
+/// 只把 id/lookup 的 UNIQUE 冲突当作可重试；触发器 ABORT 等其它约束必须原样上报
+/// （admin 需要把 `debug: forced insert failure` 这类诊断信息写进日志）。
+fn is_unique_key_collision(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(e, Some(message)) => {
+            e.code == rusqlite::ErrorCode::ConstraintViolation
+                && (message.contains("api_keys.id") || message.contains("api_keys.lookup"))
+        }
+        _ => false,
+    }
+}
+
+fn insert_api_key(conn: &Connection, record: &KeyRecord) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO api_keys (id, lookup, key_hash, name, created_at, enabled, tenant_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            record.id,
+            record.lookup,
+            record.key_hash,
+            record.name,
+            record.created_at as i64,
+            1i64,
+            record.tenant_id
+        ],
+    )
+    .map(|_| ())
+}
+
+fn validate_tenant_name(name: &str) -> Result<String, TenantError> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 64 {
+        return Err(TenantError::InvalidName);
+    }
+    Ok(name.to_string())
+}
+
+fn is_unique_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if e.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
 impl Storage {
     /// 启动期持久化自检的结果：`None` = 没配 `keys_file`；`Some(Ok(()))` = 就绪；
     /// `Some(Err(why))` = 已降级为内存模式（磁盘/权限/损坏/迁移失败…）。
@@ -146,8 +206,227 @@ impl Storage {
     /// 为什么单独暴露：构造器**刻意保持不可失败**（库与测试里"内存模式"是合法用法），
     /// 而**生产启动必须 fail-fast**——一个载不出任何 key 的网关是个空壳（每个请求 401），
     /// 却会一直报健康。判据由 [`crate::Gateway::start`] 执行。
+    ///
+    /// 注意：usage 表的载入失败**不**进入这个结果。它由 `UsageStore` 自己禁用落库
+    /// （S2-5），不会因为用量账本读不出来而让一个仍能授权/转发的网关拒绝启动。
     pub fn persistence_state(&self) -> Option<Result<(), String>> {
         self.inner.persistence.clone()
+    }
+
+    /// 按 id 取租户快照。
+    pub fn tenant(&self, id: &str) -> Option<TenantRecord> {
+        read_or_recover(&self.inner.tenants).get(id).cloned()
+    }
+
+    /// 全部租户（按 created_at 排序）。
+    pub fn tenants(&self) -> Vec<TenantRecord> {
+        let mut v: Vec<TenantRecord> = read_or_recover(&self.inner.tenants)
+            .values()
+            .cloned()
+            .collect();
+        v.sort_by_key(|t| t.created_at());
+        v
+    }
+
+    /// key id → tenant id。
+    pub fn tenant_of_key(&self, key_id: &str) -> Option<String> {
+        read_or_recover(&self.inner.runtime)
+            .values()
+            .find(|r| r.id == key_id)
+            .map(|r| r.tenant_id.clone())
+    }
+
+    /// 某 tenant 的当前 key 数（吊销后的 key 不在 runtime 里）。
+    pub fn key_count_for_tenant(&self, tenant_id: &str) -> usize {
+        read_or_recover(&self.inner.runtime)
+            .values()
+            .filter(|r| r.tenant_id == tenant_id)
+            .count()
+    }
+
+    /// 校验 agent 注册 token：tenant 必须存在且启用，token 的 sha256 必须匹配。
+    /// `default` 的 hash 为空，因此任何 token 都不匹配（legacy Register 走另一条路）。
+    pub(crate) fn verify_agent_token(
+        &self,
+        tenant_id: &str,
+        token: &str,
+    ) -> Result<TenantRecord, TenantError> {
+        let tenant = self.tenant(tenant_id).ok_or(TenantError::NotFound)?;
+        if !tenant.enabled() {
+            return Err(TenantError::Disabled);
+        }
+        let hash = tenant.agent_token_hash();
+        if hash.is_empty() || token.is_empty() {
+            return Err(TenantError::BadToken);
+        }
+        if constant_time_eq(lookup_of(token).as_bytes(), hash.as_bytes()) {
+            Ok(tenant)
+        } else {
+            Err(TenantError::BadToken)
+        }
+    }
+
+    /// 创建 tenant；返回一次性明文 agent token。
+    pub fn create_tenant(
+        &self,
+        name: String,
+        max_concurrent_requests: u32,
+        requests_per_minute: u32,
+    ) -> Result<CreatedTenant, TenantError> {
+        let name = validate_tenant_name(&name)?;
+        if read_or_recover(&self.inner.tenants)
+            .values()
+            .any(|t| t.name() == name)
+        {
+            return Err(TenantError::NameTaken);
+        }
+        let id = tenant::generate_tenant_id();
+        let agent_token = tenant::generate_agent_token();
+        let agent_token_hash = lookup_of(&agent_token);
+        let record = TenantRecord::new(
+            id.clone(),
+            name.clone(),
+            now_secs(),
+            true,
+            max_concurrent_requests,
+            requests_per_minute,
+            agent_token_hash,
+        );
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            if let Err(e) = conn.execute(
+                "INSERT INTO tenants
+                 (id, name, created_at, enabled, max_concurrent_requests, requests_per_minute, agent_token_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    record.id(),
+                    record.name(),
+                    record.created_at() as i64,
+                    i64::from(record.enabled()),
+                    record.max_concurrent_requests() as i64,
+                    record.requests_per_minute() as i64,
+                    record.agent_token_hash(),
+                ],
+            ) {
+                if is_unique_violation(&e) {
+                    return Err(TenantError::NameTaken);
+                }
+                return Err(TenantError::Database(e.to_string()));
+            }
+        }
+        write_or_recover(&self.inner.tenants).insert(id, record.clone());
+        Ok(CreatedTenant {
+            record,
+            agent_token,
+        })
+    }
+
+    /// 更新 tenant；id/name 之外的字段可改。`default` 不能禁用或改名。
+    pub fn update_tenant(&self, id: &str, patch: TenantPatch) -> Result<TenantRecord, TenantError> {
+        let mut record = self.tenant(id).ok_or(TenantError::NotFound)?;
+        if id == tenant::DEFAULT_TENANT_ID {
+            if patch.enabled == Some(false) {
+                return Err(TenantError::DefaultTenant);
+            }
+            if let Some(name) = &patch.name {
+                if name != record.name() {
+                    return Err(TenantError::DefaultTenant);
+                }
+            }
+        }
+        let name = match patch.name {
+            Some(name) => validate_tenant_name(&name)?,
+            None => record.name().to_string(),
+        };
+        if name != record.name()
+            && read_or_recover(&self.inner.tenants)
+                .values()
+                .any(|t| t.id() != id && t.name() == name)
+        {
+            return Err(TenantError::NameTaken);
+        }
+        let enabled = patch.enabled.unwrap_or(record.enabled());
+        let max = patch
+            .max_concurrent_requests
+            .unwrap_or(record.max_concurrent_requests());
+        let rpm = patch
+            .requests_per_minute
+            .unwrap_or(record.requests_per_minute());
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            if let Err(e) = conn.execute(
+                "UPDATE tenants SET name = ?1, enabled = ?2, max_concurrent_requests = ?3, requests_per_minute = ?4 WHERE id = ?5",
+                rusqlite::params![name, i64::from(enabled), max as i64, rpm as i64, id],
+            ) {
+                return Err(TenantError::Database(e.to_string()));
+            }
+        }
+        record = TenantRecord::new(
+            record.id().to_string(),
+            name,
+            record.created_at(),
+            enabled,
+            max,
+            rpm,
+            record.agent_token_hash().to_string(),
+        );
+        write_or_recover(&self.inner.tenants).insert(id.to_string(), record.clone());
+        Ok(record)
+    }
+
+    /// 删除 tenant：`default` 与仍有 key 的 tenant 拒绝；agent 存在性由 admin 层检查。
+    pub fn delete_tenant(&self, id: &str) -> Result<(), TenantError> {
+        if id == tenant::DEFAULT_TENANT_ID {
+            return Err(TenantError::DefaultTenant);
+        }
+        if self.tenant(id).is_none() {
+            return Err(TenantError::NotFound);
+        }
+        if self.key_count_for_tenant(id) > 0 {
+            return Err(TenantError::HasKeys);
+        }
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            if let Err(e) = conn.execute("DELETE FROM tenants WHERE id = ?1", rusqlite::params![id])
+            {
+                return Err(TenantError::Database(e.to_string()));
+            }
+        }
+        write_or_recover(&self.inner.tenants).remove(id);
+        Ok(())
+    }
+
+    /// 重新生成 tenant agent token；返回一次性明文。`default` 也允许（显式启用 token 注册）。
+    pub fn rotate_agent_token(&self, id: &str) -> Result<String, TenantError> {
+        let mut record = self.tenant(id).ok_or(TenantError::NotFound)?;
+        let token = tenant::generate_agent_token();
+        let hash = lookup_of(&token);
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+            if let Err(e) = conn.execute(
+                "UPDATE tenants SET agent_token_hash = ?1 WHERE id = ?2",
+                rusqlite::params![hash, id],
+            ) {
+                return Err(TenantError::Database(e.to_string()));
+            }
+        }
+        record = TenantRecord::new(
+            record.id().to_string(),
+            record.name().to_string(),
+            record.created_at(),
+            record.enabled(),
+            record.max_concurrent_requests(),
+            record.requests_per_minute(),
+            hash,
+        );
+        write_or_recover(&self.inner.tenants).insert(id.to_string(), record);
+        Ok(token)
+    }
+
+    /// tenant 的每 key 用量。
+    pub fn usage_for_tenant(&self, tenant_id: &str) -> Vec<KeyUsageInfo> {
+        self.inner.usage.usage_for_tenant(tenant_id)
+    }
+
+    /// tenant 汇总 (prompt, completion, total, requests)。
+    pub fn tenant_totals(&self, tenant_id: &str) -> (u64, u64, u64, u64) {
+        self.inner.usage.tenant_totals(tenant_id)
     }
 
     pub fn new(file: Option<PathBuf>) -> Self {
@@ -168,76 +447,10 @@ impl Storage {
     /// **吊销不依赖它**（版本/记录消失的校验在缓存之前），TTL 只决定"多久之后重新付一次
     /// argon2 的钱"。
     pub fn with_verified(file: Option<PathBuf>, max: usize, ttl: Duration) -> Self {
-        // `file` 为 None ⇒ 保持 None（内存模式是合法配置，不是故障）
-        let mut persistence: Option<Result<(), String>> = file.as_ref().map(|_| Ok(()));
-        let db = match &file {
-            Some(path) => match Connection::open(path) {
-                Ok(mut conn) => {
-                    // ① 权限先收紧：主库（刚被创建，或已存在）与**遗留的** `-wal`/`-shm`
-                    //    都以 0600 收口，不靠运维记得 `chmod`（见 `tighten_db_to_owner`）。
-                    tighten_db_to_owner(path);
-                    // ② 顺带做的持久化设置：WAL + synchronous=NORMAL。
-                    // 落库已经改成"按周期批量"，提交次数从每请求一次降到每周期一次；
-                    // 这两条让剩下的那几次提交不必每次都 fsync 主库（云端实测每次
-                    // 同步提交约 3.5ms）。journal_mode 是持久属性，设一次即可；
-                    // 失败只告警（例如文件系统不支持 WAL），不影响功能。
-                    if let Err(e) = conn.pragma_update(None, "journal_mode", "WAL") {
-                        tracing::warn!("sqlite: enable WAL failed (non-fatal): {e}");
-                    }
-                    if let Err(e) = conn.pragma_update(None, "synchronous", "NORMAL") {
-                        tracing::warn!("sqlite: set synchronous=NORMAL failed (non-fatal): {e}");
-                    }
-                    let init = (|| {
-                        conn.execute_batch(API_KEY_SCHEMA)?;
-                        conn.execute_batch(USAGE_SCHEMA)?;
-                        // 老库（无 cred_version 列）→ 补列；新库上 API_KEY_SCHEMA 已建好，这里跳过。
-                        if !table_has_column(&conn, "api_keys", "cred_version")? {
-                            conn.execute_batch(
-                                "ALTER TABLE api_keys ADD COLUMN cred_version INTEGER NOT NULL DEFAULT 1",
-                            )?;
-                        }
-                        Ok::<_, rusqlite::Error>(())
-                    })();
-                    match init {
-                        Ok(()) => {
-                            // 旧版库（明文 key 表，无 lookup 列）→ 无损迁移为 argon2 哈希
-                            match migrate_legacy_keys(&mut conn) {
-                                Ok(0) => {}
-                                Ok(n) => tracing::info!(
-                                    count = n,
-                                    "migrated legacy plaintext keys to argon2 hashes"
-                                ),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "keys db migration failed: {e}; using empty store"
-                                    );
-                                    persistence = Some(Err(format!(
-                                        "cannot migrate the legacy keys db {}: {e}",
-                                        path.display()
-                                    )));
-                                }
-                            }
-                            Some(conn)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "keys db {:?} init failed: {e}; using memory only",
-                                path
-                            );
-                            persistence =
-                                Some(Err(format!("cannot initialise {}: {e}", path.display())));
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("keys db {:?} open failed: {e}; using memory only", path);
-                    persistence = Some(Err(format!("cannot open {}: {e}", path.display())));
-                    None
-                }
-            },
-            None => None,
-        };
+        // 打开/收紧/建表/迁移都在 `db::open` 里；这里只把结果装进 `Storage`。
+        let opened = db::open(file.as_deref());
+        let mut persistence = opened.persistence;
+        let db = opened.conn;
         let runtime = match &db {
             Some(conn) => match load_keys(conn) {
                 Ok(map) => map,
@@ -254,11 +467,28 @@ impl Storage {
         // 连接是**资源**：凭据写穿与用量落库共用它，因此包一层 `Arc`；
         // 而状态各自独占——`runtime` 留在这里，用量账本交给 `usage::UsageStore`
         //（它在构造时自己从 `key_usage` 载入，失败只告警并按空账本继续）。
+        let mut tenants = match &db {
+            Some(conn) => match load_tenants(conn) {
+                Ok(map) => map,
+                Err(e) => {
+                    tracing::warn!("tenants db load failed: {e}; using only the default tenant");
+                    if matches!(persistence, Some(Ok(()))) {
+                        persistence = Some(Err(format!("cannot load the tenants db: {e}")));
+                    }
+                    HashMap::new()
+                }
+            },
+            None => HashMap::new(),
+        };
+        tenants
+            .entry(tenant::DEFAULT_TENANT_ID.to_string())
+            .or_insert_with(tenant::default_tenant);
         let db = Arc::new(Mutex::new(db));
         let usage = usage::UsageStore::new(db.clone());
         Self {
             inner: Arc::new(StoreInner {
                 runtime: RwLock::new(runtime),
+                tenants: RwLock::new(tenants),
                 db,
                 usage,
                 verified: verified::VerifiedCache::new(max, ttl),
@@ -319,43 +549,70 @@ impl Storage {
     ///
     /// 纯内存模式（`db = None`，库打不开时的降级）没有可落库的对象，直接成功。
     pub fn create(&self, name: String) -> Result<CreatedKey, GatewayError> {
-        let (id, plaintext) = generate_id_key();
-        let lookup = lookup_of(&plaintext);
-        let key_hash = hash_argon2(&plaintext);
-        let record = KeyRecord {
-            id,
-            key_hash,
-            lookup,
-            name,
-            created_at: now_secs(),
-            enabled: true,
-            cred_version: self.bump_cred_generation(),
-        };
-        // ① 先落库。失败 → 直接把错误交给调用方（admin 映射 500），内存一个字都不改。
-        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
-            conn.execute(
-                "INSERT OR REPLACE INTO api_keys (id, lookup, key_hash, name, created_at, enabled)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    record.id,
-                    record.lookup,
-                    record.key_hash,
-                    record.name,
-                    record.created_at as i64,
-                    1i64
-                ],
-            )?;
+        self.create_in(tenant::DEFAULT_TENANT_ID, name)
+    }
+
+    /// 在指定 tenant 下创建 key。tenant 必须存在且启用。
+    pub fn create_in(&self, tenant_id: &str, name: String) -> Result<CreatedKey, GatewayError> {
+        if let Some(t) = self.tenant(tenant_id) {
+            if !t.enabled() {
+                return Err(GatewayError::Other("tenant is disabled".into()));
+            }
+        } else {
+            return Err(GatewayError::Other("tenant not found".into()));
         }
-        // ② 再进内存：此后授权立即可用。
-        write_or_recover(&self.inner.runtime).insert(record.lookup.clone(), record.clone());
-        tracing::info!(id = %record.id, name = %record.name, "api key created");
-        Ok(CreatedKey { record, plaintext })
+        for _ in 0..3 {
+            let (id, plaintext) = generate_id_key();
+            let lookup = lookup_of(&plaintext);
+            let key_hash = hash_argon2(&plaintext);
+            let mut record = KeyRecord {
+                id,
+                key_hash,
+                lookup,
+                name: name.clone(),
+                created_at: now_secs(),
+                enabled: true,
+                // 成功落库后才 bump；重试不能浪费凭据代数。
+                cred_version: 0,
+                tenant_id: tenant_id.to_string(),
+            };
+            // ① 先落库。失败 → 直接把错误交给调用方（admin 映射 500），内存一个字都不改。
+            if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
+                match insert_api_key(conn, &record) {
+                    Ok(()) => {}
+                    Err(e) if is_unique_key_collision(&e) => {
+                        // id 或 lookup 撞了：换一组随机值重试，绝不能 REPLACE 掉已有行。
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            record.cred_version = self.bump_cred_generation();
+            // ② 再进内存：此后授权立即可用。
+            write_or_recover(&self.inner.runtime).insert(record.lookup.clone(), record.clone());
+            tracing::info!(id = %record.id, name = %record.name, "api key created");
+            return Ok(CreatedKey { record, plaintext });
+        }
+        Err(GatewayError::Other(
+            "could not allocate a unique key id".into(),
+        ))
     }
 
     /// 列出动态 key（不含明文；由调用方决定展示形式）。
     pub fn list(&self) -> Vec<KeyRecord> {
         let mut v: Vec<KeyRecord> = read_or_recover(&self.inner.runtime)
             .values()
+            .cloned()
+            .collect();
+        v.sort_by_key(|r| r.created_at);
+        v
+    }
+
+    /// 只列指定 tenant 的 key。
+    pub fn list_for_tenant(&self, tenant_id: &str) -> Vec<KeyRecord> {
+        let mut v: Vec<KeyRecord> = read_or_recover(&self.inner.runtime)
+            .values()
+            .filter(|r| r.tenant_id == tenant_id)
             .cloned()
             .collect();
         v.sort_by_key(|r| r.created_at);
@@ -410,7 +667,10 @@ impl Storage {
     /// 仅测试使用：生产路径只做内存累加，见 [`Self::accumulate_usage`]。
     #[cfg(test)]
     pub fn record_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        self.inner.usage.record(key_id, name, delta);
+        let tenant_id = self
+            .tenant_of_key(key_id)
+            .unwrap_or_else(|| tenant::DEFAULT_TENANT_ID.to_string());
+        self.inner.usage.record(key_id, &tenant_id, name, delta);
     }
 
     /// 本实例累计跑过多少次 argon2（测试断言用）。
@@ -428,7 +688,10 @@ impl Storage {
     ///
     /// 实现与契约见 `usage::UsageStore::accumulate`：**这里只是转发**，不保留独立逻辑。
     pub fn accumulate_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        self.inner.usage.accumulate(key_id, name, delta);
+        let tenant_id = self
+            .tenant_of_key(key_id)
+            .unwrap_or_else(|| tenant::DEFAULT_TENANT_ID.to_string());
+        self.inner.usage.accumulate(key_id, &tenant_id, name, delta);
     }
 
     /// 是否有"内存值尚未落库"的 key（静默期返回 false，调用方可跳过整轮 flush）。
@@ -456,7 +719,10 @@ impl Storage {
     /// 所以只留给测试构造"库里已有某值"的场景。**阻塞调用**，不要放回请求路径。
     #[cfg(test)]
     pub fn persist_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        self.inner.usage.persist(key_id, name, delta);
+        let tenant_id = self
+            .tenant_of_key(key_id)
+            .unwrap_or_else(|| tenant::DEFAULT_TENANT_ID.to_string());
+        self.inner.usage.persist(key_id, &tenant_id, name, delta);
     }
 
     /// 单个 key 的用量快照（无记录 → None）。
@@ -471,912 +737,4 @@ impl Storage {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-    use tempfile::tempdir;
-
-    #[test]
-    fn persist_roundtrip() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        let store = Storage::new(Some(path.clone()));
-        let created = store.create("dsh".into()).unwrap();
-        assert!(
-            store.authorize(&created.plaintext),
-            "new key should authorize"
-        );
-        assert!(!store.authorize("nope"));
-        drop(store);
-
-        let reloaded = Storage::new(Some(path.clone()));
-        assert!(
-            reloaded.authorize(&created.plaintext),
-            "persisted key should survive reload"
-        );
-    }
-
-    #[test]
-    fn plaintext_never_persisted() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        let store = Storage::new(Some(path.clone()));
-        let created = store.create("sec".into()).unwrap();
-        drop(store); // 确保落盘
-
-        let bytes = std::fs::read(&path).unwrap();
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(
-            !text.contains(&created.plaintext),
-            "plaintext key must not be persisted"
-        );
-        assert!(
-            text.contains("$argon2id$"),
-            "argon2 hash should be persisted"
-        );
-        // 明文不落盘后，重启依然能通过哈希校验授权
-        let reloaded = Storage::new(Some(path.clone()));
-        assert!(reloaded.authorize(&created.plaintext));
-        assert!(!reloaded.authorize("wrong"));
-    }
-
-    #[test]
-    fn delete_revokes_and_persists() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        let store = Storage::new(Some(path.clone()));
-        let created = store.create("x".into()).unwrap();
-        assert!(store.authorize(&created.plaintext));
-        assert!(store.delete(&created.record.id).unwrap());
-        assert!(
-            !store.authorize(&created.plaintext),
-            "revoked key must be rejected"
-        );
-        assert!(
-            !store.delete(&created.record.id).unwrap(),
-            "deleting twice returns false"
-        );
-
-        // 吊销同样持久化：重载后 key 依然失效
-        let reloaded = Storage::new(Some(path.clone()));
-        assert!(
-            !reloaded.authorize(&created.plaintext),
-            "revocation should survive reload"
-        );
-    }
-
-    #[test]
-    fn corrupt_keys_db_ignored() {
-        // 文件存在但不是合法 SQLite → 警告并当作空库
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        std::fs::write(&path, "{ not a sqlite database !!!").unwrap();
-        let store = Storage::new(Some(path.clone()));
-        assert!(!store.authorize("anything"));
-    }
-
-    #[test]
-    fn unreadable_keys_db_ignored() {
-        // 路径存在但无法打开（是目录）→ 警告并当作空库
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        std::fs::create_dir(&path).unwrap();
-        let store = Storage::new(Some(path.clone()));
-        assert!(!store.authorize("anything"));
-        // 降级为仅内存后，动态 key 仍可用
-        let created = store.create("mem".into()).unwrap();
-        assert!(store.authorize(&created.plaintext));
-    }
-
-    #[test]
-    fn usage_accumulates_and_persists() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        let store = Storage::new(Some(path.clone()));
-        let created = store.create("usage-test".into()).unwrap();
-        let id = created.record.id.clone();
-
-        // 3 次请求：2 次精确 usage + 1 次估算
-        store.record_usage(
-            &id,
-            "usage-test",
-            &UsageDelta {
-                prompt_tokens: 10,
-                completion_tokens: 20,
-                estimated: false,
-            },
-        );
-        store.record_usage(
-            &id,
-            "usage-test",
-            &UsageDelta {
-                prompt_tokens: 5,
-                completion_tokens: 5,
-                estimated: false,
-            },
-        );
-        store.record_usage(
-            &id,
-            "usage-test",
-            &UsageDelta {
-                prompt_tokens: 100,
-                completion_tokens: 50,
-                estimated: true,
-            },
-        );
-        let info = store.usage_of(&id).unwrap();
-        assert_eq!(info.prompt_tokens, 115);
-        assert_eq!(info.completion_tokens, 75);
-        assert_eq!(info.total_tokens, 190);
-        assert_eq!(info.requests, 3);
-        assert_eq!(info.estimated_requests, 1);
-        assert_eq!(info.name, "usage-test");
-        assert!(info.last_used_at > 0);
-
-        // 持久化：重载后用量仍在（吊销 key 也不丢记录，可审计）
-        drop(store);
-        let reloaded = Storage::new(Some(path.clone()));
-        let again = reloaded.usage_of(&id).unwrap();
-        assert_eq!(again.prompt_tokens, 115);
-        assert_eq!(again.completion_tokens, 75);
-        assert_eq!(again.requests, 3);
-        assert_eq!(again.estimated_requests, 1);
-
-        // 吊销 key 后 usage 记录仍保留（key 删了，用量表独立）
-        let store2 = Storage::new(Some(path.clone()));
-        store2.delete(&id).unwrap();
-        drop(store2);
-        let store3 = Storage::new(Some(path));
-        let kept = store3.usage_of(&id).unwrap();
-        assert_eq!(kept.requests, 3, "usage survives key revocation");
-    }
-
-    #[test]
-    fn usage_accumulates_in_memory_and_flushes_in_one_batch() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        let store = Storage::new(Some(path.clone()));
-        let a = store.create("batch-a".into()).unwrap();
-        let b = store.create("batch-b".into()).unwrap();
-        let delta = UsageDelta {
-            prompt_tokens: 10,
-            completion_tokens: 20,
-            estimated: false,
-        };
-
-        for _ in 0..100 {
-            store.accumulate_usage(&a.record.id, "batch-a", &delta);
-        }
-        for _ in 0..50 {
-            store.accumulate_usage(&b.record.id, "batch-b", &delta);
-        }
-
-        // ① 累加本身不碰库：/admin/usage 读内存，立即一致（这是原有语义，不能退步）
-        assert_eq!(store.usage_of(&a.record.id).unwrap().requests, 100);
-        assert_eq!(store.usage_of(&b.record.id).unwrap().requests, 50);
-        assert!(store.usage_has_pending(), "累加后应报告有待落库数据");
-        let fresh = Storage::new(Some(path.clone()));
-        assert!(
-            fresh.usage_of(&a.record.id).is_none(),
-            "未 flush 前不应有库记录"
-        );
-
-        // ② 一个周期把两个 key 各写一行
-        assert_eq!(store.flush_usage_once(false), 2);
-        assert!(!store.usage_has_pending(), "flush 后不应再有待落库数据");
-
-        // ③ 幂等：没有新用量时再 flush 是空操作（不会重复累加）
-        assert_eq!(store.flush_usage_once(false), 0);
-        assert_eq!(
-            store.flush_usage_once(true),
-            2,
-            "force 会无条件重写，值仍应是绝对值"
-        );
-
-        // ④ 重启（新建 store 读同一个库）后用量仍在，且不重复累加
-        let reloaded = Storage::new(Some(path.clone()));
-        let info = reloaded.usage_of(&a.record.id).unwrap();
-        assert_eq!(info.requests, 100);
-        assert_eq!(info.prompt_tokens, 1000);
-        assert_eq!(info.completion_tokens, 2000);
-        assert_eq!(reloaded.usage_of(&b.record.id).unwrap().requests, 50);
-    }
-
-    #[test]
-    fn shutdown_flush_writes_without_waiting_for_the_period() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        let store = Storage::new(Some(path.clone()));
-        let created = store.create("shutdown".into()).unwrap();
-        store.accumulate_usage(
-            &created.record.id,
-            "shutdown",
-            &UsageDelta {
-                prompt_tokens: 7,
-                completion_tokens: 8,
-                estimated: false,
-            },
-        );
-
-        // 关闭前的强制落库：不等 flush 周期，立刻可见
-        let store2 = store.clone();
-        assert_eq!(store2.flush_usage_blocking(), 1);
-
-        let fresh = Storage::new(Some(path));
-        let info = fresh.usage_of(&created.record.id).unwrap();
-        assert_eq!(info.requests, 1);
-        assert_eq!(info.total_tokens, 15);
-    }
-
-    #[test]
-    fn usage_in_memory_only_store() {
-        let store = Storage::new(None);
-        store.record_usage(
-            "mem-key",
-            "m",
-            &UsageDelta {
-                prompt_tokens: 1,
-                completion_tokens: 2,
-                estimated: false,
-            },
-        );
-        let info = store.usage_of("mem-key").unwrap();
-        assert_eq!(info.total_tokens, 3);
-        assert_eq!(store.usage_snapshot().len(), 1);
-        assert!(store.usage_of("ghost").is_none());
-    }
-
-    #[test]
-    fn creates_sqlite_db_and_schema() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        let store = Storage::new(Some(path.clone()));
-        let created = store.create("y".into()).unwrap();
-        assert!(store.authorize(&created.plaintext));
-        assert_eq!(store.list().len(), 1);
-        assert!(path.exists(), "sqlite db file should be created");
-        drop(store);
-        // 文件确实是 SQLite 格式（magic 头 "SQLite format 3"）
-        let head = std::fs::read(&path).unwrap();
-        assert_eq!(
-            &head[..16],
-            b"SQLite format 3\x00",
-            "expected sqlite header"
-        );
-    }
-
-    #[test]
-    fn authorize_rejects_unknown_lookup_without_argon2() {
-        // lookup 不在表中直接拒绝，不做无意义的 argon2 计算
-        let store = Storage::new(None);
-        assert!(!store.authorize("sk-not-a-real-key"));
-    }
-
-    #[test]
-    #[serial]
-    fn migrates_db_without_cred_version_column() {
-        // 本次改动给 api_keys 加了 cred_version 列：已部署的库没有它，
-        // 启动时必须**自动补列**，且旧 key 仍能通过校验（不能因为迁移把用户锁在门外）。
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        let hash = {
-            // 用同一套 argon2 参数造一条"升级前"的记录（表里没有 cred_version 列）
-            let h = crate::storage::hash::hash_argon2("sk-upgrade-secret");
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE api_keys (
-                    id TEXT PRIMARY KEY,
-                    lookup TEXT NOT NULL UNIQUE,
-                    key_hash TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1
-                 );",
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO api_keys (id, lookup, key_hash, name, created_at, enabled)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
-                rusqlite::params![
-                    "old-id",
-                    crate::storage::hash::lookup_of("sk-upgrade-secret"),
-                    h,
-                    "old",
-                    1700000000i64
-                ],
-            )
-            .unwrap();
-            let cols: Vec<String> = Connection::open(&path)
-                .unwrap()
-                .prepare("PRAGMA table_info(api_keys)")
-                .unwrap()
-                .query_map([], |r| r.get::<_, String>(1))
-                .unwrap()
-                .map(|r| r.unwrap())
-                .collect();
-            assert!(
-                !cols.iter().any(|c| c == "cred_version"),
-                "前提：旧库确实没有 cred_version 列，实际列 {cols:?}"
-            );
-            h
-        };
-        drop(hash);
-
-        // 用新代码打开旧库 → 应自动补列，且旧 key 依旧可用
-        let store = Storage::new(Some(path.clone()));
-        assert!(
-            store.authorize("sk-upgrade-secret"),
-            "升级后旧 key 必须仍然有效"
-        );
-        assert!(!store.authorize("sk-wrong"));
-        {
-            let conn = Connection::open(&path).unwrap();
-            assert!(
-                table_has_column(&conn, "api_keys", "cred_version").unwrap(),
-                "启动时应自动给旧库补上 cred_version 列"
-            );
-        }
-        // 迁移后的记录代数有效（0 会被当成"从未校验过"，这里必须是 >=1）
-        let rec = store
-            .inner
-            .runtime
-            .read()
-            .unwrap()
-            .get(&lookup_of("sk-upgrade-secret"))
-            .cloned()
-            .unwrap();
-        assert!(rec.cred_version >= 1, "cred_version 应为有效代数");
-    }
-
-    #[test]
-    fn verify_rejects_malformed_hash() {
-        // 存储的哈希不是合法 PHC 格式 → 校验直接拒绝（不 panic）
-        assert!(!verify_argon2("sk-anything", "not-a-phc-hash"));
-        assert!(!verify_argon2("sk-anything", ""));
-    }
-
-    #[test]
-    fn migrates_legacy_plaintext_db() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        // 构造旧 schema 库（明文 key 列）+ 一条明文 key
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE api_keys (
-                    id TEXT PRIMARY KEY,
-                    key TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1
-                 );
-                 INSERT INTO api_keys (id, key, name, created_at, enabled)
-                 VALUES ('abc123', 'sk-legacy-secret', 'old', 1700000000, 1);",
-            )
-            .unwrap();
-        }
-
-        let store = Storage::new(Some(path.clone()));
-        assert!(
-            store.authorize("sk-legacy-secret"),
-            "migrated plaintext key should still authorize"
-        );
-        assert!(!store.authorize("sk-other"));
-
-        // 迁移后：旧明文列已删除、lookup 列存在（确定性断言，不扫描文件字节）
-        {
-            let conn = Connection::open(&path).unwrap();
-            assert!(
-                !table_has_column(&conn, "api_keys", "key").unwrap(),
-                "legacy plaintext column must be dropped"
-            );
-            assert!(table_has_column(&conn, "api_keys", "lookup").unwrap());
-            assert!(table_has_column(&conn, "api_keys", "key_hash").unwrap());
-        }
-
-        // 重载后依然有效，且不再重复迁移
-        let reloaded = Storage::new(Some(path.clone()));
-        assert!(reloaded.authorize("sk-legacy-secret"));
-        let list = reloaded.list();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].name, "old");
-    }
-
-    #[test]
-    fn migrates_empty_legacy_table_structure() {
-        // 旧表存在但无数据：也要重建结构（否则 load_keys 仍会失败）
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE api_keys (
-                    id TEXT PRIMARY KEY,
-                    key TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1
-                 );",
-            )
-            .unwrap();
-        }
-        let store = Storage::new(Some(path.clone()));
-        assert_eq!(store.list().len(), 0);
-        // 结构已修复：新 key 可正常创建并持久化
-        let created = store.create("new".into()).unwrap();
-        drop(store);
-        let reloaded = Storage::new(Some(path.clone()));
-        assert!(reloaded.authorize(&created.plaintext));
-    }
-
-    /// 规格（启动期持久化自检）：三种状态必须分得开——**没配 / 就绪 / 降级（带原因）**。
-    ///
-    /// 为什么要有这个区分：`Gateway::start` 只对"配了 `keys_file` 却用不了"这一档 fail-fast；
-    /// 没配 keys_file 的内存模式（测试/开发）是合法配置，不能一起拒掉。而"坏库"必须能给出
-    /// **路径与原因**，否则运维只看到"起不来"三个字。
-    #[test]
-    fn persistence_state_distinguishes_unconfigured_ready_and_degraded() {
-        // ① 没配 keys_file：内存模式，不是故障
-        assert!(
-            Storage::new(None).persistence_state().is_none(),
-            "没配 keys_file 不该有'持久化状态'"
-        );
-
-        let dir = tempdir().unwrap();
-        // ② 可用（会被自动创建）的库：就绪
-        let path = dir.path().join("keys.db");
-        assert_eq!(
-            Storage::new(Some(path.clone())).persistence_state(),
-            Some(Ok(())),
-            "正常库应当是就绪"
-        );
-
-        // ③ 不是 SQLite 库的文件：降级，且原因里带路径
-        let bogus = dir.path().join("bogus.db");
-        std::fs::write(&bogus, b"this is definitely not a sqlite database").unwrap();
-        let store = Storage::new(Some(bogus.clone()));
-        let why = store
-            .persistence_state()
-            .expect("配了 keys_file 就该有状态")
-            .expect_err("坏库必须报降级");
-        assert!(why.contains("bogus.db"), "原因里要带路径，实际：{why}");
-        assert!(!why.is_empty(), "原因不能是空串（运维要靠它定位）");
-    }
-
-    /// 规格：**持久化失败时不能声称"创建成功"**（评估报告 §5 H2 / 记录 P2-9）。
-    ///
-    /// 触发方式：给 `api_keys` 加一个必然 ABORT 的 INSERT 触发器——磁盘满 / I/O 错误 /
-    /// `SQLITE_BUSY` 在真实世界里就是这一支。修改前 `create` 先写内存、后落库，落库失败只
-    /// `warn!` 然后照常返回 → 管理页显示一把**重启后就消失**的 key。
-    #[test]
-    fn create_that_fails_to_persist_leaves_no_key() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        let store = Storage::new(Some(path.clone()));
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TRIGGER dbg_reject_insert BEFORE INSERT ON api_keys
-                 BEGIN SELECT RAISE(ABORT, 'debug: persist refused'); END;",
-            )
-            .unwrap();
-        }
-
-        assert!(
-            store.create("cannot-persist".into()).is_err(),
-            "落库失败必须让调用方知道（admin 要回 500，而不是 201 + 一把假 key）"
-        );
-        assert!(
-            store.list().is_empty(),
-            "落库失败就不该留下任何条目——重启后它会消失，等于发了一把假 key"
-        );
-        let conn = Connection::open(&path).unwrap();
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(rows, 0, "库里当然也没有");
-    }
-
-    /// 规格：**吊销落库失败时 key 必须仍然可用**（评估报告 §5 H2 / 记录 P1-4）。
-    ///
-    /// 与上一条对称：修改前 `delete` 先删内存、后落库，落库失败只 `warn!` 却仍返回 `true`
-    /// → admin 回 204、日志写 "api key revoked"，而重启后 `load_keys` 会把 key 复活。
-    /// 正确语义只有两种：内存与库**一起变**，或**都不变**——绝不能"内存说没了、库还在"。
-    #[test]
-    fn delete_that_fails_to_persist_keeps_the_key_usable() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        let store = Storage::new(Some(path.clone()));
-        let created = store.create("cannot-delete".into()).unwrap();
-        assert!(store.authorize(&created.plaintext), "前提：这把 key 可用");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TRIGGER dbg_reject_delete BEFORE DELETE ON api_keys
-                 BEGIN SELECT RAISE(ABORT, 'debug: persist refused'); END;",
-            )
-            .unwrap();
-        }
-
-        assert!(
-            store.delete(&created.record.id).is_err(),
-            "吊销没能落库必须让调用方知道（admin 要回 500）"
-        );
-        assert!(
-            store.authorize(&created.plaintext),
-            "吊销没能落库时 key 必须仍然可用——否则操作员看到 204、重启后它又活了"
-        );
-        let conn = Connection::open(&path).unwrap();
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(rows, 1, "库里那一行也还在");
-    }
-
-    /// 规格（评估 §5 H4 / §7 步骤 6）：**守卫内 panic 之后，认证热路径不能永久 500**。
-    ///
-    /// `runtime` 是热路径第一站，也是全局共享的：它一旦中毒，`.read().unwrap()` 会让
-    /// 之后**每个** `/v1/*` 都 panic（进程活着、指标还在跑，但全站 500）。锁里的数据只是
-    /// 内存映射，守卫内 panic 不会让它变成非法状态，所以继续用是安全的。
-    #[test]
-    #[serial]
-    fn a_poisoned_runtime_lock_does_not_take_the_gateway_down() {
-        let store = Storage::new(None);
-        let key = store.create("poison-runtime".into()).unwrap();
-        assert!(store.authorize(&key.plaintext), "前提：这把 key 可用");
-
-        // 持写锁时 panic：锁中毒，但表本身仍然合法
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = store.inner.runtime.write().unwrap();
-            panic!("poison the runtime lock");
-        }));
-        assert!(poisoned.is_err(), "前提：panic 确实发生了");
-        assert!(
-            store.inner.runtime.is_poisoned(),
-            "前提：锁确实中毒了（否则这条测试没测到东西）"
-        );
-
-        // 中毒之后：读（授权/列表）与写（建 key）都必须照常工作
-        assert!(store.authorize(&key.plaintext), "锁中毒不应让所有请求 500");
-        assert!(store.create("after-poison".into()).is_ok());
-        assert_eq!(store.list().len(), 2);
-    }
-
-    /// 同 [`a_poisoned_runtime_lock_does_not_take_the_gateway_down`]，但针对**落库连接**
-    /// 那把锁（`db`）：它同时服务凭据写穿与用量落库，中毒后不该让"建 key"直接 500。
-    #[test]
-    #[serial]
-    fn a_poisoned_db_lock_still_lets_credential_writes_through() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Storage::new(Some(dir.path().join("keys.db")));
-
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = store.inner.db.lock().unwrap();
-            panic!("poison the db lock");
-        }));
-        assert!(poisoned.is_err(), "前提：panic 确实发生了");
-        assert!(store.inner.db.is_poisoned(), "前提：锁确实中毒了");
-
-        let created = store
-            .create("after-poison-db".into())
-            .expect("锁中毒后仍应能落库");
-        assert!(store.authorize(&created.plaintext));
-        // 库里确实有一行（不是只改了内存）
-        let conn = Connection::open(dir.path().join("keys.db")).unwrap();
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(rows, 1, "锁中毒不该把落库也堵死");
-    }
-
-    /// 规格（评估 §7 步骤 6 / P3-7）：`keys.db` 由网关自己收紧到 **0600**，不靠运维记得
-    /// `chmod`（`DEPLOY.md` 的检查清单今天就是这么要求的）。
-    ///
-    /// 库里只有 argon2 哈希与 sha256 lookup，属纵深防御；但**升级/拷贝过来的旧库**往往是
-    /// 0644，所以打开已存在的文件时也要顺手收紧——这条才是确定性的红检（新建文件是否
-    /// 已经是 0600 取决于跑测试的 umask）。
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn keys_db_is_tightened_to_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mode_of =
-            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-        let store = Storage::new(Some(path.clone()));
-        store.create("perm".into()).unwrap(); // 让 WAL/SHM 也建起来
-
-        assert_eq!(mode_of(&path), 0o600, "新建的 keys.db 必须是 0600");
-        // WAL/SHM 装着同一份数据，权限不能比主库宽
-        for suffix in ["-wal", "-shm"] {
-            let side = dir.path().join(format!("keys.db{suffix}"));
-            if side.exists() {
-                assert_eq!(
-                    mode_of(&side),
-                    0o600,
-                    "keys.db{suffix} 的权限必须与主库一致"
-                );
-            }
-        }
-
-        // 已经存在的宽权限库：打开时也要收紧（升级/拷贝场景）
-        drop(store);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let _store = Storage::new(Some(path.clone()));
-        assert_eq!(mode_of(&path), 0o600, "打开已存在的库也要收紧到 0600");
-    }
-
-    /// 规格（2026-09-25 复扫 C2-1）：`-wal`/`-shm` 必须被**显式**收紧，而不是"靠继承"。
-    ///
-    /// 上面那条测试覆盖的是"主库收紧后由 SQLite 现建侧车"——那种场景下侧车继承主库刚设好的
-    /// 0600，所以**即使代码只 chmod 主库也会通过**。真正会漏的是迁移/拷贝过来的旧库：侧车早就
-    /// 躺在磁盘上、权限是旧的 0644，而 `tighten_db_to_owner` 只收主库 ⇒ 打开后侧车仍是 0644
-    /// （WAL 里是还没 checkpoint 回主库的页，与主库同级敏感）。
-    ///
-    /// 怎么复刻：空侧车没用——SQLite 分辨得出那是"没有内容的 WAL"，会把它删掉重建，重建时
-    /// 主库已经被收紧了，于是"继承"又把它救回来（这正是这条缺陷长期没被发现的原因）。所以
-    /// 这里让第一个 store **保持打开**，使 `-wal` 里留着真实帧；再把它摆成 0644，然后用第二个
-    /// store 打开同一个库——SQLite 会**复用**这份 WAL 而不是重建，宽权限因此留了下来。
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn preexisting_wal_sidecars_are_tightened_too() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mode_of =
-            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keys.db");
-
-        // 第一个 store 故意不 drop：连接活着，WAL 里才有未 checkpoint 的帧。
-        let live = Storage::new(Some(path.clone()));
-        live.create("perm".into()).unwrap();
-
-        let wal = dir.path().join("keys.db-wal");
-        let shm = dir.path().join("keys.db-shm");
-        assert!(wal.exists(), "前置条件：WAL 模式下 -wal 应该存在");
-        assert!(shm.exists(), "前置条件：WAL 模式下 -shm 应该存在");
-
-        // 复刻"从别处拷贝 / 迁移过来的旧库"：三个文件都是宽的 0644。
-        for f in [&path, &wal, &shm] {
-            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644)).unwrap();
-            assert_eq!(mode_of(f), 0o644, "前置条件：先摆成宽权限");
-        }
-
-        // 第二个 store 打开同一个库：SQLite 复用现存的 WAL，三个文件都要被显式收紧。
-        let _second = Storage::new(Some(path.clone()));
-        assert_eq!(mode_of(&path), 0o600, "主库");
-        assert_eq!(
-            mode_of(&wal),
-            0o600,
-            "遗留的 -wal 必须显式收紧（不能只靠继承）"
-        );
-        assert_eq!(
-            mode_of(&shm),
-            0o600,
-            "遗留的 -shm 必须显式收紧（不能只靠继承）"
-        );
-    }
-}
-
-#[cfg(test)]
-mod verified_tests {
-    use super::*;
-    use crate::storage::hash::CheapArgon2;
-    use std::sync::{Arc, Barrier};
-
-    // 这一组**不需要** `#[serial]`（记录 P3-22 的复核）：
-    //   · 每条测试自己 `Storage::new(..)`，而"跑了几次 argon2"的计数器是**每个 store 一个**
-    //     （`Storage::argon2_runs` / `verified_counters`），不是进程级 ⇒ 没有跨测试污染；
-    //   · `CheapArgon2` 是**线程局部**的，只影响本线程新算的哈希；
-    //   · 校验的成本参数取自 **PHC 串**（argon2 crate 文档原话："hash params from `parsed_hash`
-    //     are used instead of what is configured in the `Argon2` instance"）⇒ 用便宜参数写进去的
-    //     记录，在**任何**线程上校验都是便宜的。
-    // 早年的注释写的是"这些测试都要读进程级的 argon2 调用计数器"——那是计数器搬进 `Storage`
-    // **之前**的事实（迁移记录见 `hash.rs` 里 `verify_argon2` 的文档），注释没跟着改。
-
-    /// 并发压同一个 token；返回 (argon2 调用次数增量, 全部请求的结果)。
-    /// `cache_max = 0` 时代表"关闭缓存"（旧行为）。
-    fn hammer(store: &Storage, token: &str, threads: usize) -> (usize, Vec<bool>) {
-        let before = store.argon2_runs();
-        let barrier = Arc::new(Barrier::new(threads));
-        let results = Arc::new(Mutex::new(Vec::new()));
-        let mut handles = Vec::new();
-        for _ in 0..threads {
-            let store = store.clone();
-            let token = token.to_string();
-            let barrier = barrier.clone();
-            let results = results.clone();
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                let ok = store.authorize(&token);
-                results.lock().unwrap().push(ok);
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        let calls = store.argon2_runs() - before;
-        let out = results.lock().unwrap().clone();
-        (calls, out)
-    }
-
-    #[test]
-    fn concurrent_same_token_hashes_once() {
-        let _cheap = CheapArgon2::install();
-        // 这是把内存峰值从 `并发数 × 19MiB` 压到 `1 × 19MiB` 的核心契约
-        let store = Storage::new(None);
-        let key = store.create("one".into()).unwrap();
-        let (calls, results) = hammer(&store, &key.plaintext, 8);
-        assert_eq!(calls, 1, "同一个 token 的 8 个并发请求只应跑 1 次 argon2");
-        assert!(results.iter().all(|ok| *ok), "所有并发请求都应当通过");
-    }
-
-    #[test]
-    fn warm_token_never_hashes_again() {
-        let _cheap = CheapArgon2::install();
-        let store = Storage::new(None);
-        let key = store.create("warm".into()).unwrap();
-        assert!(store.authorize(&key.plaintext)); // 首次：算一次（create 那次不算）
-        let before = store.argon2_runs();
-        for _ in 0..50 {
-            assert!(store.authorize(&key.plaintext));
-        }
-        assert_eq!(store.argon2_runs() - before, 0, "命中缓存不应再跑 argon2");
-        let (hits, _) = store.verified_counters();
-        assert!(hits >= 50, "命中计数应当累加，实际 {hits}");
-    }
-
-    #[test]
-    fn disabled_cache_keeps_old_behaviour() {
-        let _cheap = CheapArgon2::install();
-        // cache_max = 0 → 每个请求都完整校验（与改造前语义一致）
-        let key = Storage::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
-        let token = key.create("nocache".into()).unwrap().plaintext;
-        let before = key.argon2_runs();
-        for _ in 0..3 {
-            assert!(key.authorize(&token));
-        }
-        let off = key.argon2_runs() - before;
-
-        // 对照：开启缓存时，首个请求填缓存（1 次 argon2），之后不再跑
-        let warm = Storage::new(None);
-        let token2 = warm.create("cached".into()).unwrap().plaintext;
-        assert!(warm.authorize(&token2)); // 预热：这一次是缓存未命中
-        let before2 = warm.argon2_runs();
-        for _ in 0..3 {
-            assert!(warm.authorize(&token2));
-        }
-        let on = warm.argon2_runs() - before2;
-
-        assert_eq!(off, 3, "关闭缓存时每请求各跑一次，实际 {off}");
-        assert_eq!(on, 0, "开启缓存且已预热后不应再跑 argon2，实际 {on}");
-    }
-
-    /// 规格：**关闭缓存时，每一次校验都要计入"真跑了 argon2"**（评估 §6 的指标口径）。
-    ///
-    /// `hlmg_key_verify_misses_total` 的 HELP 写的是 "Key verifications that ran argon2"，
-    /// 而它的自增点原先在 `put`——缓存关闭时走的是"每请求完整校验"那一支，**根本不经过 `put`**。
-    /// 于是这个计数器在 `verified_cache_max: 0` 下恒为 0：每请求都在跑 19MiB argon2，
-    /// 而运维在唯一会持续烧 argon2 的配置里看不到任何负载。
-    ///
-    /// （注意：错 token 走不到这里——`sha256` 不同 ⇒ runtime 查不到 ⇒ **按设计不跑 argon2**，
-    /// 既有单测 `authorize_rejects_unknown_lookup_without_argon2` 钉着这一点，所以那种负载
-    /// 本来就不该被算成 argon2 次数。）
-    #[test]
-    fn counter_counts_argon2_runs_when_the_cache_is_disabled() {
-        let _cheap = CheapArgon2::install();
-        let store = Storage::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
-        let token = store.create("nocache-metric".into()).unwrap().plaintext;
-        for _ in 0..3 {
-            assert!(store.authorize(&token));
-        }
-        let (hits, misses) = store.verified_counters();
-        assert_eq!(hits, 0, "缓存关闭时不可能命中");
-        assert_eq!(
-            misses, 3,
-            "3 次校验 = 3 次 argon2，必须都计入（修好前这里是 0）"
-        );
-    }
-
-    #[test]
-    fn revoke_takes_effect_immediately() {
-        let _cheap = CheapArgon2::install();
-        // 缓存**不得**延长吊销窗口：delete 后必须立刻 401
-        let store = Storage::new(None);
-        let key = store.create("revoke".into()).unwrap();
-        assert!(store.authorize(&key.plaintext));
-        assert!(store.authorize(&key.plaintext)); // 已进缓存
-        assert!(store.delete(&key.record.id).unwrap());
-        assert!(
-            !store.authorize(&key.plaintext),
-            "吊销后必须立即失效（不允许缓存放行）"
-        );
-    }
-
-    #[test]
-    fn credential_version_bump_invalidates_cache() {
-        let _cheap = CheapArgon2::install();
-        // 模拟"改 key 但不 bump 版本"以外的正确路径：bump 之后旧缓存条目必须失效
-        let store = Storage::new(None);
-        let key = store.create("bump".into()).unwrap();
-        assert!(store.authorize(&key.plaintext));
-        let before = store.argon2_runs();
-        assert!(store.authorize(&key.plaintext));
-        assert_eq!(store.argon2_runs() - before, 0, "命中缓存");
-
-        // 直接改记录里的 cred_version（等价于"凭据变更走了正确路径"）
-        {
-            let mut runtime = store.inner.runtime.write().unwrap();
-            let rec = runtime.get_mut(&key.record.lookup).unwrap();
-            rec.cred_version += 1;
-        }
-        let before = store.argon2_runs();
-        assert!(
-            store.authorize(&key.plaintext),
-            "版本变了应当重新校验，而不是拒绝"
-        );
-        assert_eq!(
-            store.argon2_runs() - before,
-            1,
-            "版本变更后必须重跑一次 argon2"
-        );
-    }
-
-    #[test]
-    fn expired_entry_is_revalidated() {
-        let _cheap = CheapArgon2::install();
-        // TTL 到期后重算（不改变"吊销即时"这条，只影响多久重付一次 argon2 的钱）
-        let store = Storage::with_verified(None, DEFAULT_VERIFIED_MAX, Duration::from_millis(50));
-        let key = store.create("ttl".into()).unwrap();
-        assert!(store.authorize(&key.plaintext));
-        std::thread::sleep(Duration::from_millis(80));
-        let before = store.argon2_runs();
-        assert!(store.authorize(&key.plaintext));
-        assert_eq!(store.argon2_runs() - before, 1, "TTL 到期应重算一次");
-    }
-
-    #[test]
-    fn cache_is_bounded_and_never_stores_plaintext() {
-        let _cheap = CheapArgon2::install();
-        let store = Storage::with_verified(None, 2, DEFAULT_VERIFIED_TTL);
-        let mut tokens = Vec::new();
-        for i in 0..5 {
-            let k = store.create(format!("k{i}")).unwrap();
-            assert!(store.authorize(&k.plaintext));
-            tokens.push(k.plaintext);
-        }
-        assert!(
-            store.inner.verified.len() <= 2,
-            "缓存条目数不得超过配置上限，实际 {}",
-            store.inner.verified.len()
-        );
-        // 缓存**只键于 sha256(token)**：键全 64 位十六进制，且没有任何一个是明文 token
-        let keys = store.inner.verified.keys();
-        assert_eq!(keys.len(), store.inner.verified.len());
-        assert!(
-            keys.iter()
-                .all(|k| k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())),
-            "缓存键必须是 sha256 十六进制，实际 {keys:?}"
-        );
-        for t in &tokens {
-            assert!(
-                !keys.contains(t),
-                "缓存不得以明文 token 为键：{t} 出现在 {keys:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn wrong_token_still_rejected_with_cache() {
-        let _cheap = CheapArgon2::install();
-        // 命中路径不得绕过校验：拿别人的 token 永远进不去
-        let store = Storage::new(None);
-        let good = store.create("good".into()).unwrap();
-        assert!(store.authorize(&good.plaintext));
-        assert!(!store.authorize("sk-deadbeef"));
-        assert!(!store.authorize(&format!("{}x", good.plaintext)));
-    }
-}
+mod tests;

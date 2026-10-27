@@ -6,11 +6,9 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use tokio::sync::watch;
-
 use crate::{
-    error::GatewayError, http, listen, metrics::Metrics, nofile, quic, registry::Registry, state,
-    storage::Storage, tls::TlsPem, usage_flush,
+    error::GatewayError, http, listen, metrics::Metrics, nofile, quic, registry::Registry,
+    shutdown, state, storage::Storage, tls::TlsPem, usage_flush,
 };
 
 /// 启动旋钮住在 [`crate::options`]；这里再导出，保住 `gateway::Options` 这个既有公开路径
@@ -44,9 +42,9 @@ pub struct Gateway {
     shutdown_flush_timeout: Duration,
     /// [`Options::shutdown_grace`] 的副本：排空在途请求的最长等待。
     shutdown_grace: Duration,
-    /// 关闭阶段的广播端（见 [`state::ShutdownPhase`]）：`Draining` 停 accept、
-    /// `Terminating` 让在途响应带明确事件收尾。
-    shutdown: watch::Sender<state::ShutdownPhase>,
+    /// 关闭阶段的唯一控制器（见 [`shutdown::Controller`]）：`Draining` 停 accept、
+    /// `Terminating` 让在途响应带明确事件收尾。`AppState` 只持接收端。
+    shutdown: shutdown::Controller,
     /// 在途请求读数（与 `hlmg_active_requests` 同一份计数）：排空的判据靠它。
     metrics: Metrics,
     registry: Registry,
@@ -156,16 +154,16 @@ impl Gateway {
                  empty key store (every request would 401 while the gateway looks healthy)"
             )));
         }
-        let mut app_state =
-            state::AppState::new(registry.clone(), store.clone(), metrics.clone(), &opts);
-        // 关闭阶段的发送端留在 `Gateway`；接收端给 accept 循环，在途响应各自 `subscribe()`。
-        // **取走（而不是克隆）是复扫 D5 的要害**：发送端全仓只有一份，"通道关闭"才真正等于
-        // "`Gateway` 没了"——每连接任务据此硬停，在途转发任务据此收尾（见 `Drop` 的文档）。
-        // 必须在 `http::app` 之前取：那个 Router 会被每条连接克隆，而克隆会把 `AppState`
-        // 里剩下的东西一起带走（取走之后它手上只有接收端）。
-        // `shutdown_sender` 是 pub(crate) 的：推进关闭阶段的能力属于进程生命周期，
-        // 不随 `AppState` 外流（评估 §2 S3）。
-        let shutdown = app_state.shutdown_sender();
+        // 关闭阶段的唯一控制器留在 `Gateway`；`AppState` 只拿接收端。这条不变量由类型
+        // 保证：`AppState` 的克隆里没有发送端，`drop(Gateway)` 必然让所有接收端看到 `Err`。
+        let shutdown = shutdown::Controller::new();
+        let app_state = state::AppState::new(
+            registry.clone(),
+            store.clone(),
+            metrics.clone(),
+            &opts,
+            shutdown.subscribe(),
+        );
         let app = http::app(app_state);
 
         // ⑤ 起任务。入列顺序有意义：用量 flusher 必须在 serve 任务之前就位（它按周期
@@ -185,7 +183,9 @@ impl Gateway {
                 sockets.server,
                 registry.clone(),
                 metrics.clone(),
+                store.clone(),
                 opts.stream_ceiling(),
+                opts.allow_legacy_agent_registration,
                 opts.evict_close_grace,
                 shutdown.subscribe(),
             )),
@@ -219,7 +219,7 @@ impl Gateway {
     /// 注册表里的条目数（**含心跳已过期、连接还没关的**）。
     ///
     /// 要"现在能被路由"的数量用 [`Self::healthy_agent_count`]：排查"所有请求 503"时
-    /// 两者必须分开看（见 `registry.rs` 的 `len` / `healthy_count`）。
+    /// 两者必须分开看（见 `registry/table.rs` 的 `len` / `healthy_count`）。
     pub fn agent_count(&self) -> usize {
         self.registry.len()
     }
@@ -255,7 +255,7 @@ impl Gateway {
 
     /// 停网关：**停 accept → 有界排空 → 在途带明确事件收尾 → 有界落库 → abort**。
     ///
-    /// 两个阶段通过 [`state::ShutdownPhase`] 广播：
+    /// 两个阶段通过 [`shutdown::ShutdownPhase`] 广播：
     /// - `Draining`：公网入口停止 accept（新连接被拒），**在途请求继续正常跑**；
     /// - `Terminating`：宽限期到了仍有在途，就让它们带一个明确的"不完整"事件收尾
     ///   （见 `proxy/forward.rs`），而不是被硬切。
@@ -276,20 +276,22 @@ impl Gateway {
     ///
     /// ⚠️ 但 `hlmg_active_requests` **未必**归零：那张票据由**响应 body** 持有，而 body 归
     /// HTTP 连接任务；客户端停读时它会 park 在写 socket 上直到 `client_stall`（`io_stall`），
-    /// 与转发任务是否退出无关。`await_end_event_window` 到点仍 >0 时会 WARN 说明这一点。
+    /// 与转发任务是否退出无关。`Controller::await_end_event_window` 到点仍 >0 时会 WARN 说明这一点。
     ///
     /// ⚠️ `crate::evict_close::defer_close` 是"摘除单个 agent 时等它在途请求收尾"，
     /// **不是进程退出路径**，别直接复用到这里。
     pub async fn shutdown(self) {
         // ① 进入 Draining：公网入口停止 accept；在途请求继续正常跑。
-        let _ = self.shutdown.send(state::ShutdownPhase::Draining);
+        self.shutdown.begin_drain();
         // ② 排空在途 HTTP 请求（有界）。放在落库之前，排空期间结算的用量才会被带上。
-        self.drain().await;
+        self.shutdown
+            .drain(&self.metrics, self.shutdown_grace)
+            .await;
         // ③ 宽限期到了仍有在途 → 进入 Terminating：它们会带一个明确的"不完整"事件收尾，
         //    这里给一个发送窗口，让事件真的写出去。
         if self.metrics.active_count() > 0 {
-            let _ = self.shutdown.send(state::ShutdownPhase::Terminating);
-            self.await_end_event_window().await;
+            self.shutdown.terminate();
+            self.shutdown.await_end_event_window(&self.metrics).await;
         }
         // ④ 有界强制落库：阻塞池 + 超时（见 [`Options::shutdown_flush_timeout`]）。
         //    超时**不取消**那个阻塞任务（同步代码取消不了），只是不再等它。
@@ -319,67 +321,7 @@ impl Gateway {
             t.abort();
         }
     }
-
-    /// 等在途 HTTP 请求归零，或到 [`Options::shutdown_grace`]。
-    ///
-    /// 判据用 `Metrics::active_count()`（与 `hlmg_active_requests` 同一份计数）：它覆盖
-    /// "准入之后、响应体结束之前"的整段；响应体结束意味着隧道与用量结算都已收口。
-    async fn drain(&self) {
-        let grace = self.shutdown_grace;
-        let deadline = tokio::time::Instant::now() + grace;
-        loop {
-            let active = self.metrics.active_count();
-            if active == 0 {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    active,
-                    grace_secs = grace.as_secs(),
-                    "shutdown grace elapsed with requests still in flight; announcing termination"
-                );
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    /// 宣布 `Terminating` 之后，等在途响应把明确事件写出去：在途归零或到
-    /// [`END_EVENT_WINDOW`] 为止。正常情况下一个调度周期内就归零。
-    ///
-    /// **窗口到点仍有在途要说出来**：这个读数（`hlmg_active_requests`）由**响应 body** 持有，
-    /// 而 body 归 HTTP 连接任务；客户端停止读取时它会 park 在写 socket 上，直到 `client_stall`
-    /// （见 `io_stall::WriteStall`）——此时**转发任务早已收尾**（H5 修好后它在 `Terminating` 就
-    /// 被叫停并把 Cancel 发给了上游），在途读数却仍 >0。所以这条 WARN 说的是"有客户端不读，
-    /// 票据要等停滞上限才归还"，不是"任务泄漏"；要区分得看
-    /// `hlmg_client_stalls_total{phase="response-body"}`。
-    async fn await_end_event_window(&self) {
-        let deadline = tokio::time::Instant::now() + END_EVENT_WINDOW;
-        loop {
-            let active = self.metrics.active_count();
-            if active == 0 {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    active,
-                    window_ms = END_EVENT_WINDOW.as_millis(),
-                    "still in flight when the end-event window elapsed: the forward tasks have been \
-                     told to stop, but these admission tickets are held by HTTP connection tasks \
-                     whose client stopped reading; they are released at client_stall at the latest"
-                );
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
 }
-
-/// 宣布 `Terminating` 后留给在途响应把"不完整"事件写出去的窗口。
-///
-/// 刻意不做成新旋钮：它只是"把事件从网关写到客户端"的调度余量，通常一两个调度周期就够；
-/// 给固定上限是为了不让一个不读的客户端拖住关闭。
-const END_EVENT_WINDOW: Duration = Duration::from_secs(1);
 
 /// [`run_bounded`] 的结果。
 ///
@@ -436,9 +378,9 @@ impl Drop for Gateway {
     /// 订阅者看到关闭通道消失。tokio 里 drop `JoinHandle` 只是 **detach**，任务会继续跑
     /// （并集报告 §5-H2 实测：drop 之后端口仍可 connect），所以两件事都要做。
     ///
-    /// **通道消失是各派生任务共同的那个硬停信号**（复扫 D5）。发送端只有本结构持有
-    /// （`Gateway::start` 从 `AppState` 把它 `take()` 走了，见 `AppState::shutdown_sender`），
-    /// 所以本结构被 drop ⇒ 每个接收端的 `changed()` 得到 `Err`：
+    /// **通道消失是各派生任务共同的那个硬停信号**（复扫 D5）。发送端只由本结构的
+    /// `shutdown::Controller` 持有（`AppState` 只有接收端），所以本结构被 drop ⇒
+    /// 每个接收端的 `changed()` 得到 `Err`：
     /// - **在途转发任务**（`proxy/forward.rs`）把 `has_changed().is_err()` 当 `Terminating`，
     ///   于是给客户端写一个明确的"不完整"事件再收尾，而不是被硬切；
     /// - **每条 HTTP 连接任务**（`http/entry.rs`）在 `select!` 里等它，醒来即丢连接——
@@ -458,9 +400,8 @@ impl Drop for Gateway {
         for t in &self.tasks {
             t.abort();
         }
-        // 字段 `shutdown`（唯一的发送端）随后按声明顺序 drop ⇒ 上面那条硬停信号。这里不显式
-        // `self.shutdown = ...`（类型上没有"清空"这一步，`watch::Sender` 也不能置空）：
-        // 只有本结构持有它，drop 就是关闭，任何"顺手再发一个 Terminating"都是多余的。
+        // 字段 `shutdown`（唯一的 `Controller`）随后 drop ⇒ 通道关闭，就是上面那条硬停信号。
+        // 只有本结构持有发送端；drop 即关闭，任何"顺手再发一个 Terminating"都是多余的。
     }
 }
 

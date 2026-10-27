@@ -9,7 +9,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use crate::registry::Registry;
-use crate::state::{self, ShutdownPhase};
+use crate::shutdown::{self, ShutdownPhase};
+use crate::storage::{Storage, DEFAULT_TENANT_ID};
 
 /// `stream_ceiling` = 每条连接允许的在途隧道流数（见 `Options::max_open_tunnel_streams`）。
 /// 它只用于**注册时的一致性告警**：agent 声明的 `max_concurrency` 超过这个额度时，网关侧
@@ -35,7 +36,9 @@ pub async fn accept_loop(
     mut server: s2n_quic::Server,
     registry: Registry,
     metrics: Metrics,
+    store: Storage,
     stream_ceiling: u32,
+    allow_legacy_agent_registration: bool,
     // 接管/摘除一条连接时，等在途请求收尾的宽限（`Options::evict_close_grace`）。
     // 与 `stream_ceiling` 一样属于"每调用注入"的配置：注册表自己不存配置。
     evict_close_grace: std::time::Duration,
@@ -48,7 +51,7 @@ pub async fn accept_loop(
         // （见 `Gateway::shutdown`）。这里 `return` 而不是 `break`：下面那条 `error!` 说的是
         // "端点失效"这种真实故障，drop 关停走这里，不该被报成故障。
         let accepted = tokio::select! {
-            _ = state::until_gateway_is_gone(&mut shutdown) => {
+            _ = shutdown::wait_closed(&mut shutdown) => {
                 debug!("the gateway is gone; the tunnel entry stops accepting new agents");
                 return;
             }
@@ -58,9 +61,10 @@ pub async fn accept_loop(
             break;
         };
         let registry = registry.clone();
+        let store = store.clone();
         let metrics = metrics.clone();
         // 每条 agent 连接一个接收端：网关对象被 drop（通道关闭）时放弃这条连接。
-        // 与 HTTP 入口同一个信号，见 `state::until_gateway_is_gone`。
+        // 与 HTTP 入口同一个信号，见 `shutdown::wait_closed`。
         let mut conn_shutdown = shutdown.clone();
 
         let remote = match conn.remote_addr() {
@@ -77,7 +81,15 @@ pub async fn accept_loop(
             // gauge 会永久虚高；注册表条目的摘除同理，见 `registry::Registration`。
             let _connection = metrics.mark_agent_connected();
             let handle = async move {
-                if let Err(e) = handle_conn(conn, registry, stream_ceiling, evict_close_grace).await
+                if let Err(e) = handle_conn(
+                    conn,
+                    registry,
+                    store,
+                    stream_ceiling,
+                    allow_legacy_agent_registration,
+                    evict_close_grace,
+                )
+                .await
                 {
                     warn!("agent connection error: {e}");
                 }
@@ -85,7 +97,7 @@ pub async fn accept_loop(
             tokio::select! {
                 // 硬停（复扫 D5）：`drop(Gateway)` 之后不再服务这条 agent 连接。注册表条目与
                 // `hlmg_agents` 随上面两处守卫在本任务结束时收尾。
-                _ = state::until_gateway_is_gone(&mut conn_shutdown) => {
+                _ = shutdown::wait_closed(&mut conn_shutdown) => {
                     debug!(%remote, "gateway dropped; closing an agent connection");
                 }
                 _ = handle => {}
@@ -109,7 +121,9 @@ pub async fn accept_loop(
 async fn handle_conn(
     conn: Connection,
     registry: Registry,
+    store: Storage,
     stream_ceiling: u32,
+    allow_legacy_agent_registration: bool,
     evict_close_grace: std::time::Duration,
 ) -> anyhow::Result<()> {
     // split 消耗连接，只能一次。Handle: Clone（给 registry 存一份）；
@@ -121,19 +135,74 @@ async fn handle_conn(
         &handle,
         &mut acceptor,
         &registry,
+        &store,
         &mut registration,
         stream_ceiling,
+        allow_legacy_agent_registration,
         evict_close_grace,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+fn register_agent(
+    registry: &Registry,
+    registration: &mut crate::registry::Registration<'_>,
+    handle: &s2n_quic::connection::Handle,
+    mut send: s2n_quic::stream::SendStream,
+    tenant_id: &str,
+    id: String,
+    models: Vec<String>,
+    max_concurrency: u32,
+    peer_ip: std::net::IpAddr,
+    stream_ceiling: u32,
+    evict_close_grace: std::time::Duration,
+) {
+    if max_concurrency > stream_ceiling {
+        warn!(
+            agent = %id,
+            max_concurrency,
+            stream_ceiling,
+            "agent declares more concurrency than the gateway's per-connection stream ceiling; \
+             raise max_open_tunnel_streams (gateway) or lower max_concurrency (agent), \
+             otherwise tunnel opens will queue and time out before capacity is reached"
+        );
+    }
+    if !registration.accepts_for_tenant(tenant_id, &id, peer_ip) {
+        warn!(
+            agent = %id,
+            tenant = %tenant_id,
+            limit = crate::registry::MAX_REGISTRATIONS_PER_CONNECTION,
+            "connection tried to register agents for a different tenant or exceeded the per-connection cap; closing it"
+        );
+        let _ = send.finish();
+        handle.close(0u32.into());
+        return;
+    }
+    let stable_id = registry.register_with_grace_in_tenant(
+        tenant_id,
+        id.clone(),
+        peer_ip,
+        models,
+        max_concurrency,
+        handle.clone(),
+        evict_close_grace,
+        None,
+    );
+    registration.note_for_tenant(tenant_id, id.clone(), peer_ip, stable_id);
+    let _ = send.finish();
+    info!(agent = %id, tenant = %tenant_id, ip = %peer_ip, "agent registered");
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_conn_inner(
     handle: &s2n_quic::connection::Handle,
     acceptor: &mut s2n_quic::connection::StreamAcceptor,
     registry: &Registry,
+    store: &Storage,
     registration: &mut crate::registry::Registration<'_>,
     stream_ceiling: u32,
+    allow_legacy_agent_registration: bool,
     evict_close_grace: std::time::Duration,
 ) -> anyhow::Result<()> {
     // 来源 IP 是**这条连接的属性**、在连接生命周期内不变，所以取一次就够（不用每帧问一次）。
@@ -161,53 +230,62 @@ async fn handle_conn_inner(
                         max_concurrency,
                         ..
                     }) => {
-                        // stable_id 由 register 发号并返回——不能自己再算一个（如 handle.id()），
-                        // 否则与 Entry.stable_id 对不上，连接结束时 remove_if_same 永远摘不掉条目。
-                        // 声明容量 > 端点流额度 = 配置不一致：网关会先撞流额度，把
-                        // "排队等额度"误解成"隧道卡住"。这里必须吵一声，否则复现路径极难查。
-                        if max_concurrency > stream_ceiling {
+                        if !allow_legacy_agent_registration {
                             warn!(
                                 agent = %id,
-                                max_concurrency,
-                                stream_ceiling,
-                                "agent declares more concurrency than the gateway's per-connection stream ceiling; \
-                                 raise max_open_tunnel_streams (gateway) or lower max_concurrency (agent), \
-                                 otherwise tunnel opens will queue and time out before capacity is reached"
+                                "legacy Register rejected: allow_legacy_agent_registration is false"
                             );
-                        }
-                        // **上限判定必须在 `register()` 之前**（记录 SL-P2-10）：注册已经插表
-                        // 之后再拒绝，那条 `Entry` 就没人负责摘了——正是 `Registration` 要防的
-                        // 幽灵条目（本仓库没有 stale 清扫器）。同名重新注册走覆盖、不占额度。
-                        if !registration.accepts(&id, peer_ip) {
-                            warn!(
-                                agent = %id,
-                                limit = crate::registry::MAX_REGISTRATIONS_PER_CONNECTION,
-                                "connection tried to register more agents than the per-connection cap; \
-                                 closing it (the entries it already owns are removed by the guard)"
-                            );
-                            // 摘除交给 `Registration` 的 Drop（循环退出、栈帧展开时执行），
-                            // 这里只负责让对端察觉到连接没了。
                             let _ = send.finish();
                             handle.close(0u32.into());
                             return Ok(());
                         }
-                        // 顺序不能反：`register()` 插表、`note()` 上膛，中间 Drop 是空操作
-                        // ——其间不得有可失败或可 `await` 的操作，否则会留下没人摘的条目。
-                        // 接管旧连接时**要宽限**（D3）：旧连接上可能还有"已送达上游、模型正在
-                        // 生成"的在途请求，立刻关掉就是纯损失。宽限期与摘除路径同一个来源。
-                        let stable_id = registry.register_with_grace(
-                            id.clone(),
-                            peer_ip,
+                        register_agent(
+                            registry,
+                            registration,
+                            handle,
+                            send,
+                            DEFAULT_TENANT_ID,
+                            id,
                             models,
                             max_concurrency,
-                            handle.clone(),
+                            peer_ip,
+                            stream_ceiling,
                             evict_close_grace,
-                            None,
                         );
-                        registration.note(id.clone(), peer_ip, stable_id);
-                        let _ = send.finish();
-                        info!(agent = %id, ip = %peer_ip, "agent registered");
                     }
+                    Some(Frame::RegisterWithTenant {
+                        agent_id: id,
+                        tenant_id,
+                        agent_token,
+                        models,
+                        max_concurrency,
+                        ..
+                    }) => match store.verify_agent_token(&tenant_id, &agent_token) {
+                        Ok(tenant) => register_agent(
+                            registry,
+                            registration,
+                            handle,
+                            send,
+                            tenant.id(),
+                            id,
+                            models,
+                            max_concurrency,
+                            peer_ip,
+                            stream_ceiling,
+                            evict_close_grace,
+                        ),
+                        Err(e) => {
+                            warn!(
+                                agent = %id,
+                                tenant = %tenant_id,
+                                error = %e,
+                                "tenant agent registration rejected"
+                            );
+                            let _ = send.finish();
+                            handle.close(0u32.into());
+                            return Ok(());
+                        }
+                    },
                     Some(Frame::Heartbeat {
                         agent_id: id,
                         inflight,
@@ -222,10 +300,14 @@ async fn handle_conn_inner(
                         // 判据是"这个 id **是不是本连接注册过的**"（按每个 id 查），不是"是不是
                         // 最后注册的那一个"：一条连接可以注册多个 id（见本文件上面的 `accepts`），
                         // 只认最后一条会把其余 id 的合法心跳误判成越权并丢弃。
-                        match registration.owned_stable_id(&id, peer_ip) {
+                        match registration.tenant().and_then(|tenant| {
+                            registration.owned_stable_id_for_tenant(tenant, &id, peer_ip)
+                        }) {
                             Some(stable_id) => {
-                                let _ = registry.heartbeat_if_same(&id, peer_ip, stable_id);
-                                debug!(agent = %id, ip = %peer_ip, inflight, "heartbeat");
+                                let tenant = registration.tenant().unwrap_or(DEFAULT_TENANT_ID);
+                                let _ = registry
+                                    .heartbeat_if_same_for_tenant(tenant, &id, peer_ip, stable_id);
+                                debug!(agent = %id, ip = %peer_ip, tenant = %tenant, inflight, "heartbeat");
                             }
                             // 帧里的 id 不是本连接注册的任何一个：只可能是坏掉的或恶意的对端。
                             // 静默忽略会让这种越权完全无痕，所以这里必须出声。
@@ -311,7 +393,9 @@ mod tests {
             test_server(),
             Registry::default(),
             metrics.clone(),
+            Storage::new(None),
             1024,
+            false,
             Duration::from_secs(1),
             shutdown_rx,
         ));
@@ -347,7 +431,9 @@ mod tests {
             test_server(),
             Registry::default(),
             metrics.clone(),
+            Storage::new(None),
             1024,
+            false,
             Duration::from_secs(1),
             shutdown_rx,
         ));

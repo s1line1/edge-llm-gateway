@@ -119,6 +119,15 @@ pub fn check_ui_dir(dir: &Path) -> UiDirCheck {
     UiDirCheck::Usable
 }
 
+/// 末段带 `.` = 静态资源路径（与 SPA 前端路由区分）。
+///
+/// **只有这一份判据**：启动期 [`local_asset_refs`] 与请求期 `http::ui::ui_fallback` 都用它。
+/// 两份实现会漂移，而漂移的方向恰好是"一边把 SPA 路由当资源、另一边当页面"——前者会让
+/// 一个能用的 UI 被判成缺产物，后者会让缺失的 `.js` 拿到 200 的 index.html。
+pub(crate) fn looks_like_asset(path: &str) -> bool {
+    path.rsplit('/').next().is_some_and(|seg| seg.contains('.'))
+}
+
 /// 抓 index.html 里 `src="/…"` / `href="/…"` 这类**本地静态资源**路径（去重、去掉 query/fragment）。
 ///
 /// 只收"末段带扩展名"的引用，这条判据与 [`ui_fallback`] 的 `has_extension` 一致：
@@ -126,7 +135,7 @@ pub fn check_ui_dir(dir: &Path) -> UiDirCheck {
 /// 误判成"缺失"会把一个**能用**的 UI 关掉——宁可漏报也不能误报。
 /// 同样跳过 http(s)://、协议相对的 //cdn、data:：那些不归 ui_dir 管。
 ///
-/// 手写扫描而非引 HTML parser：只为一次启动自检不值得加依赖（metrics.rs 同样是手写无依赖）。
+/// 手写扫描而非引 HTML parser：只为一次启动自检不值得加依赖（`metrics/render.rs` 同样是手写无依赖）。
 fn local_asset_refs(html: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for attr in ["src=\"", "href=\"", "src='", "href='"] {
@@ -141,8 +150,7 @@ fn local_asset_refs(html: &str) -> Vec<String> {
                 continue;
             }
             let path = value.split(['?', '#']).next().unwrap_or(value);
-            let looks_like_file = path.rsplit('/').next().is_some_and(|seg| seg.contains('.'));
-            if !looks_like_file {
+            if !looks_like_asset(path) {
                 continue;
             }
             if !out.iter().any(|p| p == path) {

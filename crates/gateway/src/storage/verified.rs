@@ -350,6 +350,7 @@ mod tests {
             created_at: 0,
             enabled: true,
             cred_version,
+            tenant_id: "default".into(),
         }
     }
 

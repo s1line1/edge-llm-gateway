@@ -138,6 +138,68 @@ impl RateLimiter {
     }
 }
 
+/// 按 tenant 的令牌桶限流：桶键是 `tenant_id`，容量/回填速率由当前 tenant 记录给出。
+///
+/// 与 [`RateLimiter`] 分开是因为 tenant 的 `requests_per_minute` 可以在运行时被 admin
+/// 修改，而 per-key 限流器的容量在启动时固定。
+#[derive(Clone)]
+pub struct TenantRateLimiter {
+    inner: Arc<Mutex<HashMap<String, Bucket>>>,
+}
+
+impl TenantRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// `per_minute == 0` 表示不限流。桶的容量/回填速率按本次传入的限额计算；
+    /// 限额调小后下一次请求会把 token 截到新容量。
+    pub fn try_acquire(&self, tenant_id: &str, per_minute: u32) -> bool {
+        if per_minute == 0 {
+            return true;
+        }
+        let capacity = f64::from(per_minute);
+        let refill_per_sec = capacity / 60.0;
+        let mut inner = lock_or_recover(&self.inner);
+        let now = Instant::now();
+        let bucket = inner
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| Bucket {
+                tokens: capacity,
+                updated: now,
+            });
+        let elapsed = now.duration_since(bucket.updated).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * refill_per_sec).min(capacity);
+        bucket.updated = now;
+        let allowed = bucket.tokens >= 1.0;
+        if allowed {
+            bucket.tokens -= 1.0;
+        }
+        allowed
+    }
+
+    /// 429 的 `Retry-After`（秒，向上取整、至少 1）。
+    pub fn retry_after_secs(&self, per_minute: u32) -> u64 {
+        if per_minute == 0 {
+            return 1;
+        }
+        ((60.0 / f64::from(per_minute)).ceil() as u64).max(1)
+    }
+
+    /// 删除 tenant 时回收桶。
+    pub fn evict(&self, tenant_id: &str) -> bool {
+        lock_or_recover(&self.inner).remove(tenant_id).is_some()
+    }
+}
+
+impl Default for TenantRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 测试专用的观测面：桶键 / 桶数是**内部状态**，生产代码不该看见。
 ///
 /// `pub(crate)` 而不是私有，是因为要断言的规格在**调用方**（`auth.rs`：桶键必须来自
@@ -284,5 +346,30 @@ mod tests {
         );
         assert_eq!(fast.sweep_idle(Duration::ZERO), 1, "回满且空闲的桶应当回收");
         assert_eq!(fast.bucket_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::TenantRateLimiter;
+
+    #[test]
+    fn tenant_buckets_are_independent_and_zero_is_unlimited() {
+        let limiter = TenantRateLimiter::new();
+        assert!(limiter.try_acquire("a", 1));
+        assert!(!limiter.try_acquire("a", 1), "a is exhausted");
+        assert!(limiter.try_acquire("b", 1), "b must not consume a's bucket");
+        assert!(limiter.try_acquire("a", 0), "zero means unlimited");
+        assert!(limiter.evict("a"));
+        assert!(limiter.try_acquire("a", 1), "evicted bucket starts full");
+    }
+
+    #[test]
+    fn retry_after_uses_the_current_limit() {
+        let limiter = TenantRateLimiter::new();
+        assert_eq!(limiter.retry_after_secs(1), 60);
+        assert_eq!(limiter.retry_after_secs(60), 1);
+        assert_eq!(limiter.retry_after_secs(600), 1);
+        assert_eq!(limiter.retry_after_secs(0), 1);
     }
 }

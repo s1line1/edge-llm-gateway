@@ -53,18 +53,55 @@ const MAX_CONCURRENT_PROBES: u32 = 64;
 /// fd/任务封顶，而不是零拒绝。
 const MAX_CONCURRENT_SCRAPES: u32 = 64;
 
-/// 路径 → `(准入域, 该域的上限)`。
+/// 一条请求的准入类别：把"路径 → 域/上限/是否记账/是否记访问日志"收在一处。
 ///
-/// 抽成纯函数是为了让**接线**本身可测：这条映射写错（例如 `/healthz` 落回受限域），
-/// `Metrics` 那边的域隔离做得再对也没用——探针照样吃 `/v1` 的额度。
-fn admission_domain(path: &str, gated_limit: u32) -> (AdmissionDomain, u32) {
-    match path {
-        "/healthz" => (AdmissionDomain::Probe, MAX_CONCURRENT_PROBES),
-        // 复扫 A8：`/metrics` 曾经在这里**直接放行**（连票都不领）——"抓取流量不该淹没真实
-        // 告警"是对的，但"不进计数"与"没有上限"是两件事：一条无认证路径完全不设界，靠的就只剩
-        // `max_entry_connections` 与 `client_stall` 兜底；而 A3 之后，两条公开路径里只剩它无界。
-        "/metrics" => (AdmissionDomain::Scrape, MAX_CONCURRENT_SCRAPES),
-        _ => (AdmissionDomain::Gated, gated_limit),
+/// 为什么需要它：`/metrics` 的特殊待遇原先散在四个文件里（准入域、是否 counted、id 中间件
+/// 是否跳过、路由表），新增一条公开路径时很容易只改对其中一两处。`RouteClass::of` 让这些
+/// 决定**同时**出现，且 `match` 穷尽性会提醒新增类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RouteClass {
+    /// 受 `max_concurrent_requests` 约束的常规路径。
+    Gated,
+    /// 探针（`/healthz`）：自己的域/上限，不影响受限预算。
+    Probe,
+    /// 指标抓取（`/metrics`）：自己的域/上限，且**不算一次请求**、不记访问日志。
+    Scrape,
+}
+
+impl RouteClass {
+    /// 只认**精确**路径：`/healthz/`、`/metrics/prometheus` 都必须落回受限域，
+    /// 否则一个前缀就能绕过闸门。
+    pub(super) fn of(path: &str) -> Self {
+        match path {
+            "/healthz" => Self::Probe,
+            "/metrics" => Self::Scrape,
+            _ => Self::Gated,
+        }
+    }
+
+    pub(super) fn domain(self) -> AdmissionDomain {
+        match self {
+            Self::Gated => AdmissionDomain::Gated,
+            Self::Probe => AdmissionDomain::Probe,
+            Self::Scrape => AdmissionDomain::Scrape,
+        }
+    }
+
+    pub(super) fn limit(self, gated_limit: u32) -> u32 {
+        match self {
+            Self::Gated => gated_limit,
+            Self::Probe => MAX_CONCURRENT_PROBES,
+            Self::Scrape => MAX_CONCURRENT_SCRAPES,
+        }
+    }
+
+    /// 抓取票只占额度、不进 `request_count`/`active`/耗时；也跳过 id 与访问日志。
+    pub(super) fn counted(self) -> bool {
+        self != Self::Scrape
+    }
+
+    pub(super) fn logs_access(self) -> bool {
+        self != Self::Scrape
     }
 }
 
@@ -114,11 +151,13 @@ pub(super) async fn admission_middleware(
     // /metrics 是第三种（复扫 A8）：自己的域 + 自己的上限，且**只领额度、不算一次请求**
     // （`try_enter_uncounted`）——它不走 id/访问日志/状态码那条链，记账会让
     // `request_count − Σ状态码 − aborted` 每次抓取各漂移 +1。
-    let (domain, limit) = admission_domain(&path, state.max_concurrent_requests);
-    let ticket = if domain == AdmissionDomain::Scrape {
-        state.metrics.try_enter_uncounted(limit, domain)
-    } else {
+    let class = RouteClass::of(&path);
+    let domain = class.domain();
+    let limit = class.limit(state.policy.max_concurrent_requests);
+    let ticket = if class.counted() {
         state.metrics.try_enter(limit, domain)
+    } else {
+        state.metrics.try_enter_uncounted(limit, domain)
     };
     let Some(admission) = ticket else {
         // 受限域与探针域都会经过外层的状态码记账，所以这里**只补** `request_count` 那一半；
@@ -166,7 +205,7 @@ pub(super) async fn admission_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::{admission_domain, MAX_CONCURRENT_PROBES, MAX_CONCURRENT_SCRAPES};
+    use super::{RouteClass, MAX_CONCURRENT_PROBES, MAX_CONCURRENT_SCRAPES};
     use crate::http::app;
     use crate::http::test_util::test_state;
     use crate::metrics::AdmissionDomain;
@@ -181,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn a_gate_rejection_still_echoes_the_client_request_id() {
         let mut state = test_state(None);
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let metrics = state.metrics.clone();
         let router = app(state);
 
@@ -219,29 +258,32 @@ mod tests {
     /// 这条测的是接线：`Metrics` 的域隔离再对，映射写错也白搭——探针会重新吃 `/v1` 的额度，
     /// 抓取会重新无界（或把探针顶掉）。
     #[test]
-    fn healthz_and_metrics_map_to_their_own_domains_and_the_rest_to_the_gated_one() {
-        assert_eq!(
-            admission_domain("/healthz", 7),
-            (AdmissionDomain::Probe, MAX_CONCURRENT_PROBES),
-            "探针必须进自己的域，且用探针自己的上限"
-        );
-        assert_eq!(
-            admission_domain("/metrics", 7),
-            (AdmissionDomain::Scrape, MAX_CONCURRENT_SCRAPES),
-            "抓取必须进自己的域（不能进探针域：抓取洪水会把 /healthz 顶成 429），且用自己的上限"
-        );
+    fn route_classes_map_to_their_own_domains_limits_and_accounting() {
+        let probe = RouteClass::of("/healthz");
+        assert_eq!(probe, RouteClass::Probe);
+        assert_eq!(probe.domain(), AdmissionDomain::Probe);
+        assert_eq!(probe.limit(7), MAX_CONCURRENT_PROBES, "探针用自己的上限");
+        assert!(probe.counted() && probe.logs_access());
+
+        let scrape = RouteClass::of("/metrics");
+        assert_eq!(scrape, RouteClass::Scrape);
+        assert_eq!(scrape.domain(), AdmissionDomain::Scrape);
+        assert_eq!(scrape.limit(7), MAX_CONCURRENT_SCRAPES, "抓取用自己的上限");
+        assert!(!scrape.counted(), "抓取票不算一次请求");
+        assert!(!scrape.logs_access(), "抓取不记访问日志");
+
         for gated in ["/v1/models", "/v1/chat/completions", "/", "/admin/keys"] {
-            assert_eq!(
-                admission_domain(gated, 7),
-                (AdmissionDomain::Gated, 7),
-                "{gated} 必须走受限域、用配置的上限"
-            );
+            let class = RouteClass::of(gated);
+            assert_eq!(class, RouteClass::Gated, "{gated} 必须走受限域");
+            assert_eq!(class.domain(), AdmissionDomain::Gated);
+            assert_eq!(class.limit(7), 7, "{gated} 用配置的上限");
+            assert!(class.counted() && class.logs_access());
         }
         // 只认精确路径：别让 `/healthz/` 或前缀把别的请求也拖进豁免域（那等于绕过受限闸门）。
         for prefixed in ["/healthz/", "/metrics/", "/metrics/prometheus"] {
             assert_eq!(
-                admission_domain(prefixed, 7),
-                (AdmissionDomain::Gated, 7),
+                RouteClass::of(prefixed),
+                RouteClass::Gated,
                 "只有精确的 /healthz 与 /metrics 才豁免，{prefixed} 不行"
             );
         }
@@ -256,7 +298,7 @@ mod tests {
         use tower::ServiceExt;
 
         let mut state = test_state(None);
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let metrics = state.metrics.clone();
         let router = app(state);
 

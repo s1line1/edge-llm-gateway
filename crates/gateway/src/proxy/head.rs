@@ -23,7 +23,7 @@ use super::tunnel::tunnel_cancel;
 #[derive(Debug)]
 enum HeadOutcome {
     Head(StatusCode, Vec<(String, String)>),
-    Error(u16, String),
+    Error(StatusCode, String),
 }
 
 /// 读响应头帧（或错误帧）。
@@ -64,10 +64,15 @@ where
                 ));
             }
             Some(Frame::Error { code, message, .. }) => {
-                return Ok(HeadOutcome::Error(code, message));
+                // 错误帧里的 code 是线上 `u16`；类型化只在这里发生一次。
+                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+                return Ok(HeadOutcome::Error(status, message));
             }
             Some(Frame::ProxyResponseEnd { .. }) => {
-                return Ok(HeadOutcome::Error(502, "empty upstream response".into()));
+                return Ok(HeadOutcome::Error(
+                    StatusCode::BAD_GATEWAY,
+                    "empty upstream response".into(),
+                ));
             }
             Some(Frame::ProxyResponseBody { chunk, .. }) => {
                 // 忽略是契约；但"这一块再也补不回来"至少要留在日志里
@@ -87,7 +92,7 @@ where
             }
             None => {
                 return Ok(HeadOutcome::Error(
-                    502,
+                    StatusCode::BAD_GATEWAY,
                     "upstream closed before responding".into(),
                 ));
             }
@@ -97,7 +102,7 @@ where
 
 /// 等上游响应头；失败时返回**要渲染成响应的** [`RouteFailure`]（调用方 `error_response`）。
 ///
-/// 用 `head_timeout` 而不是 `request_timeout`：以前这里用 `state.timeout`（默认 120s），
+/// 用 `head_timeout` 而不是 `request_timeout`：以前这里用 `state.policy.request_timeout`（默认 120s），
 /// agent 一旦卡住（注册着但什么都不回），每个请求都要把连接、并发槽位和缓冲区占满两分钟；
 /// 客户端早就超时断开，而网关还停在读上，连"客户端已断开"都发现不了
 /// （实测 40 并发 → 620MB 内存被钉住、日志停更）。也不能用 `tunnel_op_timeout`（2s）：
@@ -112,7 +117,7 @@ pub(super) async fn await_head<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let head = tokio::time::timeout(state.head_timeout, read_head(reader, request_id)).await;
+    let head = tokio::time::timeout(state.policy.head_timeout, read_head(reader, request_id)).await;
     match head {
         Ok(Ok(HeadOutcome::Head(s, h))) => {
             // 对端真的回了响应头 = 这条隧道是活的 → 清掉连续超时计数。
@@ -120,12 +125,9 @@ where
             state.registry.note_tunnel_op_ok(entry.stable_id());
             Ok((s, h))
         }
-        Ok(Ok(HeadOutcome::Error(code, message))) => {
+        Ok(Ok(HeadOutcome::Error(status, message))) => {
             let _ = send.finish();
-            Err(RouteFailure {
-                status: StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
-                message,
-            })
+            Err(RouteFailure { status, message })
         }
         Ok(Err(e)) => {
             let _ = send.finish();
@@ -154,11 +156,11 @@ where
             let disposition = state.registry.report_head_timeout(
                 entry,
                 HeadSilence {
-                    window: state.head_alive_window,
-                    peer_alive_window: state.agent_stale_after,
-                    stuck_after: state.head_silent_grace,
+                    window: state.policy.head_alive_window,
+                    peer_alive_window: state.policy.agent_stale_after,
+                    stuck_after: state.policy.head_silent_grace,
                 },
-                state.evict_close_grace,
+                state.policy.evict_close_grace,
             );
             let last_head_ago_secs = entry.last_head_ago().map_or(0, |d| d.as_secs());
             if matches!(disposition, Disposition::Fatal) {
@@ -167,7 +169,7 @@ where
                     request_id,
                     agent = %entry.agent_id(),
                     last_head_ago_secs,
-                    window_secs = state.head_alive_window.as_secs(),
+                    window_secs = state.policy.head_alive_window.as_secs(),
                     "upstream head timeout and the agent has been silent; evicting agent"
                 );
             } else {
@@ -181,7 +183,7 @@ where
             }
             // 先发取消、再半关：agent 那边**兜底**会把请求方向的 EOF 当取消，但契约要求显式
             // `Cancel`（P3-3）——只靠半关会让"响应前 EOF"变成一条契约违背告警。
-            tunnel_cancel(send, request_id, state.tunnel_op_timeout).await;
+            tunnel_cancel(send, request_id, state.policy.tunnel_op_timeout).await;
             let _ = send.finish();
             Err(RouteFailure {
                 status: StatusCode::GATEWAY_TIMEOUT,
@@ -313,7 +315,7 @@ mod tests {
         // 一字节都没有 = 干净关闭
         let mut empty = FrameReader::new(&[][..]);
         match read_head(&mut empty, 7).await.unwrap() {
-            HeadOutcome::Error(502, message) => {
+            HeadOutcome::Error(StatusCode::BAD_GATEWAY, message) => {
                 assert!(message.contains("closed before responding"), "{message}")
             }
             other => panic!("空流应当是 502，实际：{other:?}"),
@@ -328,7 +330,9 @@ mod tests {
         .await;
         let mut reader = FrameReader::new(bytes.as_slice());
         match read_head(&mut reader, 7).await.unwrap() {
-            HeadOutcome::Error(429, message) => assert_eq!(message, "slow down"),
+            HeadOutcome::Error(StatusCode::TOO_MANY_REQUESTS, message) => {
+                assert_eq!(message, "slow down")
+            }
             other => panic!("错误帧应当原样透出，实际：{other:?}"),
         }
 
@@ -340,7 +344,7 @@ mod tests {
         .await;
         let mut reader = FrameReader::new(bytes.as_slice());
         match read_head(&mut reader, 7).await.unwrap() {
-            HeadOutcome::Error(502, message) => {
+            HeadOutcome::Error(StatusCode::BAD_GATEWAY, message) => {
                 assert!(message.contains("empty upstream response"), "{message}")
             }
             other => panic!("先结束应当是 502，实际：{other:?}"),

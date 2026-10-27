@@ -112,6 +112,9 @@ pub struct ConfigFile {
     /// 网关会打 WARN（否则同样的排队超时会以更难查的形式复现）。0 = 用默认值。
     #[serde(default = "default_max_open_tunnel_streams")]
     max_open_tunnel_streams: u32,
+    /// 迁移期接受 legacy `Register`（归入 default）；默认 false。
+    #[serde(default)]
+    allow_legacy_agent_registration: bool,
     /// 客户端"完全停滞"多久就放弃（秒）：请求体读不动、或响应体客户端不消费。
     ///
     /// 为什么必须有：准入票据（`max_concurrent_requests` 那道闸）的释放挂在 Drop 上，
@@ -297,6 +300,7 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
             max_concurrent_requests: cfg.max_concurrent_requests,
             // 原样带过去：`0 → 默认值`的归一只有一处，在 `Options::stream_ceiling()`。
             max_open_tunnel_streams: cfg.max_open_tunnel_streams,
+            allow_legacy_agent_registration: cfg.allow_legacy_agent_registration,
         },
     })
 }

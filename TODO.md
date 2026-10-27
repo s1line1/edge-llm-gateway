@@ -13,6 +13,20 @@
 > 测试补齐、以及不改变对外行为的重构。判断标准：这一条的目的是"**让已有行为更正确/更可观测**"
 > （做）还是"**让网关多一个本事**"（不做）。新功能条目只做登记，不排期、不开工。
 
+## 2026-10-27 多租户（已实施）
+
+人工指示新增：tenant 拥有 API key 与 edge agent；key 只能路由到同 tenant 的 agent，
+`/v1/models` 按 tenant 过滤；tenant 级 rate/concurrency 与 usage 记账。
+- 默认 `default` tenant 承接旧 key/旧 agent；旧 agent 的 `Register` 只在
+  `allow_legacy_agent_registration: true` 的迁移窗口内接受。
+- 新 agent 使用 `RegisterWithTenant` + 一次性 `agent_token`；token 只存 sha256，一条 QUIC 连接
+  只属于一个 tenant；同 `agent_id`/来源 IP 在不同 tenant 下是两条独立条目。
+- Admin：`/admin/tenants` CRUD + agent-token rotate；keys/agents/usage 支持 `tenant_id` 过滤。
+- 明确未做（见计划 CON-004）：tenant 管理 Web 页面、tenant 级模型白名单、tenant 独立
+  admin 身份、每 tenant 独立库/进程。
+- 回归：storage tenant/migration、auth tenant rate/disabled、agent token、tenant routing/model
+  隔离、tenant concurrency、admin flow；完整 `make check-rust` 通过。
+
 ## P0 — 工具接入（DSH / Codex / Claude Code 直连）
 
 背景：cloud-gateway 需作为 DeepSeek Harness、Codex CLI、Claude Code 等工具的 LLM 后端。
@@ -500,9 +514,9 @@
 
 | 环节 | 位置 | 事实 |
 |---|---|---|
-| 发号 | `storage/hash.rs:116` | key 恒为 `sk-` + 24 随机字节（**192 位熵**）；`/admin/keys` 只收 `name`，**不存在"运维自己填 key"的入口**（`admin.rs:98`） |
-| 存储 | `storage/mod.rs:374` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
-| 校验 | `storage/mod.rs:350` → `hash.rs:94` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
+| 发号 | `storage/hash.rs:119` | key 恒为 `sk-` + 24 随机字节（**192 位熵**）；`/admin/keys` 只收 `name`，**不存在"运维自己填 key"的入口**（`admin.rs:98`） |
+| 存储 | `storage/mod.rs:155` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
+| 校验 | `storage/mod.rs:530` → `hash.rs:87` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
 | 缓存 | `storage/verified.rs:55` | `(lookup, cred_version)` 命中即跳过校验；有 TTL 与上限（`verified_cache_max: 1650`） |
 | 单飞 | `storage/verified.rs:73` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
 
@@ -627,7 +641,7 @@
             新 schema 里把 `heartbeat_secs` 放进 `Register`（或把 `agent_stale_secs` 放进注册回应）
             之后，这三样**应当删掉**，改按协议里的实际数值判断；那时连"只提醒、不拒绝"都可以升级成
             **拒注册**，因为不再是猜（`E2` 的 (a)/(b) 两个方案就并在这里，见复扫记录）。
-         ② **`E4` 现在不动**：`proto/src/io.rs` 的 `write_frame`（每帧两次分配、两次全长拷贝）正好住在
+         ② **`E4` 现在不动**：`proto/src/io/mod.rs` 的 `write_frame`（每帧两次分配、两次全长拷贝）正好住在
             第 3 步要重写的那一层上——postcard 的 `to_allocvec` 会换成 prost 的编码。在**会被替换**的
             代码上优化等于白花力气，等切换完成后照新编码重新评估（长度前缀那层大概率留着，实现要重写）。
          ③ **`P3-1`（ALPN 借用了 `h3`）与本次协议变更合并到同一轮**：两者都是"新旧不能混跑"的兼容性
@@ -758,7 +772,7 @@
       本次用 `rustup toolchain install 1.97.1 --profile minimal -c rustfmt,clippy` 装好（顺带被 rustup
       自己升级到 1.29.1），本地/CI/镜像三处现在都是 1.97.1（同一 commit `8bab26f4f`，验证基座不变）。
 
-- [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`crates/agent/src/lib.rs:573-575`），
+- [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`crates/agent/src/session.rs:265-267`），
       网关只打 debug 日志（`quic.rs:76-84`）。它是《⛔ 健康上报驱动的更精细路由》的前置数据：要么实现上报，
       要么删掉该字段（现在是死载荷，容易误导）。
 - [x] **重连退避无抖动（2026-09-22 已修）**：`run()` 现在给退避加 **±20% 抖动**
@@ -780,7 +794,7 @@
       现在**委托**给 `gen_certs_pem()`（CA 的 `key_usages` 取并集），两份 fixture 不再各自演化。
       原记录：`tests/e2e/common.rs` 的 `gen_certs`（`:24-82`）与
       `gen_certs_pem`（`:85-123`）逐行重复，CA 的 `key_usages` 一个 3 项、一个 2 项；全仓另有
-      23 处 `CertificateParams::default()` 的 PKI 脚手架（`agent/src/lib.rs:326-366`、
+      23 处 `CertificateParams::default()` 的 PKI 脚手架（`agent/src/tests/mod.rs:34-78`、
       `gateway/src/tls.rs:75-109`、`gateway/src/main.rs:76-100`、`agent/src/main.rs:75-99`、
       `registry.rs:212-255`、`quic.rs:103-125`）。抽一个共享 fixture。
 - [x] **重复逻辑（认证+限流这一半已修，2026-09）**：`proxy` 曾内联复制一份已封装的
@@ -841,14 +855,14 @@
       源码注释里**的审计标记。起因：我把 `//` 注释写在了 JSX **子节点位置**（那里它是文本），
       整段说明被渲染到了总览页上，而 `tsc` 与 `vite build` 都不会报错（见 PROJECT_SCAN P3-19）。
       它是启发式的（只抓这种标记），但把"这一类"变成了**构建即失败**；放进 `build` 脚本而不是
-      Makefile，是因为 CI 跑的是 `pnpm build`（`.github/workflows/ci.yml:90`），这样三处都覆盖。
+      Makefile，是因为 CI 跑的是 `pnpm build`（`.github/workflows/ci.yml:89`），这样三处都覆盖。
 
 ### 前端工程化（P3-21：三条工具已落地，下述条目为历史登记）
 
 - [x] **前端 lint / formatter / 测试（2026-09-26 复核：三样都已落地，本次只是对账）**：
       `web/` 现在有 **prettier**（`pnpm format:check`）、**oxlint**（`pnpm lint`，`--max-warnings 0`）、
       **vitest + @testing-library/react**（`pnpm test`，当前 35 条），CI 四步全覆盖
-      （`.github/workflows/ci.yml:89-99` 跑 format:check / lint / test / build）。与当初预案的差别：
+      （`.github/workflows/ci.yml:79-89` 跑 format:check / lint / test / build）。与当初预案的差别：
       lint 用的是 **oxlint** 而不是 `eslint` + `typescript-eslint`——零配置、更快，也省掉了"先定规则集"
       那一步。**原始登记（供对照）**：当时 `web/` 只有 `tsc` + `vite build` 两道，三样都要新增
       devDependencies、属本阶段冻结的"新依赖"，故先登记不实施；当时建议一次只加一件，并提醒 CI 的 node 是 22
@@ -919,10 +933,12 @@
 > 此后已经修掉；**本节只登记仍未修的**，避免同一件事在两处各维护一份。行号对应 `6609a8c`。
 
 - [ ] **R1 帧头固定自描述 + golden bytes 契约测试**：线格式仍是 `[u32 BE 长度][postcard 枚举]`，
-      帧类型 tag 就是**变体声明序号**（`crates/proto/src/io.rs:29-33`、`crates/proto/src/frame.rs:7-43`）
-      ——增删变体即破坏线格式，且没有 golden bytes 断言兜住。
+      帧类型 tag 就是**变体声明序号**（`crates/proto/src/io/mod.rs:29-33`、`crates/proto/src/frame.rs:7-43`）
+      ——增删变体即破坏线格式。**2026-10-27 已补**：`io::tests::all_frame_variants_have_stable_wire_bytes`
+      用 golden 字节逐字节钉住全部 8 个变体（含反解），"重排变体仍绿"的缺口已封；仍缺的是
+      **帧头自描述**（类型/长度在头部而不是靠变体序号）。
 - [ ] **R2 按帧类型分设长度上限**：`MAX_FRAME = 64 MiB` 硬编码，且按声明长度直接
-      `vec![0u8; len]`（`crates/proto/src/io.rs:11,54-62`）——敌意前缀声明 64 MiB 就真分配 64 MiB。
+      `vec![0u8; len]`（`crates/proto/src/io/mod.rs:11,54-62`）——敌意前缀声明 64 MiB 就真分配 64 MiB。
       目标：上限按帧类型分设，分配量对声明值不敏感（计数型分配器断言）。
 - [x] **R3 读路径合一（取消安全）（2026-09-22 完成）**：原状是两条读路径——`read_frame`
       （`read_exact` 包装、不可取消）与 `FrameReader`（可取消），而"在 `select!` 里必须用可取消
@@ -943,7 +959,7 @@
       （gateway lib 173、e2e 61、proto 24、agent 32、mock-llm 1+1）；e2e 里 `lifecycle` 那条
       "阶段变化落在帧中途"的用例（P3-26 先红后绿的护栏）继续通过。
 - [x] **R4 EOF 四格分明（2026-09-22 完成）**：`read_frame` 读 4 字节前缀时**任何
-      `UnexpectedEof` 都返回 `Ok(None)`**（`crates/proto/src/io.rs:47-53`）——1–3 字节的头部
+      `UnexpectedEof` 都返回 `Ok(None)`**（`crates/proto/src/io/mod.rs:47-53`）——1–3 字节的头部
       截断被当成干净关闭；`FrameReader` 那侧早就分清了（`io.rs:108-115`），于是同一条线上的
       同一段字节有两种解释。后果是把协议违规说成对端的有序收工：`forward` 侧记成
       `ForwardEnd::UpstreamClosed`（"upstream closed the stream early"）而不是读取错误，
@@ -958,7 +974,7 @@
 - [ ] **R6 "流即会话"可断言**：首帧必须是 `ProxyRequest`、后续帧 `request_id` 必须一致
       ——现在既无断言也无日志，不一致只会表现成"上游好像没在收流"。
 - [x] **R8 原子占位改 CAS（2026-09-22 完成）**：`Admission::try_enter` 原先是 `fetch_add` +
-  超限回滚（`crates/gateway/src/metrics.rs`），回滚前那一瞬间计数**比真实持票数多 1**（幽灵占位）；
+  超限回滚（`crates/gateway/src/metrics/mod.rs`），回滚前那一瞬间计数**比真实持票数多 1**（幽灵占位）；
   若持票者恰在这一刻释放，紧随其后的请求会读到 `prev >= limit` 而被拒——**闸门明明是空的**
   （"双双误拒"：客户端拿到本不该有的 429）。现在改成 **CAS 循环**：只在确实要到票时才加计数，
   因此 `active_count()` **恒等于**已发出的票数（顺带消掉 `hlmg_active_requests` 的瞬时尖峰，
@@ -992,7 +1008,7 @@
 - [ ] **R10 总时长上限**：`timeout_secs`（120s）是响应体**逐帧空闲**超时，没有整请求总时限
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
 - [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
-      （`crates/gateway/src/metrics.rs:529-533`）——"p99 变差"从求和值里看不出来。
+      （`crates/gateway/src/metrics/render.rs:119-124`）——"p99 变差"从求和值里看不出来。
 - [x] **R12 healthz 深度检查（2026-09-22 完成）**：`/healthz` 现在是真探针——
       **200 ⇔ 隧道入口仍在接受新 agent**（`hlmg_quic_accepting`），否则 `503` + `status:"degraded"`
       + `detail`（处置：重启网关）；body 改成 JSON，同时报 `agents.registered` /
@@ -1356,7 +1372,7 @@
 来源：2026-09-25 的全项目复扫（明细在 gitignored 的 `docs/PROJECT_SCAN_2026-09-25.md`）。
 本节只登记"修复已落地、但约定的测试仍没写成"的那一条；复扫里其余未修项不在这里重复。
 
-- [ ] **`B1`（唯一 agent 忙 ⇒ 429）约定的 e2e 没写成**：修复本身在——`pick()` 改成先判"有没有
+- [x] **`B1`（唯一 agent 忙 ⇒ 429）约定的 e2e 没写成**：修复本身在——`pick()` 改成先判"有没有
       候选"、再按 `exclude` 过滤，新增 `AcquireError::AllExcluded`，`rejection_response()` 把两种
       "忙"一起映射成 429 `agent at capacity` + 标签 `all-candidates-at-capacity`，两层都有单测
       且都做了变异验证。缺的是"单 agent + 忙"的端到端用例。下面记下**正确诊断**与**走过的弯路**，
@@ -1380,6 +1396,14 @@
         闸门先把它拦下来）、`tunnel_op_timeout = 1s`、并发 > 2。超出的那批会开流超时，而
         `inflight(> 2) ≥ min(0 → ceiling = 2)` ⇒ 判"忙"。若这条路仍不通，再上"额度很小的假
         peer"：只广告很小的 MAX_STREAMS，并且接受流之后**握着不放**。
+      **已修（2026-10-27，`test(e2e): cover single-agent open-timeout busy 429`）**：新增 `e2e_single_agent_open_timeout_busy_returns_429`；两条长 SSE 握住 `max_open_tunnel_streams=2`，第三个请求 1s 开流超时后走 `AllExcluded` → 429，连续 5 次通过。
+
+- [x] **`504-not-retried` 约定"响应头超时后不重试"的直接测试没写成**：代码在
+      `proxy/routing.rs` 只对开流/写帧失败重试，504 直接返回；缺的是"第二个上游没有收到请求"的
+      端到端证据。
+      **已修（2026-10-27，`test(e2e): assert head timeout is not retried`）**：新增
+      `e2e_head_timeout_is_not_retried`；两个 agent/mock 下 504 后两边 `/stats.requests` 总和只
+      增加 1，连续 3 次通过。
 
 ## 2026-09-26 全项目复扫（第二轮，六切片）
 
@@ -1391,13 +1415,15 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 ### 中危
 
-- [ ] **`S2-1` `ProxyResponseEnd.ok` 写了但没人读（上游中途断流被当成正常结束）**：
+- [x] **`S2-1` `ProxyResponseEnd.ok` 写了但没人读（上游中途断流被当成正常结束）**：
       `proto/src/frame.rs:67` 定义了 `ok`，agent 在上游响应体 `next()` 出错时置 `false` 并照发
       （`crates/agent/src/stream.rs:313,336`），而网关**两处**消费点都用 `{ .. }` 忽略它
       （`crates/gateway/src/proxy/forward.rs:406`、`head.rs:69`）⇒ 客户端拿到**语法完整**的 200 +
       半截 JSON / 没有 `[DONE]` 的 SSE，指标还记成 `upstream_end`（与真正常结束同标签）、用量按
       "已结束"结算。修法：`ok == false` 时走 `Frame::Error` 那条路（推错误项掐断响应体）。
       **复核**：我自己读了代码（全仓无 `ok` 读者）。
+      **已修（2026-10-27，`fix(proxy): emit an error signal for truncated upstream responses`）**：网关在 `ForwardEnd::UpstreamTruncated` 上独立记账；SSE 发 `event: error` 且不发 `[DONE]`，非 SSE 推错误项中止响应体。回归：`upstream_end_signal_distinguishes_truncation_from_completion` + `e2e_truncated_sse_is_not_reported_as_complete`。
+
 - [ ] **`S2-2` 关停时非 SSE 的在途响应没有任何"不完整"信号**：
       `forward.rs:284-318` 里只有 `is_stream` 分支写 `event: error`；非 SSE 直接
       `tunnel_cancel + send.finish()` ⇒ 同样给客户端一个"完整"的截断体（`content-length` 是逐跳头、
@@ -1405,27 +1431,33 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       记为已完成，但代码没有任何客户端可见的截断信号，e2e 也只钉了 SSE
       （`tests/e2e/lifecycle.rs` 的 `e2e_shutdown_announces_incomplete_sse_instead_of_cutting`）。
       **复核**：我自己读了代码。
-- [ ] **`S2-3` "唯一能服务该模型的 agent 正忙"被报成 404（应 429）**：
+- [x] **`S2-3` "唯一能服务该模型的 agent 正忙"被报成 404（应 429）**：
       忙（`Disposition::Transient`）刻意不写 `last_failure`（`routing.rs:188-194`），但重试时
       `pick()` 是"**先按 exclude 过滤、再按 model 过滤**"（`registry.rs:360-371`）⇒ 唯一服务该模型
       的候选被 exclude 后，模型过滤滤空 → `AcquireError::NoModel` → **404 `model not found on any
       agent`** + 标签 `no-agent-serves-model`，把"该扩容"说成"没人声明这个模型"（SDK 也不会按 429
       退避重试）。`B1` 的修复只覆盖了"候选全被 exclude"那一格（`AllExcluded` → 429）。
       触发：异构 edge（A 只声明 qwen、B 只声明 llama）+ A 到达流额度。**复核**：我自己读了代码。
-- [ ] **`S2-4` key id 只有 32 位，且 `create` 用 `INSERT OR REPLACE`：撞 id 时静默删掉另一把 key 的库行**：
+      **已修（2026-10-27，`fix(registry): report busy model agents as capacity`）**：`pick()` 在 exclude 前记录 `has_model_candidate`；模型候选被全部排除时返回 `AllExcluded`（429），只有确实没有该模型时才 `NoModel`（404）。回归：`heterogeneous_pool_reports_all_excluded_when_sole_model_agent_is_excluded` + `no_model_still_reports_no_model`。
+
+- [x] **`S2-4` key id 只有 32 位，且 `create` 用 `INSERT OR REPLACE`：撞 id 时静默删掉另一把 key 的库行**：
       `storage/hash.rs:119-127` 把 4 个随机字节格式化成 8 位十六进制；这条 id 同时是主键、吊销的键
       与用量归因的键（`storage/mod.rs:388` 的 `INSERT OR REPLACE`，无碰撞检查/重试）。生日碰撞：
       1 万把 key ≈1.2%、6.5 万把 ≈39%。后果：旧 key 的库行被销毁（内存里两把都还在、继续放行，
       重启后旧 key 静默 401）、`delete(id)` 会一次吊销两把、两把用量并进同一行。**修法要单独定**
       （扩 id 位数是库/接口层面的变化）。**复核**：我自己读了代码；子代理另用 `sqlite3 :memory:`
       跑了同形语句复现"旧行被删"。
-- [ ] **`S2-5` `key_usage` 载入失败降级成空账本 + flush 写绝对值 ⇒ 覆盖库里已累计的用量**：
+      **已修（2026-10-27，`fix(storage): make key ids collision-safe`）**：新 id 为 128 位（32 位十六进制）；`create` 改为普通 `INSERT` + 最多 3 次唯一冲突重试，不再 `INSERT OR REPLACE`；旧 8 字符 id 仍可载入。回归：`generate_id_key_format` + `duplicate_id_insert_is_rejected_not_replaced` + `eight_character_legacy_id_still_loads`。
+
+- [x] **`S2-5` `key_usage` 载入失败降级成空账本 + flush 写绝对值 ⇒ 覆盖库里已累计的用量**：
       `storage/usage.rs:106-122` 载入失败只 `warn!` + 空 `HashMap`（凭据侧同位置是记 failure 并让
       启动 fail-fast），而 upsert 写的是 `excluded.prompt_tokens`（`:238`）⇒ 之后第一次 flush 就把
       库里原有的大数值覆盖成重启后的小数值，**抹掉历史**（不是"少记一段"）。触发：任何让这条
       SELECT 失败但写仍可用的状态（某行列被写成 TEXT、页损坏等）；`for row in rows { row? }` 还会
       因一行坏而丢弃整次载入。`TODO` 曾把"告警 + 空账本继续"定性为刻意不改，但**没有覆盖这个
       覆盖后果**，需重新确认。**复核**：我自己读了代码；子代理跑了同形 UPSERT 复现覆盖。
+      **已修（2026-10-27，`fix(storage): preserve usage rows when load fails`）**：`key_usage` 载入失败时 `UsageStore::has_db=false`，本进程禁用落库并 `error!`，旧行不再被绝对值 upsert 覆盖。回归：`usage_load_failure_disables_persistence`。
+
 - [ ] **`S2-6` 指标页把 `hlmg_agents`（含心跳过期）当"在线 Agents"，与同屏侧边栏矛盾**：
       `web/src/pages/MetricsPage.tsx:82`（卡片标题"在线 Agent 数"、副标题"已注册 agent 数"）
       用的是 `latest.agents`，而 `Layout.tsx:78` 用 `agents_healthy`。G1/P3-19 修了
@@ -1450,10 +1482,12 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       但标签 `all-candidates-at-capacity` 来自 `routing.rs:270-281`，客户端拿到的是 **429
       `agent at capacity`**。同类问题在 `hlmg_tunnel_retries_total` 上已按 C2-5 修过，这一族漏了。
       **复核**：我自己读了 HELP 与映射两侧。
-- [ ] **`S2-10` `Connection` 头点名的字段不会被剥离**：`proto/src/headers.rs:38-40` 的谓词只收
+- [x] **`S2-10` `Connection` 头点名的字段不会被剥离**：`proto/src/headers.rs:38-40` 的谓词只收
       **头名**，全仓没有任何调用点读 `Connection` 的取值（RFC 9110 §7.6.1 要求连它点名的字段一起
       删）⇒ 客户端/前置反代用 `Connection: X-Client-Cert` 标成单跳的头会一路进隧道、可能进上游的
       鉴权分支或日志。**复核**：我自己 grep 了全仓（无读者）。
+      **已修（2026-10-27，`fix(headers): strip connection-named fields and x-api-key`）**：新增 `connection_tokens`/`is_connection_named`/`is_forwardable`，网关请求、agent 请求、agent 响应、网关响应四处都剥离 `Connection` 点名字段；`x-api-key` 加入凭据头。回归：`connection_tokens_and_named_fields`、`x_api_key_is_a_client_credential`、`filter_headers_strips_connection_named_fields_and_x_api_key`、`connection_named_response_fields_are_not_forwarded`。
+
 - [x] **`S2-11` `build-release.sh` 四个目标全被跳过时仍报成功**：`scripts/build-release.sh:49-54`
       只在 `failed` 非空时退出 1；全 `continue` 时 `built` 为空也会打印"完成（0 个目标），产物在
       dist/"并 exit 0（rustup 不在 PATH 时必然如此），dist/ 是空的。H1-6 只修了"第一个失败吞掉
@@ -1493,15 +1527,15 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       与 `openai.rs:22-24` 承诺的"网关自己产生的错误全局一致"不符。
 - [ ] **`S2-18` `待核` `open_timeout_is_fatal` 传的是**本地**流上限而非 `min(本地, 对端)`**：
       `routing.rs:130-134` 传 `state.max_open_tunnel_streams`（默认 1024），而 agent 只广告 1000
-      （`agent/src/lib.rs:342`）⇒ `max_concurrency: 0`（文档语义"不限"）的 agent 在 inflight
+      （`agent/src/session.rs:82`）⇒ `max_concurrency: 0`（文档语义"不限"）的 agent 在 inflight
       落在 [1000, 1024) 时会被判**死**（`inflight < effective` 为假以外的分支）而不是"忙"，
       连续 3 次即摘除 → 全量 503。
 - [ ] **`S2-19` `待核` `run_loop_handles_clean_disconnect` 的夹具到不了它声称的 Ok 分支**：
-      用的是把 acceptor 丢掉的 `test_server`（`agent/src/tests.rs:361` 的 `test_server`），register 永远等不到
+      用的是把 acceptor 丢掉的 `test_server`（`agent/src/tests/mod.rs:138` 的 `test_server`），register 永远等不到
       半关 ⇒ 走的是 Err 分支；断言只有"900ms 后任务还活着"，把 Ok 分支删掉也不会红。
 - [ ] **`S2-20` `待核` `TODO` 的 R2 描述与实现不符**：R2 说读帧"按声明长度直接分配 64 MiB"，
       但那条 `read_frame` 已在 R3 删除，唯一路径 `FrameReader` 只把声明值记进 `want`、缓冲区随
-      **真实到达**字节增长，且 `len > MAX_FRAME` 在载荷到达前就拒绝（`proto/src/io.rs:93,105-111`）。
+      **真实到达**字节增长，且 `len > MAX_FRAME` 在载荷到达前就拒绝（`proto/src/io/mod.rs:93,105-111`）。
 - [ ] **`S2-21` `待核` `DESIGN` 的 `cred_generation` 缓存失效只存在于文档**：DESIGN 写"命中条件是
       `cred_version == 当前代次`、变更即 bump 失效"，而代码里 `cred_generation` **只写不读**
       （`storage/mod.rs:324-329,452`），库里 `cred_version` 恒为列默认值（`create` 不写该列）；
@@ -1610,7 +1644,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 - **现状（代码事实）**：`pick()`（`crates/gateway/src/registry/routing.rs:38-75`）的候选排序是
   **精确声明 model 优先 → `inflight` 最少 → 心跳最新**，其中唯一的"负载"信号是**网关自己数的
   在途请求数**（`Entry.inflight`）。协议里留了位置但**恒为 0**：`Frame::Heartbeat { inflight }`
-  的构造点写死 `inflight: 0`（`crates/agent/src/lib.rs:573-575`，`TODO.md:759` 已登记该空洞）。
+  的构造点写死 `inflight: 0`（`crates/agent/src/session.rs:265-267`，`TODO.md:759` 已登记该空洞）。
 - **为什么不够**：等长请求下 `inflight` 是"最少负载"的合理近似；一旦长短混合（agentic /
   长上下文），两个副本的 `inflight` 可以相同而 KV 池余量天差地别——此时"最少 inflight"会把
   新请求送到**最可能触发抢占 / 重算**的那个副本，TTFT 反而更差（这正是"模型网关"与
@@ -1636,7 +1670,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 - **现状（代码事实）**：路由意义上的"健康"只有两条——心跳不 stale（`agent_stale_secs`）
   与隧道可用；**上游引擎自己死没死完全不参与路由**。上游不可达时 agent 回 `Frame::Error{code:502}`
-  （有专门规格：502 且消息**不含内网地址/端口**，`crates/agent/src/tests.rs:1482`（`an_unreachable_upstream_reports_a_generic_502_and_a_contextual_error`）），
+  （有专门规格：502 且消息**不含内网地址/端口**，`crates/agent/src/tests/upstream.rs:85`（`an_unreachable_upstream_reports_a_generic_502_and_a_contextual_error`）），
   网关把该状态码透传给客户端（`proxy/head.rs:126`，空流/隧道读失败另回落 502，
   `proxy/head.rs:90,133`）——但**后续请求照旧路由到同一个副本**，直到有人手动改配置。
 - **要做**：① 按**错误分类**做**副本级短熔断**（连接拒绝 / 握手失败 / 5xx 分档，与业务 4xx
@@ -1696,7 +1730,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 - **现状**：`hlmg_request_duration_ms` **只有求和值、没有直方图**（`TODO.md:992` R11），
   `hlmg_requests_total` 唯一的 label 是 `status`；**没有首字时间（TTFT）与每输出 token 时间
-  （TPOT）**，agent 侧也没有首字打点（`crates/gateway/src/metrics.rs` 里只有 `total_duration_ms`）。
+  （TPOT）**，agent 侧也没有首字打点（`crates/gateway/src/metrics/mod.rs` 里只有 `total_duration_ms`）。
 - **要做**：TTFT **在网关转发路径上就能测**（"响应头之后第一个非空 delta / 首块"），
   **不需要引擎配合**；TPOT = (总时长 − TTFT) / 输出 token（输出 token 已有，来自 `usage_meter`）；
   指标加 `model` 维度 label（model 是**有限枚举**、基数可控；**别**把 key / user 当 label）。
@@ -1720,7 +1754,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 ### 顺手记下的文档漂移（本次一并修掉）
 
-- `TODO.md:759` 的指针原写 `agent/src/lib.rs:136-140`，构造点其实在 **`crates/agent/src/lib.rs:573-575`**
+- `TODO.md:759` 的指针原写 `agent/src/lib.rs:136-140`，构造点其实在 **`crates/agent/src/session.rs:265-267`**
   （`:136-140` 现为 `wait_for_abnormal_exit`）。**成因**：该条写于 `a410472`（2026-09-11），当时
   `:136` 确实是构造点；此后这个文件从 570 行长到 2935 行，指针原地不动就漂了。
 - `TODO.md:248` 原引用"本文件**「容量感知路由」那条**"，而 TODO 里没有同名条目——已改指真实条目
@@ -1842,8 +1876,8 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       的既有纪律（同 `crates/gateway/src/registry/table.rs:432` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），
       但**判据是连接级失败，不是上游 404**——404 的意思是"这个模型不存在"，误当"后端坏"会熔断
       一个健康后端。
-      **本机闸门按后端各一个**（今天是**一个全局** `Semaphore`，`crates/agent/src/lib.rs:280`
-      与 `:292`），声明值 = 各后端之和：那个闸门存在的意义就是"别把一台**机器**打爆"，而池里
+      **本机闸门按后端各一个**（今天是**一个全局** `Semaphore`，`crates/agent/src/gate.rs:38-46`
+      与 `:43`），声明值 = 各后端之和：那个闸门存在的意义就是"别把一台**机器**打爆"，而池里
       每台是独立机器，一个全局信号量会让一台慢后端占住其他后端的额度。
       **刻意不新增配置旋钮**：多后端时 `models` 缺省取各后端 `models` 的**并集**，从既有字段推导。
       **待定**：① 只做拓扑 A 还是 A+B 都要；② 本机闸门全局 vs 按后端；③ `models` 缺省推导

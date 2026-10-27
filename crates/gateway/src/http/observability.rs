@@ -37,6 +37,8 @@ use tracing::{debug, error, info};
 
 use crate::state::AppState;
 
+use super::admission::RouteClass;
+
 /// 记录请求状态码与耗时（/metrics 自身不计入），并为每个请求确定 id：
 /// 隧道 `request_id` 取自 `crate::request_id`（与响应头、日志同一数字），
 /// 写进入站 headers 供 `proxy` 复用；响应头另有回显客户端原值的规则（见实现）。
@@ -89,7 +91,7 @@ pub(super) async fn request_id_middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
-    if req.uri().path() == "/metrics" {
+    if !RouteClass::of(req.uri().path()).logs_access() {
         return next.run(req).await;
     }
     // 隧道 id 与 HTTP 层共用一个计数器（crate::request_id），并**规范化写回入站 headers**：
@@ -298,7 +300,7 @@ mod tests {
     async fn concurrent_request_limit_rejects_with_429() {
         // max_concurrent_requests=1：先人为占住 1 个在途 → 第二个请求 429
         let mut state = test_state(None);
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let metrics = state.metrics.clone();
         let router = app(state);
 
@@ -359,7 +361,7 @@ mod tests {
     #[tokio::test]
     async fn healthz_is_exempt_from_the_admission_gate() {
         let mut state = test_state(None);
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let metrics = state.metrics.clone();
         let router = app(state);
 
@@ -509,7 +511,7 @@ mod tests {
     async fn an_aborted_request_is_counted_so_the_zombie_identity_holds() {
         let mut state = test_state(None);
         state.admin_token = Some("admin".into());
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let router = app(state.clone());
 
         // 5ms 放弃 vs `/admin/keys` 里的真 argon2（10–30ms，本模块不装 CheapArgon2）：
@@ -555,7 +557,7 @@ mod tests {
     async fn aborted_request_does_not_leak_concurrency_slot() {
         let mut state = test_state(None);
         state.admin_token = Some("admin".into());
-        state.max_concurrent_requests = 1;
+        state.policy.max_concurrent_requests = 1;
         let router = app(state);
 
         // /admin/keys 的 handler 会 parked 在 spawn_blocking(argon2)（约 10-30ms），

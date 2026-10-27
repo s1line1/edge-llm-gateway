@@ -154,6 +154,11 @@ max_concurrent_requests: 32
 # max_concurrency 做准入控制，所以给大不会放大并发，也不会放大内存。
 max_open_tunnel_streams: 1024
 
+# 迁移期开关：接受不带 tenant 的 legacy `Register`，归入内置 `default` tenant。
+# **生产默认 false**；只有升级旧 agent 时临时设为 true，迁移完成后必须改回 false，
+# 否则任何持证书的旧 agent 都能进入 default tenant。
+# allow_legacy_agent_registration: false
+
 # 公网入口 HTTPS 证书（提供后公网入口启用 TLS，客户端用 https:// 访问；
 # 与 tls_key 成对，去掉即明文 HTTP）
 # tls_cert: /etc/home-llm-gateway/server.crt

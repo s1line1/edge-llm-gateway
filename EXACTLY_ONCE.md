@@ -4,7 +4,7 @@
 > ⛔ 另外它属**新功能 + 帧协议不兼容变更**：按 `TODO.md` 顶部的阶段约定（这一阶段只还技术债、
 > 修 bug），本轮**不排期、不开工**；留档是为了不丢掉设计（2026-09-22 标注）。
 > 相关实现：`crates/gateway/src/proxy/routing.rs`（重试循环，`MAX_TUNNEL_ATTEMPTS`）、`crates/agent/src/stream.rs`（帧处理）、
-> `crates/proto/src/io.rs`（帧读写）。
+> `crates/proto/src/io/mod.rs`（帧读写）。
 
 ## 1. 为什么要做
 
@@ -38,7 +38,7 @@
 
 | 事实 | 位置 | 对设计的意义 |
 |---|---|---|
-| 帧格式 `[u32 长度][postcard 载荷]`；agent 先读满整帧再动上游 | `proto/src/io.rs`、`agent/src/stream.rs` | **建立阶段失败必然"未送达"**——这是现有重试安全性的根据，也是本设计不必覆盖的区间 |
+| 帧格式 `[u32 长度][postcard 载荷]`；agent 先读满整帧再动上游 | `proto/src/io/mod.rs`、`agent/src/stream.rs` | **建立阶段失败必然"未送达"**——这是现有重试安全性的根据，也是本设计不必覆盖的区间 |
 | agent 每条流一个任务，读到 `ProxyRequest` 后才构造上游 HTTP 请求 | `agent/src/stream.rs` | 去重表的插入点就在"读到完整帧之后、调用上游之前" |
 | `Cancel` 帧通过 watch 通道触发上游取消 | `agent/src/stream.rs` | 去重命中"等待复用"时要与取消联动（见 §4.5） |
 | 请求体在网关侧已整包在手（`Bytes`） | `gateway/src/proxy/mod.rs` | 重放不需要重新读客户端 |

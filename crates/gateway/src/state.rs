@@ -20,25 +20,66 @@ use tokio::sync::watch;
 
 use crate::metrics::Metrics;
 use crate::options::Options;
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{RateLimiter, TenantRateLimiter};
 use crate::registry::Registry;
 use crate::storage::Storage;
+use crate::tenant_limits::TenantLimiter;
 use crate::ui::{resolve_ui, IndexHtml};
 
-/// 关闭阶段。`Running` → `Draining` → `Terminating`，只向一个方向走。
+// 关闭阶段的所有权在 `crate::shutdown`（唯一发送端 + 单向推进 + 等待窗口）。
+// 这里只把类型再导出：既有 `crate::state::ShutdownPhase` 导入路径不变。
+pub use crate::shutdown::ShutdownPhase;
+
+/// 请求路径上的运行时策略：从 [`Options`] 投影一次，不含身份材料/UI/存储配置。
 ///
-/// `Gateway::shutdown` 推进它（发送端由 `Gateway` **独占**，见 `AppState::shutdown_sender`），
-/// 三类消费者：
-/// - **accept 循环**（`http/entry.rs`）：`Draining` 起停止接受新连接，但在途请求继续跑；
-/// - **每条在途响应**（`proxy/forward.rs`）：`Terminating` 起带一个明确的"不完整"事件收尾，
-///   而不是被硬切；
-/// - **每连接任务**：只关心**发送端消失**（= `Gateway` 被 drop），见
-///   `state::until_gateway_is_gone`——那条路径等于"硬停"，与阶段推进不是一回事。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ShutdownPhase {
-    Running,
-    Draining,
-    Terminating,
+/// 为什么单独成类型（核心评估 C2）：这些值原先由 `AppState::new` 逐个手抄到 10 个 `pub` 字段，
+/// 新增一个旋钮要改 5 处，漏抄一个不会编译失败。现在投影只发生在 [`RequestPolicy::from_options`]，
+/// `AppState` 只持一个 `policy`；handler 通过 `state.policy.*` 读到的是同一份派生值。
+#[derive(Debug, Clone, Copy)]
+pub struct RequestPolicy {
+    /// 单次请求转发空闲超时（逐帧）。SSE 长流靠“有帧就不超时”活着。
+    pub request_timeout: Duration,
+    /// 心跳过期阈值：注册表据此判断“还能不能路由”。
+    pub agent_stale_after: Duration,
+    /// 隧道控制操作超时（打开流 / 发送请求头 / 取消帧）。
+    pub tunnel_op_timeout: Duration,
+    /// 等待上游响应头（首字节）的超时。
+    pub head_timeout: Duration,
+    /// 摘除一条连接后，等它在途请求收尾的宽限。默认与 `head_timeout` 相等；配得更短时
+    /// `Gateway::start` 会 WARN（仍在合法等响应头的请求会被宽限掐断）。
+    pub evict_close_grace: Duration,
+    /// 「响应头静默」判据里对端还在说话时的静默容忍上限。
+    pub head_silent_grace: Duration,
+    /// 客户端停滞阈值：请求体/响应体两个方向“完全没动静”多久就放弃。
+    pub client_stall: Duration,
+    /// 响应头超时的“忙/死”判据窗口：由 `head_timeout × 4` 派生，不单独设旋钮。
+    pub head_alive_window: Duration,
+    /// HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门）。
+    pub max_concurrent_requests: u32,
+    /// 每条 agent 连接允许的同时在途隧道流数（**网关这一侧**的上限）。
+    ///
+    /// **语义边界（S2-18，待核）**：这是本地上限，不是 `min(本地, 对端广告)`；两者不等时
+    /// `max_concurrency == 0` 的 agent 在 `[对端, 本地)` 区间会被判“死”而不是“忙”。
+    pub max_open_tunnel_streams: u32,
+}
+
+impl RequestPolicy {
+    /// 唯一的投影点：`Options` → 请求路径策略，两个派生量（`head_alive_window` /
+    /// `stream_ceiling()`）也在这里算。新增旋钮只改这里与 `Options`/`config`。
+    fn from_options(opts: &Options) -> Self {
+        Self {
+            request_timeout: opts.request_timeout,
+            agent_stale_after: opts.agent_stale_after,
+            tunnel_op_timeout: opts.tunnel_op_timeout,
+            head_timeout: opts.head_timeout,
+            evict_close_grace: opts.evict_close_grace,
+            head_silent_grace: opts.head_silent_grace,
+            client_stall: opts.client_stall,
+            head_alive_window: opts.head_alive_window(),
+            max_concurrent_requests: opts.max_concurrent_requests,
+            max_open_tunnel_streams: opts.stream_ceiling(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -47,51 +88,11 @@ pub struct AppState {
     pub store: Storage,
     /// Admin token（None 表示不启用 /admin/*）。
     pub admin_token: Option<String>,
-    pub timeout: Duration,
-    pub agent_stale_after: Duration,
-    /// 隧道控制操作超时（打开流 / 发送请求头 / 取消帧）。见 [`crate::Options`] 的说明。
-    pub tunnel_op_timeout: Duration,
-    /// 等待上游响应头（首字节）的超时。见 [`crate::Options`] 的说明。
-    pub head_timeout: Duration,
-    /// 摘除一条连接后，等它在途请求收尾的宽限。见 [`crate::Options::evict_close_grace`]。
-    ///
-    /// 透传给 `registry::Registry::evict`。与 `head_timeout` 的大小关系是**刻意保留**的：
-    /// 默认与 `head_timeout` **相等（都是 15s，2026-09 由 5s 上调）**，于是"仍在合法等响应头"
-    /// 的那类在途请求不会被宽限掐断；把它配得更短时启动会 WARN（见 `Gateway::start`）。
-    /// 这个值该调到多少是策略决策（见评估报告 §5 H1），本字段只负责让它可配、可回滚。
-    pub evict_close_grace: Duration,
-    /// 「响应头静默」判据里对端还在说话时的静默容忍上限。见 [`crate::Options::head_silent_grace`]。
-    pub head_silent_grace: Duration,
-    /// 客户端停滞阈值：请求体/响应体两个方向"完全没动静"多久就放弃。
-    /// 见 [`crate::Options::client_stall`]——没有它，在途请求会永久占住准入槽位。
-    pub client_stall: Duration,
-    /// 响应头超时的"忙/死"判据窗口：这么久内有过成功响应头，就只是"慢"。
-    ///
-    /// 由 `head_timeout` 派生（4 倍），不单独设配置项：它表达的是"连续 4 个响应头超时窗口
-    /// 一次都没回过"——到这个程度就不再是"排队慢"了（见 `registry::Entry::head_timeout_is_fatal`）。
-    pub head_alive_window: Duration,
+    /// 请求路径策略（超时、并发上限、流额度）；派生只在 [`RequestPolicy::from_options`]。
+    pub policy: RequestPolicy,
     pub rate_limiter: Option<RateLimiter>,
-    /// HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门）。
-    pub max_concurrent_requests: u32,
-    /// 每条 agent 连接允许的同时在途隧道流数（QUIC 双向流额度），**网关这一侧**的上限。
-    ///
-    /// **唯一用途**：开流超时时区分"忙"（额度排满、只是排队）与"死"——`proxy/routing.rs` 把它
-    /// 交给 `registry::Entry::report_open_timeout`，后者在 agent 声明 `max_concurrency == 0`
-    /// （不限）时拿它当有效上限（见 `registry.rs` 的 `open_timeout_is_fatal`）。
-    ///
-    /// **它不参与绑 QUIC 端点**（原先的文档在这里写错了）：端点额度用的是
-    /// [`crate::Options::stream_ceiling`]——`listen.rs` 的
-    /// `with_max_open_local_bidirectional_streams`，accept 循环那处也直接用 `opts.stream_ceiling()`，
-    /// 两条路径都不经过 `AppState`。之所以这个值还要进 `AppState`，只是因为"忙/死"判定发生在
-    /// **请求路径**上，而请求路径上只有 `AppState`（`Options` 在 `Gateway::start` 里已被拆开、
-    /// 不进 Router）。
-    ///
-    /// **语义边界（复扫 `S2-18`，待核）**：这是**本地**上限，**不是**本条连接的有效额度——有效额度
-    /// 是 `min(本地, 对端广告)`（agent 侧广告 1000）。两者不等时（例如网关默认 1024），
-    /// `max_concurrency == 0` 的 agent 在途落在 `[1000, 1024)` 会被判成"死"而不是"忙"，
-    /// 连续 3 次即摘除连接。修那条时要先决定：把对端额度也带进来，还是把这里的语义写成
-    /// "本地上限"并据此调整判据。
-    pub max_open_tunnel_streams: u32,
+    pub tenant_rate_limiter: TenantRateLimiter,
+    pub tenant_limiter: TenantLimiter,
     pub metrics: Metrics,
     /// React UI 静态目录（None = `/` 显示构建提示页）。
     pub ui: Option<PathBuf>,
@@ -104,22 +105,11 @@ pub struct AppState {
     /// `ui_dir` 不可用的具体原因（None = 没配 ui_dir，或配了且可用）。
     /// 由启动时 [`resolve_ui`] 判定后写入，占位页会把它显示出来——否则用户只看到白屏/通用文案。
     pub ui_problem: Option<String>,
-    /// 关闭阶段的广播端。见 [`ShutdownPhase`]：`Gateway` 发，accept 循环与在途响应任务收。
+    /// 关闭阶段的接收端：查询与订阅都从这里出发。
     ///
-    /// **`Option`，而且是 `AppState` 里唯一的一份**（复扫 D5）：`Gateway::start` 通过
-    /// [`AppState::shutdown_sender`] 把它**取走**（`take()`），此后 `AppState`——以及它被克隆
-    /// 进每条连接任务的那份——只剩接收端。这条不变量很要紧：`watch` 通道在**最后一个发送端
-    /// 被 drop** 时才让接收端看到 `Err`，而如果 `AppState` 也留着一个发送端，那么它会被
-    /// "每条连接任务手里的 Router"钉活 ⇒ `drop(Gateway)` 之后谁都不会看到通道关闭，
-    /// 在途转发任务不会收尾、已接受的连接要挂到 `client_stall`（默认 60s）。
-    ///
-    /// **刻意私有**（评估 §2 S3）：推进阶段是**进程生命周期**的能力，只有 `Gateway` 该有。
-    /// 外部拿到一个 `AppState` 只能 [`AppState::shutdown_phase`] 查询、
-    /// [`AppState::subscribe_shutdown`] 订阅——`pub` 的 `watch::Sender` 等于把"停服"
-    /// 交给每一个持有者。发送端只经 `pub(crate) fn shutdown_sender` **取走一次**。
-    shutdown_tx: Option<watch::Sender<ShutdownPhase>>,
-    /// 同一个通道的接收端：查询与订阅都从这里出发，所以发送端被取走之后
-    /// [`AppState::shutdown_phase`] / [`AppState::subscribe_shutdown`] 照旧可用。
+    /// **发送端不在本结构里**（`shutdown::Controller` 由 `Gateway` 独占）：`AppState` 的克隆
+    /// 因此不可能把 `watch` 通道钉活；`Controller` 被 drop（= `Gateway` 没了）时，所有接收端
+    /// 看到 `Err`，`shutdown::wait_closed` 据此硬停连接。
     shutdown_rx: watch::Receiver<ShutdownPhase>,
 }
 
@@ -132,12 +122,17 @@ impl AppState {
     ///
     /// `ui_dir` 的可用性判定（[`resolve_ui`]）也在这里：它是**非致命**的启动自检，
     /// 不通过就降级成占位页，并把原因交给页面自己显示。
-    pub fn new(registry: Registry, store: Storage, metrics: Metrics, opts: &Options) -> Self {
+    pub fn new(
+        registry: Registry,
+        store: Storage,
+        metrics: Metrics,
+        opts: &Options,
+        shutdown_rx: watch::Receiver<ShutdownPhase>,
+    ) -> Self {
         let (ui, ui_problem) = resolve_ui(opts.ui_dir.as_deref());
         let ui_index = ui
             .as_ref()
             .map(|dir| IndexHtml::new(dir.join("index.html")));
-        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::Running);
         Self {
             registry,
             store,
@@ -157,26 +152,32 @@ impl AppState {
                 .admin_token
                 .as_deref()
                 .map(|token| token.trim_matches([' ', '\t', '\r', '\n']).to_owned()),
-            timeout: opts.request_timeout,
-            agent_stale_after: opts.agent_stale_after,
-            tunnel_op_timeout: opts.tunnel_op_timeout,
-            head_timeout: opts.head_timeout,
-            evict_close_grace: opts.evict_close_grace,
-            head_silent_grace: opts.head_silent_grace,
-            head_alive_window: opts.head_alive_window(),
-            client_stall: opts.client_stall,
+            policy: RequestPolicy::from_options(opts),
             rate_limiter: RateLimiter::new(opts.rate_limit_per_min),
-            max_concurrent_requests: opts.max_concurrent_requests,
-            max_open_tunnel_streams: opts.stream_ceiling(),
+            tenant_rate_limiter: TenantRateLimiter::new(),
+            tenant_limiter: TenantLimiter::new(),
             metrics,
             ui,
             ui_index,
             ui_problem,
-            // 关闭通道由 `AppState` 建、**发送端交给调用方**（`Gateway`）取走：接收端各自
-            // `subscribe()`，所以起始的接收端留着做查询即可（见字段文档里那条不变量）。
-            shutdown_tx: Some(shutdown_tx),
             shutdown_rx,
         }
+    }
+
+    /// 测试专用：没有 `Gateway` 推进关闭，但需要一个**保持打开**的接收端。
+    ///
+    /// 这里泄漏一个 `watch::Sender`（`mem::forget`），让通道不会在测试中途关闭；生产路径
+    /// 只走 [`AppState::new`]（发送端由 `Gateway` 的 `shutdown::Controller` 独占）。
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        registry: Registry,
+        store: Storage,
+        metrics: Metrics,
+        opts: &Options,
+    ) -> Self {
+        let (tx, rx) = watch::channel(ShutdownPhase::Running);
+        std::mem::forget(tx);
+        Self::new(registry, store, metrics, opts, rx)
     }
 
     /// 当前关闭阶段（只读）。给"探针要不要报不健康"这类判断用。
@@ -189,47 +190,20 @@ impl AppState {
     pub fn subscribe_shutdown(&self) -> watch::Receiver<ShutdownPhase> {
         self.shutdown_rx.clone()
     }
-
-    /// 把关闭通道的发送端**取走**：只给进程生命周期（`Gateway`）。
-    ///
-    /// `pub(crate)` 而不是 `pub`：拿不到发送端就推不动阶段，这正是收窄后的契约
-    /// （见字段文档与评估 §2 S3）。`&mut self` + `take()` 而不是克隆，是复扫 D5 的要害：
-    /// **发送端全仓只有一份**，"所有接收端看到 `Err`" 才真正等于"`Gateway` 没了"。
-    ///
-    /// 取第二次是代码错误（一个进程只有一个 `Gateway` 推进关闭阶段），所以 `.expect` 而不是
-    /// 静默返回一个新的：静默克隆会把刚刚建立的不变量又破掉。
-    pub(crate) fn shutdown_sender(&mut self) -> watch::Sender<ShutdownPhase> {
-        self.shutdown_tx
-            .take()
-            .expect("shutdown_sender 只能取一次（只有 Gateway::start 该取）")
-    }
-}
-
-/// 等到关闭通道**关闭**：也就是持有唯一发送端的 `Gateway` 被 drop。
-///
-/// 与 [`ShutdownPhase`] 的推进**不是一回事**，两个方向都不能混：
-/// - `Draining` 只停 accept，已建立的连接要继续服务在途请求；
-/// - `Terminating` 之后还有 `END_EVENT_WINDOW` 让在途响应把"不完整"事件真的写出去。
-///
-/// 只有"发送端没了"才意味着网关对象已经不在了、连接没有继续存在的理由（复扫 D5：
-/// `Drop for Gateway` 承诺 abort 所有任务，而它只能 abort 那三个主任务句柄）。
-/// `watch::Receiver::changed()` 在阶段变化时返回 `Ok`、在**所有发送端消失**后返回 `Err`，
-/// 所以这个循环只在后者退出。返回后接收端仍可 `borrow()` 到最后一个阶段值，只是没有
-/// 任何东西会再改它。
-pub(crate) async fn until_gateway_is_gone(rx: &mut watch::Receiver<ShutdownPhase>) {
-    while rx.changed().await.is_ok() {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shutdown;
 
-    fn state() -> AppState {
+    fn state_with(opts: &Options, controller: &shutdown::Controller) -> AppState {
         AppState::new(
             Registry::default(),
             Storage::new(None),
             Metrics::default(),
-            &Options::default(),
+            opts,
+            controller.subscribe(),
         )
     }
 
@@ -240,16 +214,12 @@ mod tests {
     /// 走完整路由的版本在 `admin::tests::a_padded_admin_token_still_authenticates`。
     #[test]
     fn a_padded_admin_token_is_trimmed_when_the_state_is_built() {
+        let controller = shutdown::Controller::new();
         let opts = Options {
             admin_token: Some("  tok\t".into()),
             ..Options::default()
         };
-        let state = AppState::new(
-            Registry::default(),
-            Storage::new(None),
-            Metrics::default(),
-            &opts,
-        );
+        let state = state_with(&opts, &controller);
         assert_eq!(
             state.admin_token.as_deref(),
             Some("tok"),
@@ -261,69 +231,55 @@ mod tests {
             admin_token: Some("to k".into()),
             ..Options::default()
         };
-        let state = AppState::new(
-            Registry::default(),
-            Storage::new(None),
-            Metrics::default(),
-            &opts,
-        );
+        let state = state_with(&opts, &controller);
         assert_eq!(state.admin_token.as_deref(), Some("to k"));
 
         // `None`（不启用 /admin/*）不受影响
-        let state = AppState::new(
-            Registry::default(),
-            Storage::new(None),
-            Metrics::default(),
-            &Options::default(),
-        );
-        assert!(state.admin_token.is_none());
+        let no_admin = state_with(&Options::default(), &controller);
+        assert!(no_admin.admin_token.is_none());
     }
 
     /// 规格（并集评估 §2 S3）：关闭阶段**可查、可订阅**，但推进阶段的能力只属于
-    /// 进程生命周期——`shutdown_tx` 私有且**只有一份**，发送端只经 `pub(crate)` 取走。
+    /// `shutdown::Controller`（`Gateway` 独占）；`AppState` 只持接收端。
     ///
-    /// 这条测试钉的是"新接口的行为"：查询反映当前阶段，订阅端能收到后续变化。
-    /// "外部拿不到发送端"由编译器保证（把 `shutdown_tx` 改回 `pub` 或把
-    /// `shutdown_sender` 提成 `pub` 不在任何测试里会被拦住，所以字段文档里写了理由）。
+    /// 这条钉的是查询/订阅接口的行为：查询反映当前阶段，订阅端能收到后续变化。
     #[test]
     fn shutdown_phase_is_queryable_and_subscribable() {
-        let mut state = state();
+        let controller = shutdown::Controller::new();
+        let state = state_with(&Options::default(), &controller);
         assert_eq!(state.shutdown_phase(), ShutdownPhase::Running);
 
         let mut rx = state.subscribe_shutdown();
-        // 发送端只有 crate 内（`Gateway` 的角色）拿得到；测试用它模拟一次推进。
-        let tx = state.shutdown_sender();
-        let _ = tx.send(ShutdownPhase::Draining);
+        controller.begin_drain();
         assert_eq!(state.shutdown_phase(), ShutdownPhase::Draining);
         assert_eq!(*rx.borrow_and_update(), ShutdownPhase::Draining);
 
         // 订阅者是**独立**接收端：第二个订阅者只看到自己订阅之后的变化
         let mut rx2 = state.subscribe_shutdown();
-        let _ = tx.send(ShutdownPhase::Terminating);
+        controller.terminate();
         assert_eq!(*rx.borrow_and_update(), ShutdownPhase::Terminating);
         assert_eq!(*rx2.borrow_and_update(), ShutdownPhase::Terminating);
     }
 
     /// 规格（复扫 D5）：**`AppState` 及其克隆不得把关闭通道钉活**。
     ///
-    /// 通道在最后一个发送端消失时才算"关闭"，而在途转发任务与每连接任务靠这个信号判断
-    /// "网关对象没了"。如果 `AppState` 自己也留着一个发送端（修好前它确实留着一个，
-    /// 且 `shutdown_sender` 给的是克隆），那么每条连接任务手里的 Router 都会把它钉活
+    /// 发送端只有 `Gateway` 手里的 `shutdown::Controller` 一份；`AppState` 只持接收端。
+    /// 如果 `AppState` 也留着一个发送端，那么每条连接任务手里的 Router 都会把它钉活
     /// ⇒ `drop(Gateway)` 之后谁都看不到关闭：在途响应不会收尾、已接受的空闲连接要挂到
     /// `client_stall`（默认 60s）。
     ///
     /// 判据写成 `changed()` 返回 `Err`：它只可能在**所有发送端消失**时发生。
     #[tokio::test]
-    async fn app_state_does_not_pin_the_shutdown_sender() {
-        let mut state = state();
+    async fn app_state_does_not_pin_the_shutdown_channel() {
+        let controller = shutdown::Controller::new();
+        let state = state_with(&Options::default(), &controller);
         let mut rx = state.subscribe_shutdown();
 
-        // `Gateway` 的角色：取走唯一发送端，随后被 drop
-        let tx = state.shutdown_sender();
-        drop(tx);
-
-        // "每条连接任务手里那份 Router"里的 AppState 克隆
+        // "每条连接任务手里那份 Router"里的 AppState 克隆：它只有接收端。
         let per_connection = state.clone();
+        // `Gateway` 的角色：drop 唯一持有发送端的 Controller。
+        drop(controller);
+
         // 带超时：判据本身就是"通道关了"，而这个缺陷的形态是"永远关不了"——不设超时的话
         // 这条测试会挂到被外部打断，而不是给出一个干净的红（`Err(Elapsed)` 直接说明原因）。
         let verdict = tokio::time::timeout(Duration::from_secs(1), rx.changed()).await;

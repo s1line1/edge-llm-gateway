@@ -120,34 +120,6 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
-
-    /// 在临时目录生成 (ca, client.crt, client.key) 并返回路径。
-    fn gen_cert_files(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
-        let ca_key = KeyPair::generate().unwrap();
-        let mut ca = CertificateParams::default();
-        ca.distinguished_name.push(DnType::CommonName, "test ca");
-        ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
-        let ca_cert = ca.self_signed(&ca_key).unwrap();
-
-        let cli_key = KeyPair::generate().unwrap();
-        let mut cli = CertificateParams::default();
-        cli.distinguished_name.push(DnType::CommonName, "agent");
-        cli.subject_alt_names = vec![SanType::DnsName("localhost".try_into().unwrap())];
-        let cli_cert = cli.signed_by(&cli_key, &ca_cert, &ca_key).unwrap();
-
-        let write = |name: &str, content: &str| {
-            let p = dir.join(name);
-            std::fs::write(&p, content).unwrap();
-            p
-        };
-        (
-            write("ca.crt", &ca_cert.pem()),
-            write("client.crt", &cli_cert.pem()),
-            write("client.key", &cli_key.serialize_pem()),
-        )
-    }
 
     /// 规格（复扫 F5）：`run` 起来之后**真的去连过云端**，不只是"任务没结束"。
     ///
@@ -161,7 +133,7 @@ mod tests {
 
         // 写一份完整配置到临时目录；云端地址指向上面那个 socket（不会有应答）→ 后台重试
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
+        let (ca, cert, key) = test_support::pki::write_cert_files(dir.path());
         let config_path = dir.path().join("config.yml");
         let yaml = format!(
             r#"

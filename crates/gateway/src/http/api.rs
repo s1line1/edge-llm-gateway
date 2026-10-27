@@ -16,6 +16,8 @@ use serde_json::json;
 
 use crate::{auth, state::AppState};
 
+use super::ui::wants_html;
+
 /// 存活探针：状态码回答**唯一一个"探针还答得上、但实例已经没用"**的问题——
 /// 隧道入口是否还在接受新 agent（`hlmg_quic_accepting`）。
 ///
@@ -37,7 +39,7 @@ use crate::{auth, state::AppState};
 /// `agents.oldest_last_seen_secs_ago` 用来区分"没人注册"与"有人但全过期"（`null` = 注册表为空）。
 pub(super) async fn healthz(State(state): State<AppState>) -> Response {
     let accepting = state.metrics.quic_accepting() == 1;
-    let status = state.registry.status(state.agent_stale_after);
+    let status = state.registry.status(state.policy.agent_stale_after);
 
     let mut body = json!({
         "status": if accepting { "ok" } else { "degraded" },
@@ -65,12 +67,13 @@ pub(super) async fn healthz(State(state): State<AppState>) -> Response {
 /// （`["*"]` 全匹配的 agent 不贡献条目——它接受任意请求，但具体能跑什么
 /// 只有上游知道，列出会误导客户端）。与代理入口同级的认证 + 限流。
 pub(super) async fn models_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(rejection) = auth::authenticate(&state, &headers).await {
-        return rejection.into_response();
-    }
+    let key = match auth::authenticate(&state, &headers).await {
+        Ok(key) => key,
+        Err(rejection) => return rejection.into_response(),
+    };
     let data: Vec<_> = state
         .registry
-        .healthy_models(state.agent_stale_after)
+        .healthy_models_for_tenant(&key.tenant_id, state.policy.agent_stale_after)
         .into_iter()
         .map(|id| {
             json!({
@@ -88,12 +91,7 @@ pub(super) async fn models_route(State(state): State<AppState>, headers: HeaderM
 /// 浏览器直接访问/刷新（`Accept: text/html`）时返回 SPA 页面，让前端路由渲染指标页；
 /// Prometheus 抓取与前端解析（`Accept: */*`）仍拿到文本。
 pub(super) async fn metrics_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let wants_html = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|a| a.contains("text/html"))
-        .unwrap_or(false);
-    if wants_html {
+    if wants_html(&headers) {
         // 走 `AppState` 里的缓存读（按 mtime 校验）：以前这里每次请求同步
         // `std::fs::read_to_string`，是在 async 上下文里做阻塞 I/O。
         if let Some(index) = &state.ui_index {
@@ -107,7 +105,7 @@ pub(super) async fn metrics_route(State(state): State<AppState>, headers: Header
     let (verify_hits, verify_misses) = state.store.verified_counters();
     // 注册条目数 与 真正可路由数必须分开暴露：前者含失联但连接未关的 agent，
     // 排查"全部请求 503"时只有后者能说明问题（见 `hlmg_agents_healthy` 的 HELP）。
-    let healthy = state.registry.healthy_count(state.agent_stale_after);
+    let healthy = state.registry.healthy_count(state.policy.agent_stale_after);
     // 文本表示：实时数据 ⇒ 明确不许缓存（`Vary` 只解决"张冠李戴"，`no-store` 解决"存了就不用
     // 再取"——把上一次的指标当成现在的展示，比拿不到更糟）。
     let mut resp = super::vary_on_accept(
