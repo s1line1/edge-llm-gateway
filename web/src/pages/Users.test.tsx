@@ -34,6 +34,13 @@ const user: AdminUser = {
   last_login_at: 0,
 };
 
+const tenantAdmin: AdminUser = {
+  ...user,
+  id: "admin",
+  username: "tenant-admin",
+  role: "tenant_admin",
+};
+
 function renderPage(role: "super_admin" | "tenant_admin") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -60,5 +67,15 @@ describe("Users page", () => {
     renderPage("tenant_admin");
     expect(await screen.findByText("alice")).toBeDefined();
     expect(screen.queryByRole("option", { name: "super_admin" })).toBeNull();
+    expect(screen.queryByText("选择 tenant")).toBeNull();
+    expect(screen.getAllByText("tenant-a").length).toBeGreaterThan(0);
+  });
+
+  it("shows the real tenant_admin role when no select is available", async () => {
+    mocks.listUsers.mockResolvedValue([tenantAdmin]);
+    mocks.listTenants.mockResolvedValue([]);
+    renderPage("tenant_admin");
+    expect(await screen.findByText("tenant-admin")).toBeDefined();
+    expect(screen.getByText("tenant_admin")).toBeDefined();
   });
 });

@@ -124,29 +124,40 @@ export default function Users() {
               autoComplete="new-password"
               className="input"
             />
-            <select
-              value={role}
-              onChange={(e) => setRole(e.target.value as UserRole)}
-              disabled={!isSuper}
-              className="input"
-            >
-              {isSuper && <option value="super_admin">super_admin</option>}
-              {isSuper && <option value="tenant_admin">tenant_admin</option>}
-              <option value="user">user</option>
-            </select>
-            <select
-              value={tenantId}
-              onChange={(e) => setTenantId(e.target.value)}
-              disabled={!isSuper || role === "super_admin"}
-              className="input"
-            >
-              <option value="">选择 tenant</option>
-              {(tenantsQuery.data ?? []).map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                </option>
-              ))}
-            </select>
+            {isSuper ? (
+              <select
+                value={role}
+                onChange={(e) => setRole(e.target.value as UserRole)}
+                className="input"
+              >
+                <option value="super_admin">super_admin</option>
+                <option value="tenant_admin">tenant_admin</option>
+                <option value="user">user</option>
+              </select>
+            ) : (
+              <div className="flex min-h-10 items-center rounded-lg border border-line bg-ink-950/30 px-3">
+                <Badge>user</Badge>
+              </div>
+            )}
+            {isSuper ? (
+              <select
+                value={tenantId}
+                onChange={(e) => setTenantId(e.target.value)}
+                disabled={role === "super_admin"}
+                className="input"
+              >
+                <option value="">选择 tenant</option>
+                {(tenantsQuery.data ?? []).map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <div className="flex min-h-10 items-center rounded-lg border border-line bg-ink-950/30 px-3">
+                <Badge tone="cyan">{user?.tenant_name ?? user?.tenant_id ?? "当前 tenant"}</Badge>
+              </div>
+            )}
             <Button
               type="submit"
               disabled={
@@ -212,25 +223,38 @@ export default function Users() {
                       <tr key={u.id ?? u.username}>
                         <td className="font-mono text-[11px] text-paper">{u.username}</td>
                         <td>
-                          <select
-                            value={u.role}
-                            disabled={!isSuper || self}
-                            onChange={(e) => {
-                              const next = e.target.value as UserRole;
-                              updateMutation.mutate({
-                                id: u.id ?? "",
-                                patch:
-                                  next === "super_admin"
-                                    ? { role: next, clear_tenant: true }
-                                    : { role: next, tenant_id: u.tenant_id ?? undefined },
-                              });
-                            }}
-                            className="rounded border border-line bg-ink-950/45 px-2 py-1 font-mono text-[10px] text-mist"
-                          >
-                            {isSuper && <option value="super_admin">super_admin</option>}
-                            {isSuper && <option value="tenant_admin">tenant_admin</option>}
-                            <option value="user">user</option>
-                          </select>
+                          {isSuper && !self ? (
+                            <select
+                              value={u.role}
+                              onChange={(e) => {
+                                const next = e.target.value as UserRole;
+                                updateMutation.mutate({
+                                  id: u.id ?? "",
+                                  patch:
+                                    next === "super_admin"
+                                      ? { role: next, clear_tenant: true }
+                                      : { role: next, tenant_id: u.tenant_id ?? undefined },
+                                });
+                              }}
+                              className="rounded border border-line bg-ink-950/45 px-2 py-1 font-mono text-[10px] text-mist"
+                            >
+                              <option value="super_admin">super_admin</option>
+                              <option value="tenant_admin">tenant_admin</option>
+                              <option value="user">user</option>
+                            </select>
+                          ) : (
+                            <Badge
+                              tone={
+                                u.role === "super_admin"
+                                  ? "ok"
+                                  : u.role === "tenant_admin"
+                                    ? "cyan"
+                                    : "default"
+                              }
+                            >
+                              {u.role}
+                            </Badge>
+                          )}
                         </td>
                         <td>{u.tenant_name ? <Badge tone="cyan">{u.tenant_name}</Badge> : "—"}</td>
                         <td>
