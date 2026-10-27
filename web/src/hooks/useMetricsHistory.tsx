@@ -107,6 +107,10 @@ export function MetricsHistoryProvider({
  * 没有 provider 时**抛错**而不是自己退化成一条私有轮询：那样会在"有人忘了包 provider"时
  * 悄悄回到 G4 的多份采样，而症状（两个数字对不上）正是这条修复要消灭的东西。
  */
+export function useMetricsHistoryOptional(): MetricsHistory | null {
+  return useContext(MetricsHistoryContext);
+}
+
 export function useMetricsHistory(): MetricsHistory {
   const value = useContext(MetricsHistoryContext);
   if (!value) {

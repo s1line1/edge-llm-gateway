@@ -7,17 +7,17 @@
 import { MutationCache, QueryCache, QueryClient } from "@tanstack/react-query";
 
 import { ApiError } from "./client";
-import { clearAdminToken } from "../hooks/useAdminToken";
 
 /**
- * 任何请求拿到 401 ⇒ 手上的 admin token 已失效（轮换/吊销/写错）。清掉它，`RequireAuth`
- * 会把用户送回登录页；没有这一步，用户会看到一屏"加载失败"却仍然停留在已登录状态（P3-18）。
- *
- * 只认 `ApiError` 且 `status === 401`：网络错误、5xx、形状校验失败都不该把人踢下线。
+ * 任何请求拿到 401 ⇒ session 已失效。派发一个应用内事件，由 `AuthProvider` 清掉
+ * `/admin/auth/me` 查询；`RequireAuth` 随后把用户送回登录页。只认 `ApiError` 且
+ * `status === 401`：网络错误、5xx、形状校验失败都不该把人踢下线。
  */
 export function handleUnauthorized(error: unknown): void {
   if (error instanceof ApiError && error.status === 401) {
-    clearAdminToken();
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new Event("hlmg-auth-unauthorized"));
+    }
   }
 }
 

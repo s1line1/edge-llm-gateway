@@ -33,7 +33,50 @@ pub(super) const API_KEY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS api_keys (
     created_at INTEGER NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
     cred_version INTEGER NOT NULL DEFAULT 1,
-    tenant_id TEXT NOT NULL DEFAULT 'default'
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    owner_user_id TEXT NULL
+)";
+
+/// Dashboard 用户。`tenant_id` 只在 super_admin 上为 NULL；角色/租户一致性由
+/// `Storage` 的应用层校验（旧库没有 CHECK 成本更低的迁移路径）。
+pub(super) const USER_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NULL,
+    username TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('super_admin','tenant_admin','user')),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_login_at INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NULL
+)";
+
+/// 用户名大小写不敏感唯一：登录不要求 tenant slug，因此全局唯一。
+pub(super) const USERNAME_INDEX: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE)";
+
+/// 服务端会话。只存 `sha256(session_token)`，不存明文 token。
+pub(super) const SESSION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+)";
+
+pub(super) const SESSION_USER_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)";
+
+/// 特权写操作审计。刻意不存密码/session/API key/agent token。
+pub(super) const ADMIN_AUDIT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS admin_audit (
+    id TEXT PRIMARY KEY,
+    actor_user_id TEXT NULL,
+    actor_label TEXT NOT NULL,
+    tenant_id TEXT NULL,
+    action TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL
 )";
 
 pub(super) const USAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS key_usage (
@@ -183,10 +226,66 @@ pub(super) fn table_has_column(
     Ok(false)
 }
 
+/// 从 SQLite 加载全部 dashboard 用户（key = user id）。
+pub(super) fn load_users(
+    conn: &Connection,
+) -> rusqlite::Result<HashMap<String, super::user::UserRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, tenant_id, username, password_hash, role, enabled, created_at, updated_at, last_login_at, created_by
+         FROM users",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(super::user::UserRecord::from_parts(
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get::<_, String>(4)?
+                .parse::<super::user::UserRole>()
+                .unwrap_or(super::user::UserRole::User),
+            r.get::<_, i64>(5)? != 0,
+            r.get::<_, i64>(6)? as u64,
+            r.get::<_, i64>(7)? as u64,
+            r.get::<_, i64>(8)? as u64,
+            r.get(9)?,
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let rec = row?;
+        map.insert(rec.id().to_string(), rec);
+    }
+    Ok(map)
+}
+
+/// 从 SQLite 加载全部会话（key = token_hash）。
+pub(super) fn load_sessions(
+    conn: &Connection,
+) -> rusqlite::Result<HashMap<String, super::session::SessionRecord>> {
+    let mut stmt =
+        conn.prepare("SELECT id, user_id, token_hash, created_at, expires_at FROM sessions")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(super::session::SessionRecord::from_parts(
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get::<_, i64>(3)? as u64,
+            r.get::<_, i64>(4)? as u64,
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let rec = row?;
+        map.insert(rec.token_hash().to_string(), rec);
+    }
+    Ok(map)
+}
+
 /// 从 SQLite 加载全部动态 key（key = lookup）。
 pub(super) fn load_keys(conn: &Connection) -> rusqlite::Result<HashMap<String, KeyRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT id, lookup, key_hash, name, created_at, enabled, cred_version, tenant_id FROM api_keys",
+        "SELECT id, lookup, key_hash, name, created_at, enabled, cred_version, tenant_id, owner_user_id
+         FROM api_keys",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(KeyRecord {
@@ -199,6 +298,7 @@ pub(super) fn load_keys(conn: &Connection) -> rusqlite::Result<HashMap<String, K
             // 迁移前的老行是 NULL → 0；0 不是合法代数（代数从 1 起），归一到 1
             cred_version: r.get::<_, Option<i64>>(6)?.unwrap_or(1).max(1) as u64,
             tenant_id: r.get(7)?,
+            owner_user_id: r.get(8)?,
         })
     })?;
     let mut map = HashMap::new();

@@ -8,6 +8,7 @@ import { render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentInfo } from "../api/types";
+import { TestAuthProvider } from "../auth/TestAuthProvider";
 
 const mocks = vi.hoisted(() => ({ fetchAgents: vi.fn() }));
 
@@ -15,6 +16,13 @@ const mocks = vi.hoisted(() => ({ fetchAgents: vi.fn() }));
 vi.mock("../api/client", () => ({ fetchAgents: mocks.fetchAgents }));
 
 vi.mock("../hooks/useMetricsHistory", () => ({
+  useMetricsHistoryOptional: () => ({
+    latest: null,
+    history: [],
+    raw: null,
+    error: null,
+    reachable: true,
+  }),
   useMetricsHistory: () => ({
     latest: null,
     history: [],
@@ -30,7 +38,9 @@ function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <Agents />
+      <TestAuthProvider role="tenant_admin">
+        <Agents />
+      </TestAuthProvider>
     </QueryClientProvider>,
   );
 }
@@ -46,7 +56,6 @@ const oneAgent: AgentInfo = {
 
 describe("Agents 页的明细降级（P3-18①）", () => {
   beforeEach(() => {
-    localStorage.setItem("hlmg.admin.token", "t");
     mocks.fetchAgents.mockReset();
   });
 
@@ -87,7 +96,6 @@ describe("Agents 页的明细降级（P3-18①）", () => {
 
 describe("Agents 页的状态判定来自网关（复扫 G1）", () => {
   beforeEach(() => {
-    localStorage.setItem("hlmg.admin.token", "t");
     mocks.fetchAgents.mockReset();
   });
 

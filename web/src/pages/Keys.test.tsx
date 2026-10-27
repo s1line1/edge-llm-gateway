@@ -8,17 +8,20 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ApiKey } from "../api/types";
+import { TestAuthProvider } from "../auth/TestAuthProvider";
 
 const mocks = vi.hoisted(() => ({
   listKeys: vi.fn(),
   createKey: vi.fn(),
   deleteKey: vi.fn(),
+  listTenants: vi.fn(),
 }));
 
 vi.mock("../api/client", () => ({
   listKeys: mocks.listKeys,
   createKey: mocks.createKey,
   deleteKey: mocks.deleteKey,
+  listTenants: mocks.listTenants,
 }));
 
 import Keys from "./Keys";
@@ -43,17 +46,20 @@ function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <Keys />
+      <TestAuthProvider role="super_admin">
+        <Keys />
+      </TestAuthProvider>
     </QueryClientProvider>,
   );
 }
 
 describe("Keys 页的吊销失败提示（P3-18②）", () => {
   beforeEach(() => {
-    localStorage.setItem("hlmg.admin.token", "t");
     mocks.listKeys.mockReset();
     mocks.deleteKey.mockReset();
     mocks.createKey.mockReset();
+    mocks.listTenants.mockReset();
+    mocks.listTenants.mockResolvedValue([]);
     mocks.listKeys.mockResolvedValue([key]);
     // 吊销前有 `confirm` 二次确认（`Keys.tsx:175`）：jsdom 没实现它，不换掉的话它返回 undefined ⇒ 不吊销
     vi.spyOn(window, "confirm").mockReturnValue(true);
@@ -73,7 +79,7 @@ describe("Keys 页的吊销失败提示（P3-18②）", () => {
       await screen.findByText(/吊销失败：SQLite 错误: forced rollback（这条 Key 仍然有效）/),
     ).toBeDefined();
     // mutate 的 mutationFn 是异步派发的：上面那条 findByText 已经等到了结果，这里再确认参数
-    expect(mocks.deleteKey).toHaveBeenCalledWith("t", "k1");
+    expect(mocks.deleteKey).toHaveBeenCalledWith("k1");
   });
 
   it("渲染出来的文本里没有 `//` —— JSX 子节点位置的注释会原样变成文本", async () => {
@@ -94,7 +100,7 @@ describe("Keys 页的吊销失败提示（P3-18②）", () => {
 
     // 等一次列表重取（invalidate）落地，确认这段时间没有冒失败文案
     await waitFor(() => expect(mocks.listKeys.mock.calls.length).toBeGreaterThan(1));
-    expect(mocks.deleteKey).toHaveBeenCalledWith("t", "k1");
+    expect(mocks.deleteKey).toHaveBeenCalledWith("k1");
     expect(screen.queryByText(/吊销失败/)).toBeNull();
   });
 });

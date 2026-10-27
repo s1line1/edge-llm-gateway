@@ -71,7 +71,7 @@ fn tenant_crud_and_key_usage_filtering() {
         TenantError::NameTaken
     );
 
-    let key = store.create_in(&alpha, "alpha-key".into()).unwrap();
+    let key = store.create_in(&alpha, None, "alpha-key".into()).unwrap();
     assert_eq!(key.record.tenant_id(), alpha);
     assert_eq!(store.key_count_for_tenant(&alpha), 1);
     assert_eq!(store.list_for_tenant(&alpha).len(), 1);

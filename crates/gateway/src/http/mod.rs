@@ -68,37 +68,65 @@ pub fn app(state: AppState) -> Router {
                 .delete(crate::proxy::proxy)
                 .patch(crate::proxy::proxy),
         );
-    if state.admin_token.is_some() {
-        let admin = Router::new()
-            .route(
-                "/keys",
-                get(crate::admin::list_keys_filtered).post(crate::admin::create_key),
-            )
-            .route("/keys/{id}", delete(crate::admin::delete_key))
-            .route(
-                "/tenants",
-                get(crate::admin::list_tenants).post(crate::admin::create_tenant),
-            )
-            .route(
-                "/tenants/{id}",
-                axum::routing::patch(crate::admin::update_tenant)
-                    .delete(crate::admin::delete_tenant),
-            )
-            .route(
-                "/tenants/{id}/agent-token",
-                axum::routing::post(crate::admin::rotate_agent_token),
-            )
-            .route("/agents", get(crate::admin::list_agents))
-            .route("/usage", get(crate::admin::usage_filtered))
-            .route_layer(middleware::from_fn_with_state(
-                state.clone(),
-                crate::admin::admin_auth,
-            ))
-            // 放在 `route_layer` **之后** ⇒ 这个中间件在最外层，admin 鉴权自己产生的 401
-            // 也会带上这个头（见 `no_store`）。
-            .layer(middleware::from_fn(no_store));
-        router = router.nest("/admin", admin);
-    }
+    let admin_public = Router::new()
+        .route("/auth/status", get(crate::admin_auth::status))
+        .route(
+            "/auth/bootstrap",
+            axum::routing::post(crate::admin_auth::bootstrap),
+        )
+        .route("/auth/login", axum::routing::post(crate::admin_auth::login));
+    let admin_protected = Router::new()
+        .route(
+            "/auth/logout",
+            axum::routing::post(crate::admin_auth::logout),
+        )
+        .route("/auth/me", get(crate::admin_auth::me))
+        .route(
+            "/auth/password",
+            axum::routing::post(crate::admin_auth::change_password),
+        )
+        .route(
+            "/keys",
+            get(crate::admin::list_keys_filtered).post(crate::admin::create_key),
+        )
+        .route("/keys/{id}", delete(crate::admin::delete_key))
+        .route(
+            "/tenants",
+            get(crate::admin::list_tenants).post(crate::admin::create_tenant),
+        )
+        .route(
+            "/tenants/{id}",
+            get(crate::admin::tenant_by_id)
+                .patch(crate::admin::update_tenant)
+                .delete(crate::admin::delete_tenant),
+        )
+        .route(
+            "/tenants/{id}/agent-token",
+            axum::routing::post(crate::admin::rotate_agent_token),
+        )
+        .route("/agents", get(crate::admin::list_agents))
+        .route("/usage", get(crate::admin::usage_filtered))
+        .route(
+            "/users",
+            get(crate::admin_users::list_users).post(crate::admin_users::create_user),
+        )
+        .route(
+            "/users/{id}",
+            axum::routing::patch(crate::admin_users::update_user)
+                .delete(crate::admin_users::delete_user),
+        )
+        .route("/audit", get(crate::admin_users::list_audit))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::admin_auth::admin_auth,
+        ));
+    router = router.nest(
+        "/admin",
+        admin_public
+            .merge(admin_protected)
+            .layer(middleware::from_fn(no_store)),
+    );
+
     // React UI 静态托管：存在时 `/` 返回 Dashboard，未命中的路径（SPA 前端路由，
     // 如 /keys、/metrics 的浏览器直接访问/刷新）fallback 到 index.html。
     // 注意：API 类未注册路径（无 Accept: text/html、无文件扩展名）返回真 404，

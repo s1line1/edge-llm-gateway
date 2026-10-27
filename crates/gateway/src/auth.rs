@@ -375,7 +375,9 @@ mod tenant_tests {
         let store = Storage::new(None);
         let created = store.create_tenant("disabled".into(), 0, 0).unwrap();
         let tenant_id = created.record.id().to_string();
-        let key = store.create_in(&tenant_id, "disabled-key".into()).unwrap();
+        let key = store
+            .create_in(&tenant_id, None, "disabled-key".into())
+            .unwrap();
         store
             .update_tenant(
                 &tenant_id,
@@ -404,7 +406,9 @@ mod tenant_tests {
         let store = Storage::new(None);
         let created = store.create_tenant("limited".into(), 0, 1).unwrap();
         let tenant_id = created.record.id().to_string();
-        let key = store.create_in(&tenant_id, "limited-key".into()).unwrap();
+        let key = store
+            .create_in(&tenant_id, None, "limited-key".into())
+            .unwrap();
         let state = AppState::new_for_test(
             Registry::default(),
             store,

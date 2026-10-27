@@ -4,6 +4,8 @@
 //! TLS 材料与 rustls 配置构造在 [`tls`]。
 
 pub mod admin;
+mod admin_auth;
+mod admin_users;
 pub mod auth;
 pub mod body;
 pub mod config;
@@ -13,6 +15,7 @@ pub mod gateway;
 pub mod http;
 pub mod io_stall;
 mod listen;
+pub mod login_limiter;
 pub mod metrics;
 pub mod nofile;
 pub mod openai;
@@ -20,13 +23,14 @@ pub mod options;
 pub mod proxy;
 pub mod quic;
 pub mod ratelimit;
+pub mod rbac;
 pub mod registry;
 mod request_id;
 mod shutdown;
 pub mod state;
 pub mod storage;
 mod sync;
-pub mod tenant_limits;
+mod tenant_limits;
 mod tls;
 pub mod ui;
 pub mod usage_flush;

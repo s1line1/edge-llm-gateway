@@ -84,6 +84,24 @@ pub fn hash_argon2(token: &str) -> String {
 /// 任何行为（2026-09-22 删除）。**调用次数不要再放回全局计数**：那会被同一测试进程里其他测试
 /// 的 argon2 调用污染（实测并行跑全量 lib 时，一个只应 1 次的断言被顶到 2 次）；次数由
 /// `Storage` 各实例自己统计（`Storage::argon2_runs`）。
+/// 密码长度策略（12–128 个 Unicode 标量值）；不在这里做复杂度规则。
+pub fn password_length_ok(password: &str) -> bool {
+    (12..=128).contains(&password.chars().count())
+}
+
+/// 登录密码校验；用户不存在时也执行一次 dummy argon2，避免明显的用户枚举时序差。
+pub fn verify_login_password(password: &str, encoded: Option<&str>) -> bool {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    match encoded {
+        Some(encoded) => verify_argon2(password, encoded),
+        None => {
+            let dummy = DUMMY.get_or_init(|| hash_argon2("hlmg-dummy-password"));
+            let _ = verify_argon2(password, dummy);
+            false
+        }
+    }
+}
+
 pub fn verify_argon2(token: &str, encoded: &str) -> bool {
     let parsed = match PasswordHash::new(encoded) {
         Ok(p) => p,

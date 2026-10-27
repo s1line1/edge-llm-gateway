@@ -1,17 +1,16 @@
-// 应用壳：左侧控制台导航 + 顶部实时状态条 + 内容画布。
+// 应用壳：角色感知导航 + 顶部会话状态 + 内容画布。
 
 import { useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 
-import { useAdminToken, useSetAdminToken } from "../hooks/useAdminToken";
-import { useMetricsHistory } from "../hooks/useMetricsHistory";
+import { useAuth } from "../auth/useAuth";
+import { useMetricsHistoryOptional } from "../hooks/useMetricsHistory";
 import { GatewayMark, Icon, type IconName } from "./icons";
-import { IconButton, StatusPill } from "./ui";
+import { Badge, IconButton, StatusPill } from "./ui";
 
-const NAV_SECTIONS: {
-  label: string;
-  items: { to: string; label: string; icon: IconName; end?: boolean }[];
-}[] = [
+type NavItem = { to: string; label: string; icon: IconName; end?: boolean };
+
+const SUPER_NAV: { label: string; items: NavItem[] }[] = [
   {
     label: "OBSERVE",
     items: [
@@ -22,7 +21,30 @@ const NAV_SECTIONS: {
   },
   {
     label: "CONTROL",
-    items: [{ to: "/keys", label: "API Keys", icon: "key" }],
+    items: [
+      { to: "/keys", label: "API Keys", icon: "key" },
+      { to: "/tenants", label: "Tenants", icon: "shield" },
+      { to: "/users", label: "Users", icon: "terminal" },
+    ],
+  },
+];
+
+const TENANT_NAV: { label: string; items: NavItem[] }[] = [
+  {
+    label: "WORKSPACE",
+    items: [
+      { to: "/tenants", label: "Tenant", icon: "shield" },
+      { to: "/agents", label: "Agents", icon: "edge" },
+      { to: "/keys", label: "API Keys", icon: "key" },
+      { to: "/users", label: "Users", icon: "terminal" },
+    ],
+  },
+];
+
+const USER_NAV: { label: string; items: NavItem[] }[] = [
+  {
+    label: "ACCESS",
+    items: [{ to: "/my-access", label: "我的访问", icon: "key" }],
   },
 ];
 
@@ -31,27 +53,39 @@ const PAGE_LABELS: Record<string, string> = {
   "/agents": "Agents",
   "/keys": "API Keys",
   "/metrics": "指标",
+  "/tenants": "Tenants",
+  "/users": "Users",
+  "/my-access": "我的访问",
 };
+
+const ROLE_LABELS = {
+  super_admin: "SUPER ADMIN",
+  tenant_admin: "TENANT ADMIN",
+  user: "USER",
+} as const;
 
 function navClass({ isActive }: { isActive: boolean }): string {
   return `nav-item ${isActive ? "nav-item-active" : ""}`;
 }
 
 export default function Layout() {
-  const { latest, reachable, error } = useMetricsHistory();
-  const token = useAdminToken();
-  const clearToken = useSetAdminToken();
-  const navigate = useNavigate();
+  const { user, logout } = useAuth();
+  const metrics = useMetricsHistoryOptional();
   const location = useLocation();
+  const navigate = useNavigate();
   const [navOpen, setNavOpen] = useState(false);
 
-  const logout = () => {
-    clearToken("");
+  const role = user?.role ?? "user";
+  const sections =
+    role === "super_admin" ? SUPER_NAV : role === "tenant_admin" ? TENANT_NAV : USER_NAV;
+  const current = PAGE_LABELS[location.pathname] ?? "控制台";
+  const online = metrics ? metrics.reachable && metrics.latest !== null : false;
+  const latest = metrics?.latest ?? null;
+
+  const doLogout = async () => {
+    await logout();
     navigate("/login", { replace: true });
   };
-
-  const online = reachable && latest !== null;
-  const current = PAGE_LABELS[location.pathname] ?? "控制台";
 
   return (
     <div className="flex min-h-screen bg-ink-950">
@@ -82,7 +116,7 @@ export default function Layout() {
         </div>
 
         <nav className="flex-1 space-y-7 overflow-y-auto px-3 py-6">
-          {NAV_SECTIONS.map((section) => (
+          {sections.map((section) => (
             <div key={section.label}>
               <div className="mb-2 px-2 font-mono text-[9px] tracking-[0.18em] text-mist-dim">
                 {section.label}
@@ -113,34 +147,33 @@ export default function Layout() {
         <div className="border-t border-line-soft p-3">
           <div className="rounded-lg border border-line bg-ink-850/70 p-3">
             <div className="flex items-center justify-between gap-2">
-              <span className="font-mono text-[9px] tracking-[0.15em] text-mist-dim">GATEWAY</span>
+              <span className="font-mono text-[9px] tracking-[0.15em] text-mist-dim">SESSION</span>
               <span
-                className={`status-dot ${online ? "status-dot-live" : "status-dot-err"}`}
+                className={`status-dot ${online ? "status-dot-live" : "status-dot-warn"}`}
                 aria-hidden
               />
             </div>
-            <div className="mt-2 flex items-baseline gap-1.5">
-              <span className="font-mono text-lg leading-none text-paper">
-                {latest ? latest.agents_healthy : "—"}
-              </span>
-              <span className="text-[10px] text-mist">healthy edges</span>
+            <div className="mt-2 truncate text-[11px] font-medium text-paper">
+              {user?.username ?? "unknown"}
             </div>
-            <div className="mt-2 font-mono text-[9px] leading-relaxed text-mist-dim">
+            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+              <Badge tone={role === "super_admin" ? "ok" : "cyan"}>{ROLE_LABELS[role]}</Badge>
+              {user?.tenant_name && <Badge>{user.tenant_name}</Badge>}
+            </div>
+            <div className="mt-3 font-mono text-[9px] leading-relaxed text-mist-dim">
               网关版本 {__GATEWAY_VERSION__}
               <br />
               QUIC 隧道 + mTLS
             </div>
           </div>
-          {token && (
-            <button
-              type="button"
-              onClick={logout}
-              className="mt-2 flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[11px] text-mist transition-colors hover:bg-ink-800 hover:text-paper"
-            >
-              <Icon name="logout" size={14} />
-              退出登录
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => void doLogout()}
+            className="mt-2 flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[11px] text-mist transition-colors hover:bg-ink-800 hover:text-paper"
+          >
+            <Icon name="logout" size={14} />
+            退出登录
+          </button>
         </div>
       </aside>
 
@@ -174,18 +207,22 @@ export default function Layout() {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            {error && (
+            {metrics?.error && (
               <span
                 className="hidden max-w-[180px] truncate font-mono text-[10px] text-amber sm:inline"
-                title={error}
+                title={metrics.error}
               >
                 数据拉取异常
               </span>
             )}
-            <StatusPill
-              ok={online}
-              label={online ? `LIVE · ${latest.agents_healthy} EDGES` : "OFFLINE"}
-            />
+            {role === "super_admin" ? (
+              <StatusPill
+                ok={online}
+                label={online ? `LIVE · ${latest?.agents_healthy ?? 0} EDGES` : "OFFLINE"}
+              />
+            ) : (
+              <Badge tone="cyan">{ROLE_LABELS[role]}</Badge>
+            )}
           </div>
         </header>
 

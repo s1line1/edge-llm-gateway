@@ -351,6 +351,7 @@ mod tests {
             enabled: true,
             cred_version,
             tenant_id: "default".into(),
+            owner_user_id: None,
         }
     }
 

@@ -5,6 +5,7 @@
 
 mod admin;
 mod agents;
+mod auth;
 mod chain;
 mod common;
 mod entry_limits;

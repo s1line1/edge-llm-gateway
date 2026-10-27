@@ -13,7 +13,7 @@ port), and you want to call it from anywhere with a standard OpenAI SDK — **wi
 local inference endpoint to the public Internet.**
 
 <p align="center">
-  <img alt="tests" src="https://img.shields.io/badge/tests-418%20passed-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-447%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -121,6 +121,16 @@ the local LLM, and stream the response back. Point `upstream` at your local serv
   connection belongs to exactly one tenant.
 - Admin: `/admin/tenants` CRUD and agent-token rotation; `/admin/keys`, `/admin/usage`, and
   `/admin/agents` accept tenant filters. Tenant IDs are logged, not used as metric labels.
+
+**Users & Roles**
+- Dashboard login uses username/password with `super_admin` (platform), `tenant_admin` (one tenant),
+  and `user` (own keys/usage) roles.
+- Server-side sessions store only `sha256(token)`; cookies are `HttpOnly + SameSite=Lax`, and unsafe
+  requests require CSRF double-submit.
+- The first `super_admin` is created with `POST /admin/auth/bootstrap` using the configured
+  `admin_token`; afterwards the token is break-glass only, not the normal login.
+- Disabling/deleting a user revokes sessions and disables owned API keys; role/password changes revoke
+  old sessions. The last enabled `super_admin` cannot be deleted, disabled, or demoted.
 
 **Security**
 - API keys: `sha256(token)` fast index lookup + **argon2id** verification, **plaintext never stored**
@@ -356,8 +366,8 @@ fmt · clippy -D warnings · nextest · e2e wiring · toolchain-check · check-r
 
 `make check` adds `cargo deny` and the four web targets on top (web-format / web-lint / web-test / web-build).
 
-> **Current scale (`cargo nextest run --workspace`, measured)**: **418 tests executed and passed (0 skipped)**, of which
-> **76 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
+> **Current scale (`cargo nextest run --workspace`, measured)**: **447 tests executed and passed (0 skipped)**, of which
+> **77 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
 > per commit; trust the actual run output.
 >
 > Two behaviours differ from `cargo test` and are worth knowing: **nextest runs one process per test**,

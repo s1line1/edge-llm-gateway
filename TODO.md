@@ -13,6 +13,16 @@
 > 测试补齐、以及不改变对外行为的重构。判断标准：这一条的目的是"**让已有行为更正确/更可观测**"
 > （做）还是"**让网关多一个本事**"（不做）。新功能条目只做登记，不排期、不开工。
 
+## 2026-10-27 Dashboard 用户与 RBAC（已实施）
+
+人工指示新增：dashboard 登录、租户管理、`super_admin` / `tenant_admin` / `user` 三种角色。
+- 用户/会话/SQLite 持久化；argon2id 密码、服务端 session、HttpOnly cookie + CSRF。
+- 首次启动通过现有 `admin_token` bootstrap 第一个 `super_admin`；之后 token 只作 break-glass。
+- tenant admin 管理本 tenant 用户/key/agent；普通用户只管理自己的 key/usage。
+- `/admin/*` 统一 Principal/RBAC；跨 tenant 过滤返回 404；最后一名 super_admin 不可移除。
+- 明确未做：OIDC/LDAP、邮件找回、MFA、多实例共享 session、tenant 管理 Web 之外的平台计费。
+- 回归：storage user/session、login/bootstrap/CSRF、RBAC 矩阵、tenant 隔离、admin token 兼容、e2e 全流程。
+
 ## 2026-10-27 多租户（已实施）
 
 人工指示新增：tenant 拥有 API key 与 edge agent；key 只能路由到同 tenant 的 agent，
@@ -515,7 +525,7 @@
 | 环节 | 位置 | 事实 |
 |---|---|---|
 | 发号 | `storage/hash.rs:119` | key 恒为 `sk-` + 24 随机字节（**192 位熵**）；`/admin/keys` 只收 `name`，**不存在"运维自己填 key"的入口**（`admin.rs:98`） |
-| 存储 | `storage/mod.rs:155` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
+| 存储 | `storage/mod.rs:109` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
 | 校验 | `storage/mod.rs:530` → `hash.rs:87` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
 | 缓存 | `storage/verified.rs:55` | `(lookup, cred_version)` 命中即跳过校验；有 TTL 与上限（`verified_cache_max: 1650`） |
 | 单飞 | `storage/verified.rs:73` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
@@ -1512,12 +1522,9 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       `crates/gateway/src/config.rs:87` 与 `gateway-config.example.yml:129` 都没跟上 A3（`/healthz`
       进探针域）与 A8（`/metrics` 进抓取域）——真实语义是"两条无认证路径**各有独立额度**、都不吃
       受限预算"。`README.md:482` 已是对的。**复核**：我自己读了这三处。
-- [ ] **`S2-16`（本轮 G6 的漏）`clearAdminToken` 丢弃 `removeItem` 失败并把内存态置 `null`**：
-      `web/src/hooks/useAdminToken.ts:43-47`。localStorage 处于"读可用、写/删抛错"的半坏形态时，
-      旧 token 仍在存储里、`readToken` 又回落读到它 ⇒ `/admin/*` 401 之后**用户不会被登出**，
-      继续"已登录但每页加载失败"（正是 P3-18 要消灭的状态）。G6 的测试只覆盖了"完全不可用"。
-      修法：`writeStored("")` 返回 false 时把 `memoryToken` 置 `""`（而不是 `null`）。
-      **复核**：我自己读了代码。
+- [x] **`S2-16`（已随 dashboard session 迁移解决）**：旧实现的 `clearAdminToken` 会在 localStorage
+      半坏时留下旧 token；新的登录使用 HttpOnly session + CSRF cookie，前端不再把 admin token
+      写入 localStorage，因此该失败模式不再存在。
 
 ### 待核（子代理读码报告，我未逐行确认）
 

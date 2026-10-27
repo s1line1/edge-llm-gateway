@@ -13,7 +13,8 @@ use rusqlite::Connection;
 
 use super::schema::{
     add_column_if_missing, ensure_default_tenant, migrate_legacy_keys, table_has_column,
-    API_KEY_SCHEMA, TENANT_SCHEMA, USAGE_SCHEMA,
+    ADMIN_AUDIT_SCHEMA, API_KEY_SCHEMA, SESSION_SCHEMA, SESSION_USER_INDEX, TENANT_SCHEMA,
+    USAGE_SCHEMA, USERNAME_INDEX, USER_SCHEMA,
 };
 
 /// 打开后的库：连接（内存模式为 `None`）与持久化三态。
@@ -50,6 +51,11 @@ pub(super) fn open(file: Option<&Path>) -> OpenedDb {
                     conn.execute_batch(API_KEY_SCHEMA)?;
                     conn.execute_batch(USAGE_SCHEMA)?;
                     conn.execute_batch(TENANT_SCHEMA)?;
+                    conn.execute_batch(USER_SCHEMA)?;
+                    conn.execute_batch(USERNAME_INDEX)?;
+                    conn.execute_batch(SESSION_SCHEMA)?;
+                    conn.execute_batch(SESSION_USER_INDEX)?;
+                    conn.execute_batch(ADMIN_AUDIT_SCHEMA)?;
                     ensure_default_tenant(&conn)?;
                     // 老库（无 cred_version 列）→ 补列；新库上 API_KEY_SCHEMA 已建好，这里跳过。
                     if !table_has_column(&conn, "api_keys", "cred_version")? {
@@ -70,6 +76,7 @@ pub(super) fn open(file: Option<&Path>) -> OpenedDb {
                         "tenant_id",
                         "TEXT NOT NULL DEFAULT 'default'",
                     )?;
+                    add_column_if_missing(&conn, "api_keys", "owner_user_id", "TEXT NULL")?;
                     ensure_default_tenant(&conn)?;
                     Ok::<_, rusqlite::Error>(())
                 })();
