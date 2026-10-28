@@ -20,7 +20,7 @@
 #
 # 墙内构建**不要**关掉下面的镜像源：实测同一台阿里云 ECS 上，crates 包体走阿里云
 # 1.17 MB/s、直连 static.crates.io 只有 21 KB/s（本项目要下 338 个 crate ≈ 74 MB）。
-# 想回到官方源：--build-arg CRATES_MIRROR= --build-arg APT_MIRROR= --build-arg NPM_MIRROR=
+# 想回到官方源：--build-arg CRATES_MIRROR= --build-arg NPM_MIRROR=
 # 国内 用 mirrors.ustc.edu.cn(实测最快)
 #
 # 运行网关（云服务器）：
@@ -156,19 +156,14 @@ RUN pnpm build
 
 FROM debian:bookworm-slim
 
-# apt 保留（要装 ca-certificates），但必须修掉两个坑，否则这一步会卡死：
-#   ① `deb.debian.org` 在这个容器里解析到 IPv6（2a04:4e42:7b::644），而宿主机**没有全局
-#      IPv6** → 连接被黑洞而不是快速失败。实测 `apt-get update` 超过 3 分钟不返回。
-#      加 `Acquire::ForceIPv4` 即可（注意：apt 自己不会主动回退到 IPv4）。
-#   ② 直连取一个 Release 文件 3.4s，同区镜像 0.09s。
-ARG APT_MIRROR=mirrors.aliyun.com
-RUN printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99force-ipv4 \
-    && if [ -n "$APT_MIRROR" ]; then \
-         sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
-       fi \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Runtime only needs the CA bundle; do not run apt-get here. The former apt step
+# depended on a mirror's Release signatures (Aliyun once returned "invalid
+# signature" for all three suites), which made the image build fail before the
+# gateway binary was even copied. The builder image is the same Debian release
+# and already has the distro CA bundle, so copying it is deterministic and
+# network-free.
+COPY --from=builder /etc/ssl/certs /etc/ssl/certs
+COPY --from=builder /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf
 
 COPY --from=builder /build/target/release/gateway /usr/local/bin/gateway
 
