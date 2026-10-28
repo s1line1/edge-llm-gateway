@@ -6,6 +6,8 @@ import { useMemo, useState } from "react";
 
 import { fetchAgents } from "../api/client";
 import type { AgentInfo } from "../api/types";
+import { EdgeOrbit } from "../components/EdgeOrbit";
+import { agentKey, agentStatus, isAgentFull } from "../components/orbitGeometry";
 import { Badge, EmptyState, IconButton, PageHeader, Panel, PanelHead } from "../components/ui";
 import { useAuth } from "../auth/useAuth";
 import { useMetricsHistoryOptional } from "../hooks/useMetricsHistory";
@@ -19,26 +21,34 @@ const FILTERS: { id: Filter; label: string }[] = [
   { id: "stale", label: "掉线" },
 ];
 
-function isFull(a: AgentInfo) {
-  return a.max_concurrency > 0 && a.inflight >= a.max_concurrency;
-}
-
-function statusOf(a: AgentInfo): { label: string; tone: "ok" | "warn" | "err" } {
-  if (!a.healthy) return { label: "失联", tone: "err" };
-  if (isFull(a)) return { label: "已满", tone: "warn" };
-  return { label: "在线", tone: "ok" };
-}
-
-function AgentCard({ agent }: { agent: AgentInfo }) {
-  const status = statusOf(agent);
+function AgentCard({
+  agent,
+  selected,
+  onSelect,
+}: {
+  agent: AgentInfo;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const status = agentStatus(agent);
   const load = agent.max_concurrency > 0 ? (agent.inflight / agent.max_concurrency) * 100 : 0;
-  const rowKey = `${agent.agent_id}@${agent.ip ?? ""}`;
   const tenant = agent.tenant_id ?? "default";
 
   return (
     <article
-      key={rowKey}
-      className="panel group flex flex-col p-4 transition-colors hover:border-[#34485a]"
+      className={`panel group flex flex-col p-4 transition-colors hover:border-[#34485a] ${
+        selected ? "border-signal/50 ring-1 ring-signal/20" : ""
+      }`}
+      tabIndex={0}
+      aria-current={selected ? "true" : undefined}
+      onClick={onSelect}
+      onFocus={onSelect}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect();
+        }
+      }}
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
@@ -115,6 +125,8 @@ export default function Agents() {
   const latest = metrics?.latest ?? null;
   const [filter, setFilter] = useState<Filter>("all");
   const [search, setSearch] = useState("");
+  const [view, setView] = useState<"grid" | "orbit">("grid");
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
   const detailQuery = useQuery({
     queryKey: ["admin", "agents"],
@@ -139,12 +151,18 @@ export default function Agents() {
       ) {
         return false;
       }
-      if (filter === "healthy") return a.healthy && !isFull(a);
-      if (filter === "full") return a.healthy && isFull(a);
+      if (filter === "healthy") return a.healthy && !isAgentFull(a);
+      if (filter === "full") return a.healthy && isAgentFull(a);
       if (filter === "stale") return !a.healthy;
       return true;
     });
   }, [agents, filter, search]);
+
+  const effectiveSelectedKey =
+    selectedKey && filtered.some((a) => agentKey(a) === selectedKey) ? selectedKey : null;
+  const selectedAgent = effectiveSelectedKey
+    ? (filtered.find((a) => agentKey(a) === effectiveSelectedKey) ?? null)
+    : null;
 
   const capacity =
     agents.length > 0
@@ -162,6 +180,18 @@ export default function Agents() {
         description="edge-agent 的在线状态、模型声明与并发容量。节点通过 QUIC 反向拨号接入，状态以网关判定为准。"
         actions={
           <>
+            <div className="orbit-toggle" role="group" aria-label="Agent 视图">
+              <button type="button" aria-pressed={view === "grid"} onClick={() => setView("grid")}>
+                卡片
+              </button>
+              <button
+                type="button"
+                aria-pressed={view === "orbit"}
+                onClick={() => setView("orbit")}
+              >
+                Orbit
+              </button>
+            </div>
             <Badge tone={latest && latest.agents_healthy > 0 ? "ok" : "warn"}>
               <span
                 className={`status-dot ${
@@ -260,6 +290,21 @@ export default function Agents() {
           </div>
         )}
 
+        {view === "grid" && selectedAgent && (
+          <div className="orbit-selected-strip">
+            <span>
+              <span className="micro-label">SELECTED</span>{" "}
+              <span className="font-mono text-[11px] text-paper">{selectedAgent.agent_id}</span>
+              <span className="ml-2 text-[10px] text-mist">
+                {selectedAgent.tenant_id ?? "default"}
+              </span>
+            </span>
+            <button type="button" className="btn btn-secondary" onClick={() => setView("orbit")}>
+              查看 Orbit
+            </button>
+          </div>
+        )}
+
         <div className="panel-body">
           {detailQuery.isPending ? (
             <EmptyState title="加载中…" detail="正在读取 /admin/agents 快照。" />
@@ -289,10 +334,23 @@ export default function Agents() {
             />
           ) : filtered.length === 0 ? (
             <EmptyState title="没有匹配的 agent" detail="调整状态筛选或搜索词。" icon="search" />
+          ) : view === "orbit" ? (
+            <EdgeOrbit
+              agents={filtered}
+              selectedKey={effectiveSelectedKey}
+              onSelect={setSelectedKey}
+              onRefetch={() => void detailQuery.refetch()}
+              staleAfterLabel="STATUS FROM GATEWAY · NO FRONTEND THRESHOLD"
+            />
           ) : (
             <div className="grid gap-3 md:grid-cols-2">
               {filtered.map((agent) => (
-                <AgentCard key={`${agent.agent_id}@${agent.ip ?? ""}`} agent={agent} />
+                <AgentCard
+                  key={agentKey(agent)}
+                  agent={agent}
+                  selected={agentKey(agent) === effectiveSelectedKey}
+                  onSelect={() => setSelectedKey(agentKey(agent))}
+                />
               ))}
             </div>
           )}
