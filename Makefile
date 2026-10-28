@@ -251,7 +251,7 @@ certs-required:
 
 gateway-config.yml: | certs-required
 	@echo "生成本地开发 gateway-config.yml（admin_token: dev-admin）..."
-	@printf 'listen_addr: "0.0.0.0:8080"\nquic_addr: "0.0.0.0:4433"\ncert: certs/out/server.crt\nkey: certs/out/server.key\nca: certs/out/ca.crt\nadmin_token: dev-admin\nkeys_file: keys.db\n' > gateway-config.yml
+	@printf 'listen_addr: "0.0.0.0:8080"\nquic_addr: "0.0.0.0:4433"\ncert: certs/out/server.crt\nkey: certs/out/server.key\nca: certs/out/ca.crt\nadmin_token: dev-admin\nkeys_file: keys.db\n# 本地 make dev 使用内置 default tenant；生产必须删除这一行并用 tenant agent token。\nallow_legacy_agent_registration: true\n' > gateway-config.yml
 
 $(AGENT_CONFIG): | certs-required
 	@echo "生成本地 agent 配置 $(AGENT_CONFIG)..."
