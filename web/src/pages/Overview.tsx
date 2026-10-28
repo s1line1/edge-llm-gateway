@@ -157,7 +157,7 @@ export default function Overview() {
           hint={latest ? `可路由；已注册 ${latest.agents}（含心跳过期）` : "可路由"}
           tone={latest && latest.agents_healthy > 0 ? "ok" : "warn"}
         >
-          <Sparkline data={agents} height={34} stroke="#b9f27b" />
+          <Sparkline data={agents} height={34} stroke="var(--ui-chart-1)" />
         </MetricCard>
         <MetricCard
           label="在途请求"
@@ -165,7 +165,7 @@ export default function Overview() {
           hint="当前并发转发中"
           tone="cyan"
         >
-          <Sparkline data={active} height={34} stroke="#79d7d1" />
+          <Sparkline data={active} height={34} stroke="var(--ui-chart-2)" />
         </MetricCard>
         <MetricCard
           label="累计请求"
@@ -202,7 +202,7 @@ export default function Overview() {
             {active.length < 2 ? (
               <ChartPending label="启动采样中 · 5s" />
             ) : (
-              <Sparkline data={active} height={96} stroke="#79d7d1" />
+              <Sparkline data={active} height={96} stroke="var(--ui-chart-2)" />
             )}
           </div>
         </Panel>
@@ -216,7 +216,7 @@ export default function Overview() {
             {agents.length < 2 ? (
               <ChartPending label="启动采样中 · 5s" />
             ) : (
-              <Sparkline data={agents} height={96} stroke="#b9f27b" />
+              <Sparkline data={agents} height={96} stroke="var(--ui-chart-1)" />
             )}
           </div>
         </Panel>

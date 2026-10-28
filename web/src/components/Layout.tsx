@@ -4,6 +4,7 @@ import { useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 
 import { useAuth } from "../auth/useAuth";
+import AppearanceMenu from "./AppearanceMenu";
 import { useMetricsHistoryOptional } from "../hooks/useMetricsHistory";
 import { GatewayMark, Icon, type IconName } from "./icons";
 import { Badge, IconButton, StatusPill } from "./ui";
@@ -91,7 +92,7 @@ export default function Layout() {
     <div className="flex min-h-screen bg-ink-950">
       <aside
         id="app-navigation"
-        className={`fixed inset-y-0 left-0 z-40 flex w-[248px] shrink-0 flex-col border-r border-line bg-ink-900/95 backdrop-blur-xl transition-transform duration-200 lg:sticky lg:top-0 lg:h-dvh lg:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-40 flex w-[248px] shrink-0 flex-col border-r border-line app-rail backdrop-blur-xl transition-transform duration-200 lg:sticky lg:top-0 lg:h-dvh lg:translate-x-0 ${
           navOpen ? "translate-x-0" : "-translate-x-full"
         }`}
       >
@@ -181,13 +182,13 @@ export default function Layout() {
         <button
           type="button"
           aria-label="关闭导航遮罩"
-          className="fixed inset-0 z-30 bg-ink-950/70 backdrop-blur-sm lg:hidden"
+          className="app-scrim fixed inset-0 z-30 backdrop-blur-sm lg:hidden"
           onClick={() => setNavOpen(false)}
         />
       )}
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-20 flex h-[62px] items-center justify-between gap-4 border-b border-line bg-ink-950/80 px-4 backdrop-blur-xl sm:px-6 lg:px-9">
+        <header className="sticky top-0 z-20 flex h-[62px] items-center justify-between gap-4 border-b border-line app-topbar px-4 backdrop-blur-xl sm:px-6 lg:px-9">
           <div className="flex min-w-0 items-center gap-2.5">
             <span className="text-signal lg:hidden">
               <GatewayMark size={20} />
@@ -207,6 +208,7 @@ export default function Layout() {
             </div>
           </div>
           <div className="flex items-center gap-3">
+            <AppearanceMenu />
             {metrics?.error && (
               <span
                 className="hidden max-w-[180px] truncate font-mono text-[10px] text-amber sm:inline"

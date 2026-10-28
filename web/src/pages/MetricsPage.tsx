@@ -62,7 +62,7 @@ export default function MetricsPage() {
           hint="gauge · 当前并发"
           tone="cyan"
         >
-          <Sparkline data={active} height={30} stroke="#79d7d1" />
+          <Sparkline data={active} height={30} stroke="var(--ui-chart-2)" />
         </MetricCard>
         <MetricCard
           label="在线 Agent 数"
@@ -70,21 +70,21 @@ export default function MetricsPage() {
           hint="gauge · 已注册，含过期"
           tone="ok"
         >
-          <Sparkline data={agents} height={30} stroke="#b9f27b" />
+          <Sparkline data={agents} height={30} stroke="var(--ui-chart-1)" />
         </MetricCard>
         <MetricCard
           label="累计请求数"
           value={latest ? latest.request_count.toLocaleString() : "—"}
           hint="counter · since start"
         >
-          <Sparkline data={counts} height={30} stroke="#f5c46e" />
+          <Sparkline data={counts} height={30} stroke="var(--ui-chart-3)" />
         </MetricCard>
         <MetricCard
           label="累计转发字节"
           value={latest ? formatBytes(latest.bytes_out) : "—"}
           hint="counter · client bytes"
         >
-          <Sparkline data={bytes} height={30} stroke="#ff8b7b" />
+          <Sparkline data={bytes} height={30} stroke="var(--ui-chart-4)" />
         </MetricCard>
       </div>
 
@@ -99,7 +99,7 @@ export default function MetricsPage() {
             {active.length < 2 ? (
               <ChartPending label="启动采样中 · 5s" />
             ) : (
-              <Sparkline data={active} height={116} stroke="#79d7d1" />
+              <Sparkline data={active} height={116} stroke="var(--ui-chart-2)" />
             )}
           </div>
         </Panel>
@@ -113,7 +113,7 @@ export default function MetricsPage() {
             {agents.length < 2 ? (
               <ChartPending label="启动采样中 · 5s" />
             ) : (
-              <Sparkline data={agents} height={116} stroke="#b9f27b" />
+              <Sparkline data={agents} height={116} stroke="var(--ui-chart-1)" />
             )}
           </div>
         </Panel>
@@ -127,7 +127,7 @@ export default function MetricsPage() {
             {counts.length < 2 ? (
               <ChartPending label="启动采样中 · 5s" />
             ) : (
-              <Sparkline data={counts} height={116} stroke="#f5c46e" />
+              <Sparkline data={counts} height={116} stroke="var(--ui-chart-3)" />
             )}
           </div>
         </Panel>
@@ -141,7 +141,7 @@ export default function MetricsPage() {
             {bytes.length < 2 ? (
               <ChartPending label="启动采样中 · 5s" />
             ) : (
-              <Sparkline data={bytes} height={116} stroke="#ff8b7b" />
+              <Sparkline data={bytes} height={116} stroke="var(--ui-chart-4)" />
             )}
           </div>
         </Panel>

@@ -3,7 +3,41 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#06090d" />
     <title>Edge LLM Gateway</title>
+    <style>
+      html { background: #06090d; }
+      html[data-theme="light"] { background: #f2eee5; }
+    </style>
+    <script>
+      (function () {
+        var key = "hlmg.ui.appearance.v1";
+        var theme = "system";
+        var accent = "signal";
+        try {
+          var raw = localStorage.getItem(key);
+          if (raw) {
+            var value = JSON.parse(raw);
+            if (value && (value.theme === "system" || value.theme === "light" || value.theme === "dark")) theme = value.theme;
+            if (value && (value.accent === "signal" || value.accent === "cyan" || value.accent === "amber")) accent = value.accent;
+          }
+        } catch (_) {}
+        var resolved = theme;
+        if (theme === "system") {
+          try {
+            resolved = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+          } catch (_) {
+            resolved = "dark";
+          }
+        }
+        var root = document.documentElement;
+        root.setAttribute("data-theme", resolved);
+        root.setAttribute("data-accent", accent);
+        root.style.colorScheme = resolved;
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute("content", resolved === "light" ? "#f2eee5" : "#06090d");
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

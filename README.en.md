@@ -153,7 +153,8 @@ the local LLM, and stream the response back. Point `upstream` at your local serv
 **Observability**
 - `/metrics` in Prometheus text format; `/healthz` liveness probe (JSON body with agent diagnostics)
 - Structured request logs carrying `request_id`, status and latency
-- Built-in React admin dashboard: overview / API keys / agents / metrics
+- Built-in React admin dashboard: overview / API keys / agents / metrics; Agents offers card and Orbit radial views
+- Appearance preference: system / light / dark theme and accent preset, stored only in this browser
 
 ---
 

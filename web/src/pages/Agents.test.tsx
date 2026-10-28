@@ -4,7 +4,7 @@
 // `null` 返回（不进 `isError`）⇒ 那段永远为假 ⇒ 404 被显示成"暂无在线 agent"，把"未知"说成"零"。
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentInfo } from "../api/types";
@@ -76,6 +76,19 @@ describe("Agents 页的明细降级（P3-18①）", () => {
     expect(await screen.findByText("暂无在线 agent")).toBeDefined();
     expect(screen.queryByText(/返回 404/)).toBeNull();
     expect(screen.getByText(/来自 \/admin\/agents/)).toBeDefined();
+  });
+
+  it("默认卡片视图，并可以切换到 Orbit 选择节点", async () => {
+    mocks.fetchAgents.mockResolvedValue([oneAgent]);
+    renderPage();
+
+    expect(await screen.findByText("agent-1")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Orbit" }));
+    expect(await screen.findByRole("group", { name: "Edge orbit" })).toBeDefined();
+    const node = screen.getByRole("button", { name: /agent-1 · 在线/ });
+    fireEvent.click(node);
+    expect(screen.getByText("SELECTED")).toBeDefined();
+    expect(node.getAttribute("aria-pressed")).toBe("true");
   });
 
   it("拿到明细时渲染表格（防止降级分支把正常路径吃掉）", async () => {

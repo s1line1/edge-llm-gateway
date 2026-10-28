@@ -7,6 +7,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 
 import { bootstrapAdmin, bootstrapStatus } from "../api/auth";
 import { useAuth } from "../auth/useAuth";
+import AppearanceMenu from "../components/AppearanceMenu";
 import { GatewayMark, Icon } from "../components/icons";
 import { Badge, Button, Field } from "../components/ui";
 
@@ -53,16 +54,12 @@ export default function Login() {
 
   return (
     <div className="app-canvas flex min-h-screen items-stretch px-4 py-4 sm:px-6 lg:px-8">
-      <div className="mx-auto grid w-full max-w-6xl overflow-hidden rounded-2xl border border-line bg-ink-900/80 shadow-2xl lg:grid-cols-[1.18fr_0.82fr]">
+      <div className="relative mx-auto grid w-full max-w-6xl overflow-hidden rounded-2xl border border-line bg-ink-900/80 shadow-2xl lg:grid-cols-[1.18fr_0.82fr]">
+        <div className="absolute right-4 top-4 z-20">
+          <AppearanceMenu />
+        </div>
         <section className="relative hidden flex-col justify-between overflow-hidden border-r border-line p-10 lg:flex">
-          <div
-            className="pointer-events-none absolute inset-0 opacity-70"
-            style={{
-              backgroundImage:
-                "linear-gradient(rgba(143,162,182,0.055) 1px, transparent 1px), linear-gradient(90deg, rgba(143,162,182,0.055) 1px, transparent 1px)",
-              backgroundSize: "36px 36px",
-            }}
-          />
+          <div className="login-grid pointer-events-none absolute inset-0 opacity-70" />
           <div className="relative">
             <div className="flex items-center gap-3">
               <span className="text-signal">
