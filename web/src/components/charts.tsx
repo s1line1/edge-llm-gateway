@@ -6,7 +6,7 @@ export function Sparkline({
   data,
   width = 320,
   height = 56,
-  stroke = "#b9f27b",
+  stroke = "var(--ui-chart-1)",
   fill = true,
 }: {
   data: number[];
@@ -56,7 +56,7 @@ export function Sparkline({
       </defs>
       <path
         d={`M ${pad} ${height - pad} L ${width - pad} ${height - pad}`}
-        stroke="rgba(143,162,182,0.16)"
+        stroke="var(--ui-line)"
         strokeWidth="1"
         strokeDasharray="2 4"
       />
@@ -65,7 +65,7 @@ export function Sparkline({
         <>
           <path
             d={`M ${pad} ${height / 2} L ${width - pad} ${height / 2}`}
-            stroke="rgba(143,162,182,0.2)"
+            stroke="var(--ui-line-soft)"
             strokeWidth="1"
             strokeDasharray="2 5"
           />
@@ -89,7 +89,7 @@ export function Sparkline({
 /** 采样点不足两个时的图表占位：明确告诉用户还要等多久，而不是留一块空白。 */
 export function ChartPending({ label = "等待第二个采样点…" }: { label?: string }) {
   return (
-    <div className="flex h-full min-h-24 items-center justify-center rounded-lg border border-dashed border-line-soft bg-ink-950/25">
+    <div className="surface-soft flex h-full min-h-24 items-center justify-center rounded-lg border border-dashed border-line-soft">
       <span className="font-mono text-[10px] tracking-[0.06em] text-mist-dim">{label}</span>
     </div>
   );
@@ -112,7 +112,7 @@ export function BarList({ items }: { items: { label: string; value: number; colo
                 className="h-full rounded-full transition-[width] duration-500"
                 style={{
                   width: `${(it.value / max) * 100}%`,
-                  background: it.color ?? (isError ? "var(--color-coral)" : "var(--color-signal)"),
+                  background: it.color ?? (isError ? "var(--ui-coral)" : "var(--ui-accent)"),
                 }}
                 title={`${it.label}: ${it.value}`}
               />

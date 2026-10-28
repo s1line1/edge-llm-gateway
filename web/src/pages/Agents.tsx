@@ -36,7 +36,7 @@ function AgentCard({
 
   return (
     <article
-      className={`panel group flex flex-col p-4 transition-colors hover:border-[#34485a] ${
+      className={`panel group flex flex-col p-4 transition-colors hover:border-[var(--ui-line-strong)] ${
         selected ? "border-signal/50 ring-1 ring-signal/20" : ""
       }`}
       tabIndex={0}

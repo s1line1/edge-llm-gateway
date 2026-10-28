@@ -132,6 +132,7 @@ agent 只做一件事：把隧道里收到的请求帧，变成一次对本地 L
 - `/metrics` Prometheus 文本格式；`/healthz` 存活探针（JSON body 带 agent 诊断信息）
 - 结构化请求日志，每个请求带 `request_id`、状态码、耗时
 - 内置 React 管理面板：总览 / API Keys / Agents / 指标；Agents 支持卡片与 Orbit 径向视图
+- 界面支持跟随系统 / 浅色 / 深色主题与强调色，偏好只保存在本浏览器
 
 ---
 

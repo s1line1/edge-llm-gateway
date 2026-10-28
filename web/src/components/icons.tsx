@@ -18,7 +18,11 @@ export type IconName =
   | "arrow"
   | "shield"
   | "terminal"
-  | "chevron";
+  | "chevron"
+  | "sun"
+  | "moon"
+  | "display"
+  | "palette";
 
 const paths: Record<IconName, string[]> = {
   overview: ["M4 4h6v6H4z", "M14 4h6v6h-6z", "M4 14h6v6H4z", "M14 14h6v6h-6z"],
@@ -42,6 +46,25 @@ const paths: Record<IconName, string[]> = {
   shield: ["M12 3 20 6v6c0 4.5-3.4 7.8-8 9-4.6-1.2-8-4.5-8-9V6l8-3Z", "m9 12 2 2 4-4"],
   terminal: ["M4 5h16v14H4z", "m7 9 2 2-2 2", "M12 13h4"],
   chevron: ["m9 18 6-6-6-6"],
+  sun: [
+    "M12 3v2",
+    "M12 19v2",
+    "M4.2 4.2l1.4 1.4",
+    "M18.4 18.4l1.4 1.4",
+    "M3 12h2",
+    "M19 12h2",
+    "M4.2 19.8l1.4-1.4",
+    "M18.4 5.6l1.4-1.4",
+    "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z",
+  ],
+  moon: ["M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z"],
+  display: ["M4 5h16v11H4z", "M9 20h6", "M12 16v4"],
+  palette: [
+    "M12 3a9 9 0 1 0 0 18h1.5a2 2 0 0 0 0-4H12a2 2 0 0 1 0-4h4a5 5 0 0 0 0-10h-4Z",
+    "M7.5 8h.01",
+    "M7.5 12h.01",
+    "M10 6h.01",
+  ],
 };
 
 export function Icon({
