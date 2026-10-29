@@ -122,41 +122,6 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
-
-    /// 在临时目录生成 (ca, server.crt, server.key) 并返回路径。
-    fn gen_cert_files(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
-        let ca_key = KeyPair::generate().unwrap();
-        let mut ca = CertificateParams::default();
-        ca.distinguished_name.push(DnType::CommonName, "test ca");
-        ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
-        let ca_cert = ca.self_signed(&ca_key).unwrap();
-
-        let srv_key = KeyPair::generate().unwrap();
-        let mut srv = CertificateParams::default();
-        srv.distinguished_name.push(DnType::CommonName, "gw");
-        srv.subject_alt_names = vec![SanType::DnsName("localhost".try_into().unwrap())];
-        let srv_cert = srv.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
-
-        let write = |name: &str, content: &str| {
-            let p = dir.join(name);
-            std::fs::write(&p, content).unwrap();
-            p
-        };
-        (
-            write("ca.crt", &ca_cert.pem()),
-            write("server.crt", &srv_cert.pem()),
-            write("server.key", &srv_key.serialize_pem()),
-        )
-    }
-
-    /// 规格（复扫 A6）：**非终端一律不上色**，且 `NO_COLOR` 的语义保持不变。
-    ///
-    /// 这条判据没法在进程内用真日志验证（tracing 的全局订阅者只能装一次，而测试进程的 stdout
-    /// 恰好是 libtest 的管道），所以这里钉纯函数表；"日志真的落盘时干净"由真进程 e2e
-    /// `signals::e2e_logs_written_to_a_file_are_not_colored` 覆盖（它把子进程 stdout 指向文件，
-    /// 并**显式清掉继承来的 `NO_COLOR`**，否则测的就不是 TTY 判据了）。
     #[test]
     fn logs_are_only_colored_on_a_terminal() {
         let empty = OsStr::new("");
@@ -190,22 +155,19 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
 
-        // 写一份完整配置到临时目录
+        // 写一份完整配置到临时目录（PKI 模式：启动不生成证书）
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
         let config_path = dir.path().join("config.yml");
         let yaml = format!(
             r#"
 listen_addr: "127.0.0.1:{port}"
 quic_addr: "127.0.0.1:0"
-cert: {}
-key: {}
-ca: {}
+pki:
+  enabled: true
+  dir: {}
 keys_file: {}
 "#,
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-            ca.to_str().unwrap(),
+            dir.path().join("pki").to_str().unwrap(),
             dir.path().join("keys.db").to_str().unwrap(),
         );
         std::fs::write(&config_path, &yaml).unwrap();

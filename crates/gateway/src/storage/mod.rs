@@ -36,6 +36,7 @@ use rusqlite::Connection;
 use crate::error::GatewayError;
 
 pub mod hash;
+mod pki;
 mod session;
 mod tenant;
 mod usage;
@@ -48,6 +49,7 @@ pub use tenant::{CreatedTenant, TenantError, TenantPatch, TenantRecord};
 pub use user::{AuditRecord, CreatedUser, UserError, UserPatch, UserRecord, UserRole};
 
 /// 用量记账/落库的类型由私有模块 `usage` 定义，路径 `crate::storage::UsageDelta` 保持不变。
+pub use pki::PkiRecord;
 pub use usage::{KeyUsageInfo, UsageDelta};
 
 use crate::storage::hash::{

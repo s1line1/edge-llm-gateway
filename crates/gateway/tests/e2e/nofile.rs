@@ -121,8 +121,11 @@ async fn a_failed_start_leaves_the_process_nofile_limit_untouched() {
     // 隧道材料合法、只有 HTTPS 材料是垃圾 → 失败点必然在 TLS 构建阶段，早于 install()
     let (ca, server_cert, server_key, _client_cert, _client_key) = gen_certs();
     let result = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls::from_der(vec![ca], vec![server_cert], server_key)
-            .expect("gen_certs returns non-empty material"),
+        tunnel: Some(
+            TunnelTls::from_der(vec![ca], vec![server_cert], server_key)
+                .expect("gen_certs returns non-empty material"),
+        ),
+        pki: None,
         opts: Options {
             https: Some(TlsPem {
                 cert: b"not a pem".to_vec(),

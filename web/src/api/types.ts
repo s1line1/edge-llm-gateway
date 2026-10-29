@@ -167,3 +167,38 @@ export interface AuditRecord {
   target_id: string;
   created_at: number;
 }
+
+/** On-demand PKI status (`GET /admin/pki/status`). */
+export interface PkiStatus {
+  enabled: boolean;
+  credentials: number;
+  tunnel_ready: boolean;
+  waiting_for_credentials: boolean;
+}
+
+/** A paired server/client credential. The private key is only in the one-time tar. */
+export interface PkiPair {
+  id: string;
+  name: string;
+  tenant_id: string;
+  server_name: string;
+  serial: string;
+  ca_fingerprint_sha256: string;
+  server_fingerprint_sha256: string;
+  client_fingerprint_sha256: string;
+  status: "waiting" | "connected" | "revoked" | "expired";
+  created_at: number;
+  created_by: string;
+  downloaded_at: number | null;
+  last_connected_at: number | null;
+  revoked_at: number | null;
+  client_not_after: number;
+  download_url: string | null;
+}
+
+export interface CreatePkiPairBody {
+  name: string;
+  tenant_id: string;
+  server_name: string;
+  server_sans?: string[];
+}

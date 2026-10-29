@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::{storage::Storage, GatewayConfig, Options, TlsPem, TunnelTls};
+use crate::{pki::PkiConfig, storage::Storage, GatewayConfig, Options, TlsPem, TunnelTls};
 
 /// YAML 配置文件结构。所有字段均有默认值；`cert`/`key`/`ca` 必须显式提供。
 #[derive(Debug, Deserialize)]
@@ -153,6 +153,10 @@ pub struct ConfigFile {
     /// 公网入口 HTTPS 私钥 PEM（与 tls_cert 成对）
     #[serde(default)]
     tls_key: Option<PathBuf>,
+    /// On-demand credential management. When enabled, the legacy certificate fields above are
+    /// ignored/rejected; no certificate is generated at startup.
+    #[serde(default)]
+    pki: Option<PkiConfig>,
     /// React UI 静态目录（含 index.html）。
     ///
     /// **不写这一项 = 用 [`default_ui_dir`] 的镜像内路径**（`/usr/local/share/home-llm-gateway/web`），
@@ -252,6 +256,19 @@ fn default_max_open_tunnel_streams() -> u32 {
 pub fn from_path(path: &PathBuf) -> anyhow::Result<GatewayConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read config file {}", path.display()))?;
+    let raw: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text)
+        .with_context(|| format!("invalid config file {}", path.display()))?;
+    if let Some(map) = raw.as_mapping() {
+        for key in ["cert", "key", "ca", "tls_cert", "tls_key"] {
+            if map.contains_key(serde_yaml_ng::Value::String(key.to_string())) {
+                anyhow::bail!(
+                    "config: `{key}` is no longer supported; the gateway does not load fixed \
+                     certificate paths. Remove it and create a credential pair through \
+                     /admin/pki/pairs (see the pki section in gateway-config.example.yml)."
+                );
+            }
+        }
+    }
     let file_cfg: ConfigFile = serde_yaml_ng::from_str(&text)
         .with_context(|| format!("invalid config file {}", path.display()))?;
     from_file(file_cfg)
@@ -262,14 +279,30 @@ pub fn from_path(path: &PathBuf) -> anyhow::Result<GatewayConfig> {
 /// 这里是**唯一**的 YAML 字段名 → 类型化旋钮映射点：`Options` 的每个字段都显式写出来，
 /// 这是映射的职责；测试与库调用方则用 `..Options::default()` 只写自己要改的那些。
 pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
-    if cfg.cert.as_os_str().is_empty()
-        || cfg.key.as_os_str().is_empty()
-        || cfg.ca.as_os_str().is_empty()
-    {
-        anyhow::bail!("config: cert/key/ca paths are required");
-    }
-    let tunnel = TunnelTls::from_pem_files(&cfg.ca, &cfg.cert, &cfg.key)
-        .context("config: cannot load the tunnel cert/key/ca")?;
+    let pki = cfg.pki.clone().filter(|p| p.enabled);
+    let legacy_cert_set = !cfg.cert.as_os_str().is_empty()
+        || !cfg.key.as_os_str().is_empty()
+        || !cfg.ca.as_os_str().is_empty();
+    let (tunnel, pki) = match pki {
+        Some(pki) => {
+            if legacy_cert_set || cfg.tls_cert.is_some() || cfg.tls_key.is_some() {
+                anyhow::bail!(
+                    "config: pki.enabled cannot be combined with cert/key/ca/tls_cert/tls_key; \
+                     remove the fixed certificate fields"
+                );
+            }
+            (None, Some(pki))
+        }
+        None => {
+            if !legacy_cert_set {
+                anyhow::bail!("config: cert/key/ca paths are required when pki is not enabled");
+            }
+            let tunnel = TunnelTls::from_pem_files(&cfg.ca, &cfg.cert, &cfg.key)
+                .context("config: cannot load the tunnel cert/key/ca")?;
+            let _ = (cfg.tls_cert.as_ref(), cfg.tls_key.as_ref());
+            (Some(tunnel), None)
+        }
+    };
     let https = match (&cfg.tls_cert, &cfg.tls_key) {
         (Some(c), Some(k)) => Some(
             TlsPem::from_pem_files(c, k)
@@ -281,6 +314,7 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
 
     Ok(GatewayConfig {
         tunnel,
+        pki,
         opts: Options {
             http_bind: cfg
                 .listen_addr
@@ -562,17 +596,23 @@ rate_limit_per_min: 60
     #[test]
     fn from_path_reads_and_maps() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
         let config_path = dir.path().join("config.yml");
         let yaml = format!(
-            "listen_addr: \"127.0.0.1:8080\"\nquic_addr: \"127.0.0.1:4433\"\ncert: {}\nkey: {}\nca: {}\n",
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-            ca.to_str().unwrap(),
+            "listen_addr: \"127.0.0.1:8080\"\nquic_addr: \"127.0.0.1:4433\"\npki:\n  enabled: true\n  dir: {}\n",
+            dir.path().join("pki").to_str().unwrap(),
         );
         std::fs::write(&config_path, &yaml).unwrap();
         let cfg = from_path(&config_path).unwrap();
         assert_eq!(cfg.opts.http_bind.to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn from_path_rejects_fixed_certificate_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.yml");
+        std::fs::write(&path, "cert: old.crt\nkey: old.key\nca: old.ca\n").unwrap();
+        let err = from_path(&path).unwrap_err().to_string();
+        assert!(err.contains("no longer supported"), "err: {err}");
     }
 
     #[test]

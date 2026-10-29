@@ -185,7 +185,7 @@ run-mock: ## debug 运行 mock-llm（127.0.0.1:11435）
 run-agent: $(AGENT_CONFIG) ## debug 运行 edge-agent（连本地网关，转发到 mock-llm）
 	cargo run -p agent -- --config $(AGENT_CONFIG)
 
-dev: build-debug gateway-config.yml $(AGENT_CONFIG) ## 一键起全栈（mock-llm + gateway + agent，后台，日志在 .tmp/logs/；会先编译）
+dev: build-debug gateway-config.yml ## 一键起全栈（mock-llm + gateway + agent，后台，日志在 .tmp/logs/；会先编译）
 	@mkdir -p $(LOGDIR)
 	@echo "== 启动 mock-llm (11435) =="
 	@nohup $(MOCK_BIN) --addr 127.0.0.1:11435 --name mock-llm > $(LOGDIR)/mock-llm.log 2>&1 & echo $$! > .tmp/mock-llm.pid
@@ -193,8 +193,15 @@ dev: build-debug gateway-config.yml $(AGENT_CONFIG) ## 一键起全栈（mock-ll
 	@echo "== 启动 gateway (8080 / UDP 4433) =="
 	@nohup $(GATEWAY_BIN) --config gateway-config.yml > $(LOGDIR)/gateway.log 2>&1 & echo $$! > .tmp/gateway.pid
 	@sleep 0.5
+	@echo "等待 gateway 健康检查..."
+	@for i in $$(seq 1 50); do \
+		if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then break; fi; \
+		sleep 0.2; \
+	done
+	@echo "== 创建 on-demand 凭证对（Gateway 启动本身不生成证书） =="
+	@bash scripts/dev-pki-client.sh http://127.0.0.1:8080 .tmp/dev-client
 	@echo "== 启动 agent =="
-	@nohup $(AGENT_BIN) --config $(AGENT_CONFIG) > $(LOGDIR)/agent.log 2>&1 & echo $$! > .tmp/agent.pid
+	@nohup $(AGENT_BIN) --config .tmp/agent-config.dev.yml > $(LOGDIR)/agent.log 2>&1 & echo $$! > .tmp/agent.pid
 	@sleep 1
 	@# 存活检查（P2-20）：以前不管进程死没死都报"✔ 全栈已启动"，二进制缺失时就是一个静默空栈。
 	@# 现在任一进程没活下来就失败退出，并把该进程日志末尾贴出来，好让人一眼看到原因。
@@ -251,7 +258,7 @@ certs-required:
 
 gateway-config.yml: | certs-required
 	@echo "生成本地开发 gateway-config.yml（admin_token: dev-admin）..."
-	@printf 'listen_addr: "0.0.0.0:8080"\nquic_addr: "0.0.0.0:4433"\ncert: certs/out/server.crt\nkey: certs/out/server.key\nca: certs/out/ca.crt\nadmin_token: dev-admin\nkeys_file: keys.db\n# 本地 make dev 使用内置 default tenant；生产必须删除这一行并用 tenant agent token。\nallow_legacy_agent_registration: true\n' > gateway-config.yml
+	@printf 'listen_addr: "0.0.0.0:8080"\nquic_addr: "0.0.0.0:4433"\nadmin_token: dev-admin\nkeys_file: keys.db\nui_dir: web/dist\npki:\n  enabled: true\n  dir: .tmp/pki\n  require_https_for_download: false\n# 本地 make dev 使用内置 default tenant；生产必须删除这一行并用 tenant agent token。\nallow_legacy_agent_registration: true\n' > gateway-config.yml
 
 $(AGENT_CONFIG): | certs-required
 	@echo "生成本地 agent 配置 $(AGENT_CONFIG)..."

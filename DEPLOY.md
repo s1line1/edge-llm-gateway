@@ -25,42 +25,49 @@ edge 节点（家里 / 分支 / 云主机）  agent → 本地 Ollama / vLLM / l
 | 域名（可选但推荐） | 有域名则证书 SAN 用 `DNS:`，IP 变更不影响；没有就用 `IP:` SAN 的自签证书 |
 | 本地 | 仓库已 clone（或 `dist/` 里有现成二进制） |
 
-## 1. 生成生产证书（最关键的一步）
+## 1. 凭证管理（不再使用固定 YAML 证书）
 
-开发脚本 `certs/gen-dev.sh` 的 server 证书 SAN 只有 `localhost/127.0.0.1`，**生产必须换成你的公网 IP 或域名**。在自己电脑上执行：
+Gateway 启动时**不会生成 CA 或证书**，也不再从 `gateway-config.yml` 读取
+`cert`/`key`/`ca`/`tls_cert`/`tls_key`。凭证是访问控制资源，只在需要时创建。
 
-```bash
-mkdir -p prod-certs && cd prod-certs
+首次部署：
 
-# 1) CA（只生成一次；ca.key 永远留在自己手里，绝不上服务器）
-openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout ca.key -out ca.crt -days 3650 -subj "/CN=HomeLLM CA"
-
-# 2) 网关服务端证书（SAN 填你的公网 IP 或域名，二者可都填）
-openssl req -newkey rsa:2048 -nodes \
-  -keyout server.key -out server.csr -subj "/CN=gw"
-cat > server.ext <<EOF
-subjectAltName=DNS:llm.example.com,IP:1.2.3.4
-extendedKeyUsage=serverAuth
-EOF
-openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
-  -out server.crt -days 825 -extfile server.ext
-
-# 3) 每台 LLM 机器单独签发一个客户端证书（mTLS）
-openssl req -newkey rsa:2048 -nodes \
-  -keyout client-edge1.key -out client-edge1.csr -subj "/CN=edge-agent-1"
-cat > client.ext <<EOF
-extendedKeyUsage=clientAuth
-EOF
-openssl x509 -req -in client-edge1.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
-  -out client-edge1.crt -days 825 -extfile client.ext
-# 有第二台就再签一份 client-edge2（CN 同名无害，agent_id 才是身份标识）
+```yaml
+pki:
+  enabled: true
+  dir: /etc/home-llm-gateway/pki
+  server_validity_days: 397
+  client_validity_days: 90
+  require_https_for_download: true
 ```
 
-分发：`ca.crt` 给两端；`server.crt/server.key` 给中转服务器；`client-edge1.crt/client-edge1.key` 给对应 agent 机器。
+1. 启动 Gateway（QUIC 入口此时没有可用 server 证书，握手会失败关闭）。
+2. 登录 Dashboard，进入 **Certificates**。
+3. 创建一对凭证，填写：
+   - 名称，例如 `gateway-1`
+   - **server_name**，必须是 DNS 名，且客户端会用同一个名字做 SNI，例如
+     `gateway.example.com`
+   - 额外 SAN（可选；若客户端还要按 IP 校验证书，可填公网 IP）
+4. 服务器自动生成并立即加载：
+   - 该 pair 专属 CA
+   - server 证书/私钥（留在 Gateway）
+   - client 证书/私钥（只下载一次）
+5. 下载 client tar，解压后得到：
+   ```text
+   ca.crt
+   client.crt
+   client.key
+   client-config.example.yml
+   ```
+6. 把解压出的 client 文件放到 agent 机器；server 私钥和 CA 私钥永不下发。
 
-> **证书轮换**：825 天有效期，到期前重签替换即可（重签后重启服务）。
-> 不建议用 Let's Encrypt：90 天自动续期需要给 rustls 热重载证书，个人项目自签更省事。
+> **管理后台 TLS**：本版本不再由 Gateway 自己加载固定 HTTPS 证书。生产请用
+> Caddy/nginx 终止 TLS，并转发到 `127.0.0.1:8080`；client 私钥下载默认要求 HTTPS
+> （或本机/SSH 隧道）。反向代理需发送 `X-Forwarded-Proto: https`。
+
+> **持久化**：`pki.dir` 必须在持久卷上。容器部署要挂载
+> `/etc/home-llm-gateway`（含 `pki/` 和 `keys.db`）；目录丢失会导致启动加载 active pair 失败，
+> 不会静默重新生成。
 
 ## 2. 安全组 + 防火墙
 
@@ -154,11 +161,10 @@ home-llm-gateway-<版本>-<平台>/
 sudo mkdir -p /etc/home-llm-gateway
 # 二进制（方案 A 构建后在 home-llm-gateway/target/release/ 下，方案 B 解包 dist/）
 sudo cp target/release/gateway /usr/local/bin/gateway
-# 证书：**直接放配置目录**——`gateway-config.example.yml` 里的 cert/key/ca 就是
-# /etc/home-llm-gateway/{server.crt,server.key,ca.crt}（没有 certs/ 子目录，别自建一层，
-# 否则示例配置"零改动"启动时读不到证书）
-sudo cp server.crt server.key ca.crt /etc/home-llm-gateway/
-sudo chmod 600 /etc/home-llm-gateway/server.key
+# 凭证：Gateway 启动时不再读取固定证书。首次启动后在 Dashboard 的 Certificates
+# 页面按需创建 client/server 成对凭证；server 半部分写入
+# /etc/home-llm-gateway/pki/pairs/<id>/，client 半部分只下载一次。
+# 确保该目录是持久卷，且不要手工放 server.key/ca.key 到配置根目录。
 # Web UI（可选）：本机构建后把产物整个上传（含 index.html + assets/）。
 # ⚠️ **层次要和配置里的 ui_dir 对齐**：下面保持 `web/dist/` 这一层，对应 ui_dir: web/dist
 #   cd web && pnpm install && pnpm build
@@ -195,8 +201,12 @@ sudo tail -f /var/log/home-llm-gateway/gateway.log
 ```yaml
 listen_addr: "0.0.0.0:8443"        # HTTPS API 入口
 quic_addr: "0.0.0.0:4433"          # QUIC 隧道（UDP）
-tls_cert / tls_key                 # 公网 HTTPS 证书（server.crt/server.key）
-cert / key / ca                    # QUIC 隧道证书（同 server 证书 + ca.crt）
+pki:                               # 按需凭证管理；启动不生成任何证书
+  enabled: true
+  dir: /etc/home-llm-gateway/pki
+  server_validity_days: 397
+  client_validity_days: 90
+  require_https_for_download: true
 admin_token: <强随机串>             # Admin API 口令（必配；用它创建第一个 API key）
 keys_file: /etc/home-llm-gateway/keys.db   # 动态 key 持久化数据库（SQLite，默认 keys.db）
 rate_limit_per_min: 60             # 每个 Key 每分钟上限
@@ -244,15 +254,15 @@ curl -s http://127.0.0.1:11434/v1/models          # 本机确认 OpenAI 兼容�
 sudo mkdir -p /etc/home-llm-gateway
 # 二进制（agent.service 的 ExecStart 是 /usr/local/bin/agent）
 sudo cp target/release/agent /usr/local/bin/agent
-# 证书：与 agent-config.example.yml 的路径一致（/etc/home-llm-gateway/{ca.crt,client.crt,client.key}）
-sudo cp ca.crt /etc/home-llm-gateway/ca.crt
-sudo cp client-edge1.crt /etc/home-llm-gateway/client.crt
-sudo cp client-edge1.key /etc/home-llm-gateway/client.key
+# 从 Dashboard 下载该 agent 对应 pair 的 client tar，解压后复制三件套
+# （每台 agent 使用独立 pair；不要共享 client.key）
+sudo mkdir -p /etc/home-llm-gateway
+sudo cp ca.crt client.crt client.key /etc/home-llm-gateway/
 sudo chmod 600 /etc/home-llm-gateway/client.key
 
 # 基于 agent-config.example.yml 生成 agent 配置：
 #   cloud_addr: <公网IP>:4433
-#   server_name: <与网关 server 证书 SAN 一致的域名或 IP>   ← 关键！不一致会 TLS 握手失败
+#   server_name: <创建 pair 时填写的 DNS server_name>   ← 关键！不一致会 TLS 握手失败
 #   agent_id: <每台机器唯一！>                              ← 关键！同名会让两台机器互踢（见下方警告）
 #   upstream: http://127.0.0.1:11434
 sudo cp agent-config.example.yml /etc/home-llm-gateway/agent-config.yml

@@ -59,7 +59,8 @@ pub fn e2e_options(keys_file: Option<PathBuf>) -> Options {
 /// 用给定旋钮组装一份 [`GatewayConfig`]（不启动）——要断言"启动**之前**就失败"的用例需要它。
 pub fn gateway_config(certs: &TestCerts, opts: Options) -> GatewayConfig {
     GatewayConfig {
-        tunnel: certs.tunnel_tls(),
+        tunnel: Some(certs.tunnel_tls()),
+        pki: None,
         opts,
     }
 }

@@ -759,8 +759,11 @@ async fn gateway_start_fails_fast_on_unusable_tls() {
     async fn start_with_tls(tls: TlsPem) -> Result<Gateway, gateway::error::GatewayError> {
         let (ca, server_cert, server_key, _client_cert, _client_key) = gen_certs();
         Gateway::start(GatewayConfig {
-            tunnel: TunnelTls::from_der(vec![ca], vec![server_cert], server_key)
-                .expect("gen_certs returns non-empty material"),
+            tunnel: Some(
+                TunnelTls::from_der(vec![ca], vec![server_cert], server_key)
+                    .expect("gen_certs returns non-empty material"),
+            ),
+            pki: None,
             opts: Options {
                 keys_file: None,
                 request_timeout: Duration::from_secs(5),

@@ -13,7 +13,7 @@ port), and you want to call it from anywhere with a standard OpenAI SDK — **wi
 local inference endpoint to the public Internet.**
 
 <p align="center">
-  <img alt="tests" src="https://img.shields.io/badge/tests-447%20passed-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-458%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -155,6 +155,7 @@ the local LLM, and stream the response back. Point `upstream` at your local serv
 - Structured request logs carrying `request_id`, status and latency
 - Built-in React admin dashboard: overview / API keys / agents / metrics; Agents offers card and Orbit radial views
 - Appearance preference: system / light / dark theme and accent preset, stored only in this browser
+- On-demand credentials: startup creates no certificates; a paired client/server credential is created only when needed, with the server half retained by the gateway and the client half downloadable once
 
 ---
 
@@ -367,7 +368,7 @@ fmt · clippy -D warnings · nextest · e2e wiring · toolchain-check · check-r
 
 `make check` adds `cargo deny` and the four web targets on top (web-format / web-lint / web-test / web-build).
 
-> **Current scale (`cargo nextest run --workspace`, measured)**: **447 tests executed and passed (0 skipped)**, of which
+> **Current scale (`cargo nextest run --workspace`, measured)**: **458 tests executed and passed (0 skipped)**, of which
 > **77 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
 > per commit; trust the actual run output.
 >
