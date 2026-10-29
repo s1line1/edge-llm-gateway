@@ -32,7 +32,9 @@ pub struct Options {
     ///
     /// 注意它是 **UDP**，与 `http_bind` 的端口号含义不同，可以重合。
     pub quic_bind: SocketAddr,
-    /// 提供后，公网入口启用 HTTPS（rustls）；与 QUIC 侧共用同一套身份材料。
+    /// Test-only HTTPS material for the entry. Production YAML no longer supplies fixed TLS
+    /// credentials; deployment TLS is terminated by a reverse proxy. Kept as a fixture for the
+    /// existing HTTPS e2e suite.
     pub https: Option<TlsPem>,
 
     // ── 落地 ──

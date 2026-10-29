@@ -13,7 +13,7 @@ port), and you want to call it from anywhere with a standard OpenAI SDK — **wi
 local inference endpoint to the public Internet.**
 
 <p align="center">
-  <img alt="tests" src="https://img.shields.io/badge/tests-447%20passed-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-456%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -155,6 +155,7 @@ the local LLM, and stream the response back. Point `upstream` at your local serv
 - Structured request logs carrying `request_id`, status and latency
 - Built-in React admin dashboard: overview / API keys / agents / metrics; Agents offers card and Orbit radial views
 - Appearance preference: system / light / dark theme and accent preset, stored only in this browser
+- On-demand credentials: startup creates no certificates; a paired client/server credential is created only when needed, with the server half retained by the gateway and the client half downloadable once
 
 ---
 
@@ -168,7 +169,7 @@ Everything runs locally, **no real model required** (`mock-llm` stands in for th
 ```bash
 git clone <repo> && cd home-llm-gateway
 
-make setup     # generate dev certificates (certs/out/) + install frontend deps
+make setup     # install frontend deps (the dev certificate script remains, but startup no longer loads fixed certificates)
 make dev       # build debug binaries, then bring up mock-llm + gateway + agent
                # if any process fails to start it exits with an error and prints that process's log tail
 ```
@@ -367,7 +368,7 @@ fmt · clippy -D warnings · nextest · e2e wiring · toolchain-check · check-r
 
 `make check` adds `cargo deny` and the four web targets on top (web-format / web-lint / web-test / web-build).
 
-> **Current scale (`cargo nextest run --workspace`, measured)**: **447 tests executed and passed (0 skipped)**, of which
+> **Current scale (`cargo nextest run --workspace`, measured)**: **456 tests executed and passed (0 skipped)**, of which
 > **77 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
 > per commit; trust the actual run output.
 >
@@ -452,12 +453,14 @@ crates/
 ├── proto/      tunnel frame protocol + shared primitives (frame codec, mTLS material loading,
 │               hop-by-hop / credential header filtering, path guard)
 ├── gateway/    cloud-gateway binary (Axum + Tokio + s2n-quic server + SQLite keystore)
+│   └── src/pki/ on-demand credentials: model/files/repo/tls/bundle/service
 ├── agent/      edge-agent binary (Tokio + s2n-quic client + reqwest)
 └── mock-llm/   fake OpenAI-compatible LLM (to bring up the chain without a real model)
 web/            React + TS admin dashboard (Vite + React 19 + Tailwind; served by the gateway)
-certs/          dev certificate generation script
+  └── src/styles/ theme/base/components/orbit/appearance layers
+certs/          dev certificate generation script (production no longer reads it)
 deploy/         systemd units (gateway.service / agent.service)
-scripts/        release packaging · k6 load tests · toolchain consistency check · git pre-commit hook
+scripts/        release packaging · k6 load tests · toolchain sync · dev/pki-client.sh · pre-commit hook
 gateway-config.example.yml / agent-config.example.yml   both config templates (all parameters documented)
 deny.toml       cargo-deny policy (dependency licenses / advisories)
 ```

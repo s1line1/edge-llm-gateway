@@ -7,8 +7,17 @@
 use std::{net::SocketAddr, time::Duration};
 
 use crate::{
-    error::GatewayError, http, listen, metrics::Metrics, nofile, quic, registry::Registry,
-    shutdown, state, storage::Storage, tls::TlsPem, usage_flush,
+    error::GatewayError,
+    http, listen,
+    metrics::Metrics,
+    nofile,
+    pki::{PkiConfig, PkiService},
+    quic,
+    registry::Registry,
+    shutdown, state,
+    storage::Storage,
+    tls::TlsPem,
+    usage_flush,
 };
 
 /// 启动旋钮住在 [`crate::options`]；这里再导出，保住 `gateway::Options` 这个既有公开路径
@@ -18,14 +27,41 @@ pub use crate::options::Options;
 /// 隧道身份材料住在 [`crate::tls`]；同样再导出以保住 `gateway::TunnelTls` 路径。
 pub use crate::tls::TunnelTls;
 
-/// 启动配置：**必填的身份材料** + 全部可选项。
+/// The single gateway identity source.
+#[derive(Debug)]
+pub enum GatewayIdentity {
+    /// Production: credentials are created on demand and loaded dynamically.
+    Pki(PkiConfig),
+    /// Test-only fixed tunnel fixture. Production YAML cannot construct this.
+    #[doc(hidden)]
+    TestFixed(TunnelTls),
+}
+
+/// 启动配置：**唯一身份来源** + 全部可选项。
 ///
 /// **不要**给它加 `#[non_exhaustive]`：`tests/e2e` 是独立 crate，加了之后连
 /// `..Options::default()` 这种 FRU 写法都用不了，正好毁掉本结构存在的意义。
 #[derive(Debug)]
 pub struct GatewayConfig {
-    pub tunnel: TunnelTls,
+    pub identity: GatewayIdentity,
     pub opts: Options,
+}
+
+impl GatewayConfig {
+    pub fn pki(config: PkiConfig, opts: Options) -> Self {
+        Self {
+            identity: GatewayIdentity::Pki(config),
+            opts,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn test_fixed(tunnel: TunnelTls, opts: Options) -> Self {
+        Self {
+            identity: GatewayIdentity::TestFixed(tunnel),
+            opts,
+        }
+    }
 }
 
 pub struct Gateway {
@@ -80,7 +116,7 @@ impl Gateway {
     /// `Verifier`、`Io`（端口占用）、`QuicStart`。**已知的刻意放宽**（保持原有设计）：NOFILE 抬不动
     /// 只 WARN、`ui_dir` 不可用只降级成占位页，两者都不阻止启动。
     pub async fn start(cfg: GatewayConfig) -> Result<Self, GatewayError> {
-        let GatewayConfig { tunnel, opts } = cfg;
+        let GatewayConfig { identity, opts } = cfg;
 
         // ⓪ 旋钮校验（记录 P2-8）：零值不是"关闭"而是"立刻超时"，其中 `head_timeout`/`agent_stale`
         //    的零值会让网关起来就开始全量 503。放在最前面——比 TLS 材料还早，因为这是配置作者的
@@ -91,7 +127,31 @@ impl Gateway {
         //    否则进程会"启动成功"却从未监听公网端口——systemd 显示 active(running)、
         //    日志写着 Gateway ready，而端口是 connection refused；且 /healthz、/metrics、
         //    /admin/* 全在同一端口上，可观测性一起陪葬。
-        let quic_tls = tunnel.server_config()?;
+        let store = Storage::with_verified(
+            opts.keys_file.clone(),
+            opts.verified_cache_max,
+            Storage::default_verified_ttl(),
+        );
+        if let Some(Err(why)) = store.persistence_state() {
+            return Err(GatewayError::Config(format!(
+                "config: keys_file is configured but unusable ({why}); refusing to start with an \
+                 empty key store (every request would 401 while the gateway looks healthy)"
+            )));
+        }
+        let (pki_service, quic_tls) = match identity {
+            GatewayIdentity::Pki(config) => {
+                let service = std::sync::Arc::new(
+                    PkiService::new(config, store.clone())
+                        .map_err(|e| GatewayError::Config(e.to_string()))?,
+                );
+                let tls = service
+                    .runtime()
+                    .server_config()
+                    .map_err(|e| GatewayError::Config(e.to_string()))?;
+                (Some(service), tls)
+            }
+            GatewayIdentity::TestFixed(tunnel) => (None, tunnel.server_config()?),
+        };
         let https = opts.https.as_ref().map(TlsPem::server_config).transpose()?;
 
         // 配置自检：**摘除宽限短于 `head_timeout`** 时吵一声。在途集合里包含"仍在等响应头"
@@ -134,36 +194,20 @@ impl Gateway {
         // ③ 绑端口：QUIC(UDP) + HTTP(TCP) 在同一处完成，失败不会只绑一半。
         let sockets = listen::Sockets::bind(&nofile, quic_tls, &opts).await?;
 
-        // ④ 进程内状态
+        // ④ 进程内状态（store 已在绑定前创建，PKI 启动加载需要它）
         let registry = Registry::default();
         let metrics = Metrics::default();
-        let store = Storage::with_verified(
-            opts.keys_file.clone(),
-            opts.verified_cache_max,
-            Storage::default_verified_ttl(),
-        );
-        // ④.1 持久化自检（fail-fast）：配了 `keys_file` 却打不开/建不出表/迁移或载入失败时，
-        //     `Storage` 会降级成**内存模式**——库里明明有 key，网关却一个都认不出来，于是每个
-        //     请求 401，而进程、systemd、`/healthz` 全都正常。这与本文件开头的原则同源
-        //     （"不留一个看起来启动了的空壳进程"）。位置在**绑端口之后、起任何任务之前**：
-        //     返回 Err 时④之前绑好的 socket 随局部变量一起 drop（这正是"全有或全无"）。
-        //     `keys_file: None`（内存模式，测试/开发）不受影响——那不是故障。
-        if let Some(Err(why)) = store.persistence_state() {
-            return Err(GatewayError::Config(format!(
-                "config: keys_file is configured but unusable ({why}); refusing to start with an \
-                 empty key store (every request would 401 while the gateway looks healthy)"
-            )));
-        }
         // 关闭阶段的唯一控制器留在 `Gateway`；`AppState` 只拿接收端。这条不变量由类型
         // 保证：`AppState` 的克隆里没有发送端，`drop(Gateway)` 必然让所有接收端看到 `Err`。
         let shutdown = shutdown::Controller::new();
-        let app_state = state::AppState::new(
+        let mut app_state = state::AppState::new(
             registry.clone(),
             store.clone(),
             metrics.clone(),
             &opts,
             shutdown.subscribe(),
         );
+        app_state.pki = pki_service.clone();
         let app = http::app(app_state);
 
         // ⑤ 起任务。入列顺序有意义：用量 flusher 必须在 serve 任务之前就位（它按周期
@@ -188,6 +232,7 @@ impl Gateway {
                 opts.allow_legacy_agent_registration,
                 opts.evict_close_grace,
                 shutdown.subscribe(),
+                pki_service.clone(),
             )),
         ];
 

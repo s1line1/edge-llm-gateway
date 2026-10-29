@@ -68,6 +68,27 @@ pub(super) const SESSION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
 pub(super) const SESSION_USER_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)";
 
+pub(super) const PKI_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pki_credentials (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    server_name TEXT NOT NULL,
+    ca_fingerprint_sha256 TEXT NOT NULL,
+    server_fingerprint_sha256 TEXT NOT NULL,
+    client_fingerprint_sha256 TEXT NOT NULL,
+    serial TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    created_by TEXT NOT NULL,
+    downloaded_at INTEGER,
+    last_connected_at INTEGER,
+    revoked_at INTEGER,
+    client_not_after INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pki_tenant_idx ON pki_credentials(tenant_id);
+CREATE INDEX IF NOT EXISTS pki_server_name_idx ON pki_credentials(server_name);
+CREATE INDEX IF NOT EXISTS pki_status_idx ON pki_credentials(status);";
+
 /// 特权写操作审计。刻意不存密码/session/API key/agent token。
 pub(super) const ADMIN_AUDIT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS admin_audit (
     id TEXT PRIMARY KEY,

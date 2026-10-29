@@ -67,6 +67,8 @@ pub enum Action {
     UserRead,
     UserWrite,
     UsageRead,
+    PkiRead,
+    PkiWrite,
     MetricsGlobal,
     AuditRead,
 }
@@ -132,6 +134,8 @@ pub fn authorize(
                 | Action::UserRead
                 | Action::UserWrite
                 | Action::UsageRead
+                | Action::PkiRead
+                | Action::PkiWrite
         ),
         UserRole::User => matches!(
             action,

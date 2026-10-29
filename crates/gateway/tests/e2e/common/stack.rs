@@ -58,10 +58,7 @@ pub fn e2e_options(keys_file: Option<PathBuf>) -> Options {
 
 /// 用给定旋钮组装一份 [`GatewayConfig`]（不启动）——要断言"启动**之前**就失败"的用例需要它。
 pub fn gateway_config(certs: &TestCerts, opts: Options) -> GatewayConfig {
-    GatewayConfig {
-        tunnel: certs.tunnel_tls(),
-        opts,
-    }
+    GatewayConfig::test_fixed(certs.tunnel_tls(), opts)
 }
 
 /// 同 [`start_gateway`]，但 `tune` 还能拿到证书材料——HTTPS 入口的 PEM 只有生成之后才知道。

@@ -25,6 +25,7 @@ const SUPER_NAV: { label: string; items: NavItem[] }[] = [
     items: [
       { to: "/keys", label: "API Keys", icon: "key" },
       { to: "/tenants", label: "Tenants", icon: "shield" },
+      { to: "/certificates", label: "Certificates", icon: "shield" },
       { to: "/users", label: "Users", icon: "terminal" },
     ],
   },
@@ -37,6 +38,7 @@ const TENANT_NAV: { label: string; items: NavItem[] }[] = [
       { to: "/tenants", label: "Tenant", icon: "shield" },
       { to: "/agents", label: "Agents", icon: "edge" },
       { to: "/keys", label: "API Keys", icon: "key" },
+      { to: "/certificates", label: "Certificates", icon: "shield" },
       { to: "/users", label: "Users", icon: "terminal" },
     ],
   },
@@ -55,6 +57,7 @@ const PAGE_LABELS: Record<string, string> = {
   "/keys": "API Keys",
   "/metrics": "指标",
   "/tenants": "Tenants",
+  "/certificates": "Certificates",
   "/users": "Users",
   "/my-access": "我的访问",
 };

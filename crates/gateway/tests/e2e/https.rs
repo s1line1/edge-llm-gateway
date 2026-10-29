@@ -758,10 +758,10 @@ async fn gateway_start_fails_fast_on_unusable_tls() {
     /// 用给定的 TLS 材料起网关（QUIC 侧用一套正常证书，保证失败只因 HTTPS 材料）。
     async fn start_with_tls(tls: TlsPem) -> Result<Gateway, gateway::error::GatewayError> {
         let (ca, server_cert, server_key, _client_cert, _client_key) = gen_certs();
-        Gateway::start(GatewayConfig {
-            tunnel: TunnelTls::from_der(vec![ca], vec![server_cert], server_key)
+        Gateway::start(GatewayConfig::test_fixed(
+            TunnelTls::from_der(vec![ca], vec![server_cert], server_key)
                 .expect("gen_certs returns non-empty material"),
-            opts: Options {
+            Options {
                 keys_file: None,
                 request_timeout: Duration::from_secs(5),
                 tunnel_op_timeout: Duration::from_secs(2),
@@ -770,7 +770,7 @@ async fn gateway_start_fails_fast_on_unusable_tls() {
                 https: Some(tls),
                 ..Options::default()
             },
-        })
+        ))
         .await
     }
 

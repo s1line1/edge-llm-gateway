@@ -17,12 +17,15 @@ hyper-util = { workspace = true }
 proto = { path = "../proto" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { workspace = true }
+rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
 s2n-quic = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
+rand = { workspace = true }
+tar = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
@@ -38,7 +41,6 @@ agent = { path = "../agent" }
 criterion = { workspace = true }
 futures-util = { workspace = true }
 mock-llm = { path = "../mock-llm" }
-rcgen = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 serial_test = "0.10"

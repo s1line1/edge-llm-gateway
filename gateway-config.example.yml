@@ -1,7 +1,7 @@
 # home-llm-gateway 网关配置示例
 # 使用：cp gateway-config.example.yml gateway-config.yml，按需修改后
 #       gateway --config gateway-config.yml
-# 所有字段都有默认值；cert / key / ca 为必填。
+# 所有字段都有默认值。服务器证书不再从 YAML 加载；凭证通过 /admin/pki/pairs 按需创建。
 
 # listen_addr: "[::]:8080"
 # quic_addr: "[::]:4433"
@@ -12,10 +12,14 @@ listen_addr: "0.0.0.0:8443"
 # QUIC 隧道监听地址（agent 拨入入口，UDP）
 quic_addr: "0.0.0.0:4433"
 
-# QUIC 隧道证书（服务端证书 + 私钥 + 签发 agent 客户端证书的 CA）— 必填
-cert: /etc/home-llm-gateway/server.crt
-key: /etc/home-llm-gateway/server.key
-ca: /etc/home-llm-gateway/ca.crt
+# 按需凭证管理（PKI）。启动时不生成 CA/证书；没有凭证时 QUIC 入口拒绝所有握手，
+# 管理员在 Dashboard 的 Certificates 页面创建 client/server 成对凭证。
+pki:
+  enabled: true
+  dir: /etc/home-llm-gateway/pki
+  server_validity_days: 397
+  client_validity_days: 90
+  require_https_for_download: true
 
 # Admin token（必须配置：所有 API Key 都通过 Admin API 运行时创建并存入 SQLite，
 # 首次启动用它创建第一个 key。生成：openssl rand -hex 32）
@@ -162,14 +166,14 @@ max_open_tunnel_streams: 1024
 # dashboard session 绝对有效期（秒）。默认 43200（12 小时）。
 # session_ttl_secs: 43200
 
-# session cookie 的 Secure 属性。不写 = 配了 tls_cert 时自动开启；纯 HTTP 本地开发可显式 false。
+# session cookie 的 Secure 属性。不写 = 未启用 HTTPS（本版本 HTTPS 由反向代理解析）
+# 时为 false；生产建议由反向代理终止 TLS 后显式设置为 true。
 # 生产环境不要用 false（session cookie 会在明文链路上传输）。
 # session_cookie_secure: true
 
 # 公网入口 HTTPS 证书（提供后公网入口启用 TLS，客户端用 https:// 访问；
-# 与 tls_key 成对，去掉即明文 HTTP）
-# tls_cert: /etc/home-llm-gateway/server.crt
-# tls_key: /etc/home-llm-gateway/server.key
+# 本版本不再从 YAML 加载 tls_cert/tls_key。生产请用 Caddy/nginx 终止 TLS；
+# 客户端私钥下载要求 HTTPS（或本机/SSH 隧道）。
 
 # React Web UI 静态目录（含 index.html；浏览器打开网关地址 `/` 即管理面板）。
 # **不写这一项 = 默认 `/usr/local/share/home-llm-gateway/web`**（`config.rs` 的

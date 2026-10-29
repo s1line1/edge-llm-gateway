@@ -43,6 +43,7 @@ pub async fn accept_loop(
     // 与 `stream_ceiling` 一样属于"每调用注入"的配置：注册表自己不存配置。
     evict_close_grace: std::time::Duration,
     mut shutdown: watch::Receiver<ShutdownPhase>,
+    pki: Option<std::sync::Arc<crate::pki::PkiService>>,
 ) {
     let _accepting = metrics.mark_accepting();
     loop {
@@ -60,6 +61,11 @@ pub async fn accept_loop(
         let Some(conn) = accepted else {
             break;
         };
+        if let (Some(pki), Ok(Some(name))) = (pki.as_ref(), conn.server_name()) {
+            if let Err(e) = pki.mark_connected(&name) {
+                warn!(error = %e, "cannot mark PKI pair connected");
+            }
+        }
         let registry = registry.clone();
         let store = store.clone();
         let metrics = metrics.clone();
@@ -398,6 +404,7 @@ mod tests {
             false,
             Duration::from_secs(1),
             shutdown_rx,
+            None,
         ));
 
         // 循环进入等待后应标记为「接受中」
@@ -436,6 +443,7 @@ mod tests {
             false,
             Duration::from_secs(1),
             shutdown_rx,
+            None,
         ));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

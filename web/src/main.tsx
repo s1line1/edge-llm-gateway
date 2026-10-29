@@ -11,6 +11,7 @@ import RequireAuth from "./components/RequireAuth";
 import RequireRole from "./components/RequireRole";
 import { MetricsHistoryProvider } from "./hooks/useMetricsHistory";
 import Agents from "./pages/Agents";
+import Certificates from "./pages/Certificates";
 import Keys from "./pages/Keys";
 import Login from "./pages/Login";
 import MetricsPage from "./pages/MetricsPage";
@@ -77,6 +78,14 @@ createRoot(document.getElementById("root")!).render(
                 element={
                   <TenantOrSuper>
                     <Tenants />
+                  </TenantOrSuper>
+                }
+              />
+              <Route
+                path="/certificates"
+                element={
+                  <TenantOrSuper>
+                    <Certificates />
                   </TenantOrSuper>
                 }
               />

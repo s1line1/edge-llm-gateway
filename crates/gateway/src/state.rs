@@ -101,6 +101,7 @@ pub struct AppState {
     pub tenant_rate_limiter: TenantRateLimiter,
     pub tenant_limiter: TenantLimiter,
     pub login_limiter: LoginLimiter,
+    pub pki: Option<Arc<crate::pki::PkiService>>,
     pub metrics: Metrics,
     /// React UI 静态目录（None = `/` 显示构建提示页）。
     pub ui: Option<PathBuf>,
@@ -168,6 +169,7 @@ impl AppState {
             tenant_rate_limiter: TenantRateLimiter::new(),
             tenant_limiter: TenantLimiter::new(),
             login_limiter: LoginLimiter::new(),
+            pki: None,
             metrics,
             ui,
             ui_index,

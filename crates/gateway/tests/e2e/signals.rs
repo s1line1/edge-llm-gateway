@@ -99,10 +99,6 @@ async fn wait_for_exit(child: &mut ChildGuard, limit: Duration) -> ExitStatus {
 /// 颜色"的判据变成假绿——它要测的正是"没有 `NO_COLOR` 时靠 TTY 判断"。`RUST_LOG=info` 保证
 /// 日志里有内容。
 fn spawn_gateway(dir: &Path) -> (ChildGuard, PathBuf) {
-    let (ca_pem, srv_pem, srv_key_pem, _, _) = gen_certs_pem();
-    let ca = write_file(dir, "ca.crt", &ca_pem);
-    let cert = write_file(dir, "server.crt", &srv_pem);
-    let key = write_file(dir, "server.key", &srv_key_pem);
     let http_port = free_port();
     let quic_port = free_port();
     let cfg = write_file(
@@ -111,10 +107,9 @@ fn spawn_gateway(dir: &Path) -> (ChildGuard, PathBuf) {
         &format!(
             "listen_addr: \"127.0.0.1:{http_port}\"\n\
              quic_addr: \"127.0.0.1:{quic_port}\"\n\
-             cert: {}\nkey: {}\nca: {}\nkeys_file: {}\n",
-            cert.display(),
-            key.display(),
-            ca.display(),
+             pki:\n  enabled: true\n  dir: {}\n\
+             keys_file: {}\n",
+            dir.join("pki").display(),
             dir.join("keys.db").display(),
         ),
     );

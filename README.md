@@ -12,7 +12,7 @@
 任何地方用标准的 OpenAI SDK 调它，同时**不把本地推理端点直接暴露到公网**。
 
 <p align="center">
-  <img alt="测试" src="https://img.shields.io/badge/tests-447%20passed-brightgreen">
+  <img alt="测试" src="https://img.shields.io/badge/tests-456%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -133,6 +133,7 @@ agent 只做一件事：把隧道里收到的请求帧，变成一次对本地 L
 - 结构化请求日志，每个请求带 `request_id`、状态码、耗时
 - 内置 React 管理面板：总览 / API Keys / Agents / 指标；Agents 支持卡片与 Orbit 径向视图
 - 界面支持跟随系统 / 浅色 / 深色主题与强调色，偏好只保存在本浏览器
+- 按需凭证管理：Gateway 启动不生成证书；需要时创建 client/server 成对凭证，server 半部分留在网关，client 半部分一次性下载
 
 ---
 
@@ -145,7 +146,7 @@ agent 只做一件事：把隧道里收到的请求帧，变成一次对本地 L
 ```bash
 git clone <repo> && cd home-llm-gateway
 
-make setup     # 生成开发证书（certs/out/）+ 安装前端依赖
+make setup     # 安装前端依赖（开发证书脚本仍保留，但 Gateway 启动不再加载固定证书）
 make dev       # 编译 debug 二进制，一键起 mock-llm + gateway + agent
                # 任一进程没起来就报错退出，并贴出该进程日志末尾
 ```
@@ -328,7 +329,7 @@ fmt · clippy -D warnings · nextest · e2e 接线 · toolchain-check · check-r
 
 `make check` 在它之外再加 `cargo deny` 与前端四项（web-format / web-lint / web-test / web-build）。
 
-> **当前规模（`cargo nextest run --workspace` 实测）**：**447 个被执行且通过的测试（0 skipped）**，其中
+> **当前规模（`cargo nextest run --workspace` 实测）**：**456 个被执行且通过的测试（0 skipped）**，其中
 > **77 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
 >
 > 两点与 `cargo test` 不同的行为要知道：**nextest 每条测试一个进程**，所以 `serial_test` 的
@@ -400,12 +401,14 @@ make dev && make bench-k6 KEY=<sk-...> VUS=20 DUR=30s
 crates/
 ├── proto/      隧道帧协议 + 共享原语（帧编解码、mTLS 材料加载、逐跳头/凭据头过滤、路径守卫）
 ├── gateway/    cloud-gateway 二进制（Axum + Tokio + s2n-quic server + SQLite keystore）
+│   └── src/pki/ 按需凭证：model/files/repo/tls/bundle/service
 ├── agent/      edge-agent 二进制（Tokio + s2n-quic client + reqwest）
 └── mock-llm/   OpenAI 兼容的假 LLM（无真实模型时打通链路用）
 web/            React + TS 管理面板（Vite + React 19 + Tailwind；网关启动即托管）
-certs/          开发证书生成脚本
+  └── src/styles/  theme/base/components/orbit/appearance 分层样式
+certs/          开发证书生成脚本（Gateway 生产路径不再读取）
 deploy/         systemd 单元（gateway.service / agent.service）
-scripts/        release 打包 · k6 压测 · 工具链一致性检查 · git pre-commit hook
+scripts/        release 打包 · k6 压测 · 工具链一致性检查 · dev/pki-client.sh · pre-commit hook
 gateway-config.example.yml / agent-config.example.yml   两份配置模板（含全部参数注释）
 deny.toml       cargo-deny 策略（依赖许可证 / 公告）
 ```

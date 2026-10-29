@@ -5,9 +5,9 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::{storage::Storage, GatewayConfig, Options, TlsPem, TunnelTls};
+use crate::{pki::PkiConfig, storage::Storage, GatewayConfig, Options};
 
-/// YAML 配置文件结构。所有字段均有默认值；`cert`/`key`/`ca` 必须显式提供。
+/// YAML 配置文件结构。所有字段均有默认值；`pki.enabled` 必须为 true，固定证书字段已移除。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
@@ -17,15 +17,6 @@ pub struct ConfigFile {
     /// QUIC 隧道监听地址（UDP）
     #[serde(default = "default_quic_addr")]
     quic_addr: String,
-    /// 服务端证书链 PEM（QUIC 隧道用）— 必填
-    #[serde(default)]
-    cert: PathBuf,
-    /// 服务端私钥 PEM（QUIC 隧道用）— 必填
-    #[serde(default)]
-    key: PathBuf,
-    /// 签发 agent 客户端证书的 CA PEM — 必填
-    #[serde(default)]
-    ca: PathBuf,
     /// Admin token（提供后启用 /admin/keys 管理接口）
     #[serde(default)]
     admin_token: Option<String>,
@@ -147,12 +138,10 @@ pub struct ConfigFile {
     /// 关闭时等待在途请求收尾的上限（秒）。见 `Options::shutdown_grace`。
     #[serde(default = "default_shutdown_grace_secs")]
     shutdown_grace_secs: u64,
-    /// 公网入口 HTTPS 证书 PEM（提供后启用 TLS，与 tls_key 成对）
+    /// On-demand credential management. No certificate is generated at startup; pairs are
+    /// created through the admin API.
     #[serde(default)]
-    tls_cert: Option<PathBuf>,
-    /// 公网入口 HTTPS 私钥 PEM（与 tls_cert 成对）
-    #[serde(default)]
-    tls_key: Option<PathBuf>,
+    pki: Option<PkiConfig>,
     /// React UI 静态目录（含 index.html）。
     ///
     /// **不写这一项 = 用 [`default_ui_dir`] 的镜像内路径**（`/usr/local/share/home-llm-gateway/web`），
@@ -252,6 +241,19 @@ fn default_max_open_tunnel_streams() -> u32 {
 pub fn from_path(path: &PathBuf) -> anyhow::Result<GatewayConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read config file {}", path.display()))?;
+    let raw: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text)
+        .with_context(|| format!("invalid config file {}", path.display()))?;
+    if let Some(map) = raw.as_mapping() {
+        for key in ["cert", "key", "ca", "tls_cert", "tls_key"] {
+            if map.contains_key(serde_yaml_ng::Value::String(key.to_string())) {
+                anyhow::bail!(
+                    "config: `{key}` is no longer supported; the gateway does not load fixed \
+                     certificate paths. Remove it and create a credential pair through \
+                     /admin/pki/pairs (see the pki section in gateway-config.example.yml)."
+                );
+            }
+        }
+    }
     let file_cfg: ConfigFile = serde_yaml_ng::from_str(&text)
         .with_context(|| format!("invalid config file {}", path.display()))?;
     from_file(file_cfg)
@@ -262,26 +264,19 @@ pub fn from_path(path: &PathBuf) -> anyhow::Result<GatewayConfig> {
 /// 这里是**唯一**的 YAML 字段名 → 类型化旋钮映射点：`Options` 的每个字段都显式写出来，
 /// 这是映射的职责；测试与库调用方则用 `..Options::default()` 只写自己要改的那些。
 pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
-    if cfg.cert.as_os_str().is_empty()
-        || cfg.key.as_os_str().is_empty()
-        || cfg.ca.as_os_str().is_empty()
-    {
-        anyhow::bail!("config: cert/key/ca paths are required");
-    }
-    let tunnel = TunnelTls::from_pem_files(&cfg.ca, &cfg.cert, &cfg.key)
-        .context("config: cannot load the tunnel cert/key/ca")?;
-    let https = match (&cfg.tls_cert, &cfg.tls_key) {
-        (Some(c), Some(k)) => Some(
-            TlsPem::from_pem_files(c, k)
-                .with_context(|| format!("config: cannot read {}", c.display()))?,
-        ),
-        (None, None) => None,
-        _ => anyhow::bail!("config: tls_cert and tls_key must be provided together"),
-    };
+    let pki = cfg
+        .pki
+        .clone()
+        .filter(|p| p.enabled)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "config: pki.enabled must be true; fixed cert/key/ca configuration is no longer supported"
+            )
+        })?;
 
-    Ok(GatewayConfig {
-        tunnel,
-        opts: Options {
+    Ok(GatewayConfig::pki(
+        pki,
+        Options {
             http_bind: cfg
                 .listen_addr
                 .parse::<SocketAddr>()
@@ -290,7 +285,7 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
                 .quic_addr
                 .parse::<SocketAddr>()
                 .with_context(|| format!("config: invalid quic_addr {:?}", cfg.quic_addr))?,
-            https,
+            https: None,
             admin_token: cfg.admin_token,
             keys_file: cfg.keys_file,
             ui_dir: cfg.ui_dir,
@@ -313,66 +308,46 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
             session_ttl_secs: cfg.session_ttl_secs,
             session_cookie_secure: cfg.session_cookie_secure,
         },
-    })
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
-
-    /// 在临时目录生成 (ca, server.crt, server.key) 并返回路径。
-    fn gen_cert_files(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
-        let ca_key = KeyPair::generate().unwrap();
-        let mut ca = CertificateParams::default();
-        ca.distinguished_name.push(DnType::CommonName, "test ca");
-        ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
-        let ca_cert = ca.self_signed(&ca_key).unwrap();
-
-        let srv_key = KeyPair::generate().unwrap();
-        let mut srv = CertificateParams::default();
-        srv.distinguished_name.push(DnType::CommonName, "gw");
-        srv.subject_alt_names = vec![SanType::DnsName("localhost".try_into().unwrap())];
-        let srv_cert = srv.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
-
-        let write = |name: &str, content: &str| {
-            let p = dir.join(name);
-            std::fs::write(&p, content).unwrap();
-            p
-        };
-        (
-            write("ca.crt", &ca_cert.pem()),
-            write("server.crt", &srv_cert.pem()),
-            write("server.key", &srv_key.serialize_pem()),
-        )
-    }
+    use crate::GatewayIdentity;
 
     fn parse_yaml(yaml: &str) -> ConfigFile {
         serde_yaml_ng::from_str(yaml).unwrap()
     }
 
+    fn pki_yaml(dir: &std::path::Path, extra: &str) -> String {
+        format!(
+            "pki:\n  enabled: true\n  dir: {}\n{}",
+            dir.join("pki").to_str().unwrap(),
+            extra
+        )
+    }
+
+    fn pki_config(cfg: &GatewayConfig) -> &PkiConfig {
+        match &cfg.identity {
+            GatewayIdentity::Pki(config) => config,
+            GatewayIdentity::TestFixed(_) => panic!("expected pki identity"),
+        }
+    }
+
     #[test]
     fn yaml_maps_to_config() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
         let yaml = format!(
-            r#"
-listen_addr: "0.0.0.0:8443"
-quic_addr: "0.0.0.0:4433"
-cert: {}
-key: {}
-ca: {}
-admin_token: admin
-keys_file: {}
-timeout_secs: 30
-agent_stale_secs: 20
-rate_limit_per_min: 60
-"#,
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-            ca.to_str().unwrap(),
+            "listen_addr: \"0.0.0.0:8443\"\n\
+             quic_addr: \"0.0.0.0:4433\"\n\
+             admin_token: admin\n\
+             keys_file: {}\n\
+             timeout_secs: 30\n\
+             agent_stale_secs: 20\n\
+             rate_limit_per_min: 60\n{}",
             dir.path().join("keys.db").to_str().unwrap(),
+            pki_yaml(dir.path(), ""),
         );
         let cfg = from_file(parse_yaml(&yaml)).unwrap();
         assert_eq!(cfg.opts.http_bind.to_string(), "0.0.0.0:8443");
@@ -383,29 +358,16 @@ rate_limit_per_min: 60
         assert_eq!(cfg.opts.agent_stale_after, Duration::from_secs(20));
         assert_eq!(cfg.opts.rate_limit_per_min, 60);
         assert!(cfg.opts.https.is_none());
+        assert!(pki_config(&cfg).enabled);
     }
 
     #[test]
     fn minimal_yaml_applies_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
-        let yaml = format!(
-            "cert: {}\nkey: {}\nca: {}\n",
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-            ca.to_str().unwrap(),
-        );
+        let yaml = pki_yaml(dir.path(), "");
         let cfg = from_file(parse_yaml(&yaml)).unwrap();
-        assert_eq!(
-            cfg.opts.http_bind.to_string(),
-            "0.0.0.0:8080",
-            "default listen_addr"
-        );
-        assert_eq!(
-            cfg.opts.quic_bind.to_string(),
-            "0.0.0.0:4433",
-            "default quic_addr"
-        );
+        assert_eq!(cfg.opts.http_bind.to_string(), "0.0.0.0:8080");
+        assert_eq!(cfg.opts.quic_bind.to_string(), "0.0.0.0:4433");
         assert_eq!(cfg.opts.request_timeout, Duration::from_secs(120));
         assert_eq!(cfg.opts.agent_stale_after, Duration::from_secs(15));
         assert_eq!(cfg.opts.rate_limit_per_min, 0);
@@ -415,43 +377,12 @@ rate_limit_per_min: 60
     }
 
     #[test]
-    fn missing_required_paths_rejected() {
+    fn missing_pki_is_rejected() {
         let result = from_file(parse_yaml("listen_addr: \"0.0.0.0:8443\"\n"));
         match result {
-            Ok(_) => panic!("expected error for missing cert/key/ca"),
-            Err(e) => assert!(e.to_string().contains("required"), "err: {e}"),
+            Ok(_) => panic!("expected error for missing pki"),
+            Err(e) => assert!(e.to_string().contains("pki.enabled"), "err: {e}"),
         }
-    }
-
-    #[test]
-    fn tls_pair_loaded_from_yaml() {
-        let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
-        let yaml = format!(
-            "cert: {}\nkey: {}\nca: {}\ntls_cert: {}\ntls_key: {}\n",
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-            ca.to_str().unwrap(),
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-        );
-        let cfg = from_file(parse_yaml(&yaml)).unwrap();
-        let tls = cfg.opts.https.expect("tls pair should be loaded");
-        assert!(!tls.cert.is_empty() && !tls.key.is_empty());
-    }
-
-    #[test]
-    fn tls_cert_without_key_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
-        let yaml = format!(
-            "cert: {}\nkey: {}\nca: {}\ntls_cert: {}\n",
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-            ca.to_str().unwrap(),
-            cert.to_str().unwrap(),
-        );
-        assert!(from_file(parse_yaml(&yaml)).is_err());
     }
 
     #[test]
@@ -464,11 +395,7 @@ rate_limit_per_min: 60
         assert!(serde_yaml_ng::from_str::<ConfigFile>("nonsense_field: 1").is_err());
     }
 
-    /// `gateway-config.example.yml` 必须始终能解析，并且**覆盖到新增的字段**。
-    ///
-    /// 为什么值得一条测试：`ConfigFile` 开了 `deny_unknown_fields`，示例文件写错字段名
-    /// 会直接导致「照抄示例 → 网关起不来」；反过来新增字段若忘了写进示例，用户也看不到
-    /// 这个开关的存在（`tunnel_op_secs` / `head_timeout_secs` 就是这类旋钮）。
+    /// `gateway-config.example.yml` 必须始终能解析，并且覆盖到新增的字段。
     #[test]
     fn example_config_parses_and_documents_knobs() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -477,7 +404,6 @@ rate_limit_per_min: 60
             .unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
         let cfg: ConfigFile = serde_yaml_ng::from_str(&text)
             .unwrap_or_else(|e| panic!("{} 解析失败（字段名写错？）: {e}", path.display()));
-        // 每个超时开关都必须出现在示例里，否则用户无从知道
         for key in [
             "timeout_secs",
             "tunnel_op_secs",
@@ -510,49 +436,24 @@ rate_limit_per_min: 60
     }
 
     /// 规格：**流额度不能是 0**。
-    ///
-    /// 0 在 s2n-quic 里意味着"一条双向流都不许开"，而不是"不限"——直接照抄进
-    /// `with_max_open_local_bidirectional_streams` 会让网关连注册流都开不出来，
-    /// 表现是"agent 永远注册不上"，与配置字面意思（0 = 不限/默认）完全相反。
     #[test]
     fn zero_max_open_tunnel_streams_falls_back_to_the_default() {
         assert!(default_max_open_tunnel_streams() >= 256);
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
-        // YAML 里显式写 0 必须能解析，且不能原样传给 s2n-quic ——
-        // 在 s2n-quic 里 0 的意思是"一条双向流都不许开"（不是"不限"），
-        // 照抄进去会让网关连 agent 的注册流都开不出来，表现是"agent 永远注册不上"。
-        let yaml = format!(
-            "cert: {}\nkey: {}\nca: {}\nmax_open_tunnel_streams: 0\n",
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-            ca.to_str().unwrap(),
-        );
+        let yaml = pki_yaml(dir.path(), "max_open_tunnel_streams: 0\n");
         assert_eq!(parse_yaml(&yaml).max_open_tunnel_streams, 0);
         assert_eq!(
             from_file(parse_yaml(&yaml)).unwrap().opts.stream_ceiling(),
             default_max_open_tunnel_streams()
         );
 
-        // 显式给非 0 值时按原值生效（运维要能收紧/放宽额度）
-        let yaml = format!(
-            "cert: {}\nkey: {}\nca: {}\nmax_open_tunnel_streams: 300\n",
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-            ca.to_str().unwrap(),
-        );
+        let yaml = pki_yaml(dir.path(), "max_open_tunnel_streams: 300\n");
         assert_eq!(
             from_file(parse_yaml(&yaml)).unwrap().opts.stream_ceiling(),
             300
         );
 
-        // 省略时用默认值
-        let yaml = format!(
-            "cert: {}\nkey: {}\nca: {}\n",
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-            ca.to_str().unwrap(),
-        );
+        let yaml = pki_yaml(dir.path(), "");
         assert_eq!(
             from_file(parse_yaml(&yaml)).unwrap().opts.stream_ceiling(),
             default_max_open_tunnel_streams()
@@ -562,13 +463,10 @@ rate_limit_per_min: 60
     #[test]
     fn from_path_reads_and_maps() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
         let config_path = dir.path().join("config.yml");
         let yaml = format!(
-            "listen_addr: \"127.0.0.1:8080\"\nquic_addr: \"127.0.0.1:4433\"\ncert: {}\nkey: {}\nca: {}\n",
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-            ca.to_str().unwrap(),
+            "listen_addr: \"127.0.0.1:8080\"\nquic_addr: \"127.0.0.1:4433\"\n{}",
+            pki_yaml(dir.path(), ""),
         );
         std::fs::write(&config_path, &yaml).unwrap();
         let cfg = from_path(&config_path).unwrap();
@@ -576,28 +474,25 @@ rate_limit_per_min: 60
     }
 
     #[test]
+    fn from_path_rejects_fixed_certificate_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.yml");
+        std::fs::write(&path, "cert: old.crt\nkey: old.key\nca: old.ca\n").unwrap();
+        let err = from_path(&path).unwrap_err().to_string();
+        assert!(err.contains("no longer supported"), "err: {err}");
+    }
+
+    #[test]
     fn from_path_missing_file_errors() {
         assert!(from_path(&PathBuf::from("/nonexistent/config.yml")).is_err());
     }
 
-    /// 规格：**数值旋钮的默认值只能有一个说法**。
-    ///
-    /// 默认值现在有两处落点：`Options::default()`（库 / 测试调用方）与这里的 serde
-    /// `default_*`（部署，YAML 省略该字段时）。端口与落盘位置**刻意不同**——库默认密闭
-    /// （临时端口、不碰任何文件），部署默认是 `0.0.0.0:8080` / `keys.db`——但所有
-    /// `Duration` / 数量旋钮必须一致：否则同一条 `timeout_secs` 的默认值会有两个说法，
-    /// "文档写的是哪一个"就变成靠记忆。这条测试把两者钉在一起。
     #[test]
     fn yaml_defaults_and_options_default_agree_on_the_tuning_knobs() {
         let dir = tempfile::tempdir().unwrap();
-        let (ca, cert, key) = gen_cert_files(dir.path());
-        let yaml = format!(
-            "cert: {}\nkey: {}\nca: {}\n",
-            cert.to_str().unwrap(),
-            key.to_str().unwrap(),
-            ca.to_str().unwrap(),
-        );
-        let opts = from_file(parse_yaml(&yaml)).unwrap().opts;
+        let opts = from_file(parse_yaml(&pki_yaml(dir.path(), "")))
+            .unwrap()
+            .opts;
         let d = Options::default();
 
         assert_eq!(opts.request_timeout, d.request_timeout, "timeout_secs");
@@ -633,12 +528,8 @@ rate_limit_per_min: 60
         );
         assert_eq!(opts.stream_ceiling(), d.stream_ceiling());
 
-        // 刻意不同：库默认密闭（内核分配端口、不读不写任何文件），部署默认面向公网
         assert_ne!(opts.http_bind, d.http_bind, "库默认不绑公网端口");
         assert_ne!(opts.keys_file, d.keys_file, "库默认不碰 keys.db");
-        // 部署的 UI 默认必须**钉死成镜像内那个绝对路径**：容器里配置通常不写 `ui_dir`
-        // （镜像是自包含的），所以这个默认值就是容器唯一的 UI 入口 —— 写成相对路径
-        // （曾经的 `web/dist`）会落在挂载点 `/etc/home-llm-gateway` 里、被宿主目录遮住。
         assert_eq!(
             opts.ui_dir,
             Some(std::path::PathBuf::from(

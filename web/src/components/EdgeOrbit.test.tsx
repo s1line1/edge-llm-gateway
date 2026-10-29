@@ -106,7 +106,7 @@ describe("EdgeOrbit", () => {
   });
 
   it("declares a reduced-motion override for the selected arc", () => {
-    const css = readFileSync(resolve(process.cwd(), "src/index.css"), "utf8");
+    const css = readFileSync(resolve(process.cwd(), "src/styles/orbit.css"), "utf8");
     expect(css).toContain("@media (prefers-reduced-motion: reduce)");
     expect(css).toMatch(/\.orbit-selected-arc \{\s*transition: none;/);
   });

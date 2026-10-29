@@ -7,7 +7,10 @@ import type {
   ApiKey,
   AuditRecord,
   CreatedKey,
+  CreatePkiPairBody,
   HealthStatus,
+  PkiPair,
+  PkiStatus,
   Tenant,
   UsageRecord,
   UserRole,
@@ -255,4 +258,45 @@ export async function deleteUser(id: string): Promise<void> {
 export async function listAudit(tenantId?: string | null): Promise<AuditRecord[]> {
   const resp = await apiFetch(`/admin/audit${adminQuery(tenantId)}`);
   return expectArray<AuditRecord>(await handle<unknown>(resp), "GET /admin/audit");
+}
+
+export async function fetchPkiStatus(): Promise<PkiStatus> {
+  const resp = await apiFetch("/admin/pki/status");
+  return expectObject<PkiStatus>(await handle<unknown>(resp), "GET /admin/pki/status");
+}
+
+export async function listPkiPairs(tenantId?: string | null): Promise<PkiPair[]> {
+  const resp = await apiFetch(`/admin/pki/pairs${adminQuery(tenantId)}`);
+  return expectArray<PkiPair>(await handle<unknown>(resp), "GET /admin/pki/pairs");
+}
+
+export async function createPkiPair(body: CreatePkiPairBody): Promise<PkiPair> {
+  const resp = await apiFetch("/admin/pki/pairs", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  return expectObject<PkiPair>(await handle<unknown>(resp), "POST /admin/pki/pairs");
+}
+
+export async function revokePkiPair(id: string): Promise<void> {
+  const resp = await apiFetch(`/admin/pki/pairs/${encodeURIComponent(id)}/revoke`, {
+    method: "POST",
+  });
+  await handle<void>(resp);
+}
+
+/** Fetch the one-time tar as a blob; the caller creates the download link. */
+export async function downloadPkiPair(id: string): Promise<Blob> {
+  const resp = await apiFetch(`/admin/pki/pairs/${encodeURIComponent(id)}/download`);
+  if (!resp.ok) {
+    let message = `HTTP ${resp.status}`;
+    try {
+      const body = (await resp.json()) as { error?: { message?: string } };
+      if (body.error?.message) message = body.error.message;
+    } catch {
+      // keep status
+    }
+    throw new ApiError(resp.status, message);
+  }
+  return resp.blob();
 }

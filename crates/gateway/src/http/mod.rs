@@ -11,6 +11,7 @@ use tracing::info;
 
 use crate::state::AppState;
 
+mod admin_pki;
 mod admission;
 mod api;
 mod entry;
@@ -116,6 +117,19 @@ pub fn app(state: AppState) -> Router {
                 .delete(crate::admin_users::delete_user),
         )
         .route("/audit", get(crate::admin_users::list_audit))
+        .route("/pki/status", get(crate::http::admin_pki::status))
+        .route(
+            "/pki/pairs",
+            get(crate::http::admin_pki::list).post(crate::http::admin_pki::create),
+        )
+        .route(
+            "/pki/pairs/{id}/download",
+            get(crate::http::admin_pki::download),
+        )
+        .route(
+            "/pki/pairs/{id}/revoke",
+            axum::routing::post(crate::http::admin_pki::revoke),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::admin_auth::admin_auth,
