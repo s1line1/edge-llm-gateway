@@ -1,0 +1,188 @@
+/* Theme tokens and Tailwind aliases. */
+/* ── Appearance tokens ────────────────────────────────────────────────────
+   Dark is the default token set (and the no-data-theme fallback). Light is a
+   warm paper palette, not an inverted copy. Components consume --ui-* only. */
+:root {
+  --rail-width: 248px;
+  color-scheme: dark;
+
+  --ui-canvas: #06090d;
+  --ui-rail: #0a1017;
+  --ui-panel: #0e161f;
+  --ui-panel-raised: #131d27;
+  --ui-control: #1b2835;
+  --ui-line: #23313f;
+  --ui-line-soft: #1a2632;
+  --ui-line-strong: #34485a;
+  --ui-text: #e8eef5;
+  --ui-muted: #8fa2b6;
+  --ui-dim: #788a9d;
+  --ui-accent: #b9f27b;
+  --ui-accent-strong: #cdf8a1;
+  --ui-accent-contrast: #091008;
+  --ui-cyan: #79d7d1;
+  --ui-amber: #f5c46e;
+  --ui-coral: #ff8b7b;
+
+  --ui-accent-soft: color-mix(in srgb, var(--ui-accent) 10%, transparent);
+  --ui-accent-faint: color-mix(in srgb, var(--ui-accent) 4%, transparent);
+  --ui-accent-border: color-mix(in srgb, var(--ui-accent) 55%, transparent);
+  --ui-accent-glow: color-mix(in srgb, var(--ui-accent) 12%, transparent);
+  --ui-cyan-soft: color-mix(in srgb, var(--ui-cyan) 10%, transparent);
+  --ui-cyan-border: color-mix(in srgb, var(--ui-cyan) 26%, transparent);
+  --ui-amber-soft: color-mix(in srgb, var(--ui-amber) 10%, transparent);
+  --ui-amber-border: color-mix(in srgb, var(--ui-amber) 26%, transparent);
+  --ui-coral-soft: color-mix(in srgb, var(--ui-coral) 10%, transparent);
+  --ui-coral-border: color-mix(in srgb, var(--ui-coral) 28%, transparent);
+
+  --ui-grid: color-mix(in srgb, var(--ui-muted) 4.5%, transparent);
+  --ui-glow-cyan: color-mix(in srgb, var(--ui-cyan) 8%, transparent);
+  --ui-glow-accent: color-mix(in srgb, var(--ui-accent) 4.5%, transparent);
+  --ui-panel-bg: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--ui-panel-raised) 92%, transparent),
+    color-mix(in srgb, var(--ui-panel) 96%, transparent)
+  );
+  --ui-panel-shadow:
+    0 1px 0 color-mix(in srgb, var(--ui-text) 3.5%, transparent) inset,
+    0 18px 50px rgba(0, 0, 0, 0.16);
+  --ui-input-bg: color-mix(in srgb, var(--ui-canvas) 55%, transparent);
+  --ui-input-bg-focus: color-mix(in srgb, var(--ui-canvas) 78%, transparent);
+  --ui-control-bg: color-mix(in srgb, var(--ui-panel-raised) 80%, transparent);
+  --ui-raised-bg: color-mix(in srgb, var(--ui-panel-raised) 88%, transparent);
+  --ui-surface-soft: color-mix(in srgb, var(--ui-canvas) 42%, transparent);
+  --ui-surface-faint: color-mix(in srgb, var(--ui-canvas) 30%, transparent);
+  --ui-surface-code: color-mix(in srgb, var(--ui-canvas) 60%, transparent);
+  --ui-surface-chip: color-mix(in srgb, var(--ui-panel-raised) 70%, transparent);
+  --ui-topbar: color-mix(in srgb, var(--ui-canvas) 80%, transparent);
+  --ui-scrim: color-mix(in srgb, var(--ui-canvas) 70%, transparent);
+  --ui-hover: color-mix(in srgb, var(--ui-muted) 7%, transparent);
+  --ui-hover-strong: color-mix(in srgb, var(--ui-muted) 10%, transparent);
+  --ui-chart-1: #b9f27b;
+  --ui-chart-2: #79d7d1;
+  --ui-chart-3: #f5c46e;
+  --ui-chart-4: #ff8b7b;
+  --ui-theme-color: #06090d;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --ui-canvas: #f1ece2;
+  --ui-rail: #e8e1d4;
+  --ui-panel: #fffdf8;
+  --ui-panel-raised: #f7f2e9;
+  --ui-control: #e7dfd2;
+  --ui-line: #c9beaa;
+  --ui-line-soft: #ded4c5;
+  --ui-line-strong: #9a8a74;
+  --ui-text: #172125;
+  --ui-muted: #4d595d;
+  --ui-dim: #657073;
+  --ui-accent: #2f5d35;
+  --ui-accent-strong: #244a29;
+  --ui-accent-contrast: #f8fff4;
+  --ui-cyan: #155e62;
+  --ui-amber: #744a08;
+  --ui-coral: #8f332c;
+
+  --ui-grid: rgba(55, 70, 60, 0.07);
+  --ui-glow-cyan: rgba(21, 94, 98, 0.09);
+  --ui-glow-accent: rgba(47, 93, 53, 0.065);
+  --ui-panel-bg: linear-gradient(180deg, rgba(255, 253, 248, 0.99), rgba(247, 242, 233, 0.99));
+  --ui-panel-shadow: 0 1px 0 rgba(255, 255, 255, 0.85) inset, 0 12px 34px rgba(75, 65, 45, 0.12);
+  --ui-input-bg: rgba(255, 252, 245, 0.9);
+  --ui-input-bg-focus: #fffdf8;
+  --ui-control-bg: rgba(247, 242, 233, 0.96);
+  --ui-raised-bg: rgba(247, 242, 233, 0.98);
+  --ui-surface-soft: rgba(247, 242, 233, 0.78);
+  --ui-surface-faint: rgba(255, 252, 245, 0.7);
+  --ui-surface-code: rgba(247, 242, 233, 0.9);
+  --ui-surface-chip: rgba(247, 242, 233, 0.95);
+  --ui-topbar: rgba(241, 236, 226, 0.94);
+  --ui-scrim: rgba(50, 45, 35, 0.32);
+  --ui-hover: rgba(55, 70, 60, 0.07);
+  --ui-hover-strong: rgba(55, 70, 60, 0.12);
+  --ui-chart-1: #2f5d35;
+  --ui-chart-2: #155e62;
+  --ui-chart-3: #744a08;
+  --ui-chart-4: #8f332c;
+  --ui-theme-color: #f1ece2;
+}
+
+/* Accent presets only change the accent family; semantic status colors stay fixed. */
+[data-theme="dark"][data-accent="cyan"] {
+  --ui-accent: #79d7d1;
+  --ui-accent-strong: #a6ece7;
+  --ui-accent-contrast: #041414;
+}
+[data-theme="dark"][data-accent="amber"] {
+  --ui-accent: #f5c46e;
+  --ui-accent-strong: #ffdda0;
+  --ui-accent-contrast: #1a1206;
+}
+[data-theme="light"][data-accent="cyan"] {
+  --ui-accent: #155e62;
+  --ui-accent-strong: #104a4e;
+  --ui-accent-contrast: #f5ffff;
+}
+[data-theme="light"][data-accent="amber"] {
+  --ui-accent: #744a08;
+  --ui-accent-strong: #5c3904;
+  --ui-accent-contrast: #fffaf0;
+}
+
+/* Tailwind utilities resolve these aliases, so existing class names follow the theme. */
+@theme {
+  --font-sans: "Inter", "SF Pro Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", "Cascadia Code", Consolas, monospace;
+
+  --color-ink-950: var(--ui-canvas);
+  --color-ink-900: var(--ui-rail);
+  --color-ink-850: var(--ui-panel);
+  --color-ink-800: var(--ui-panel-raised);
+  --color-ink-700: var(--ui-control);
+  --color-line: var(--ui-line);
+  --color-line-soft: var(--ui-line-soft);
+  --color-mist: var(--ui-muted);
+  --color-mist-dim: var(--ui-dim);
+  --color-paper: var(--ui-text);
+  --color-signal: var(--ui-accent);
+  --color-signal-dim: var(--ui-accent-strong);
+  --color-amber: var(--ui-amber);
+  --color-coral: var(--ui-coral);
+  --color-cyan: var(--ui-cyan);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+html {
+  background: var(--ui-canvas);
+}
+
+body,
+.panel,
+.app-rail,
+.app-topbar,
+.nav-item,
+.input,
+.btn,
+.data-table td,
+.orbit-stage,
+.orbit-node,
+.appearance-panel {
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    box-shadow 160ms ease;
+}

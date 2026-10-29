@@ -27,7 +27,7 @@ function tokens(block: string): Record<string, string> {
 }
 
 describe("appearance palettes", () => {
-  const css = readFileSync(resolve(process.cwd(), "src/index.css"), "utf8");
+  const css = readFileSync(resolve(process.cwd(), "src/styles/theme.css"), "utf8");
   const lightBlock = css.slice(
     css.indexOf('[data-theme="light"]'),
     css.indexOf("/* Accent presets"),

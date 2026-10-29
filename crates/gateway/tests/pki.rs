@@ -32,13 +32,9 @@ async fn starts_with_zero_credentials_and_creates_a_pair_on_demand() {
     let _ = store;
     assert!(!dir.path().join("pki").exists());
 
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: None,
-        pki: Some(pki_config(dir.path())),
-        opts: options(keys),
-    })
-    .await
-    .unwrap();
+    let gw = Gateway::start(GatewayConfig::pki(pki_config(dir.path()), options(keys)))
+        .await
+        .unwrap();
     assert!(
         !dir.path().join("pki").exists(),
         "startup must not create certificates"
@@ -134,13 +130,9 @@ async fn active_pairs_are_reloaded_on_restart_without_new_generation() {
     let dir = tempdir().unwrap();
     let keys = dir.path().join("keys.db");
     let cfg = pki_config(dir.path());
-    let first = Gateway::start(GatewayConfig {
-        tunnel: None,
-        pki: Some(cfg.clone()),
-        opts: options(keys.clone()),
-    })
-    .await
-    .unwrap();
+    let first = Gateway::start(GatewayConfig::pki(cfg.clone(), options(keys.clone())))
+        .await
+        .unwrap();
     let base = format!("http://{}", first.http_addr);
     let client = reqwest::Client::new();
     let created: serde_json::Value = client
@@ -161,13 +153,9 @@ async fn active_pairs_are_reloaded_on_restart_without_new_generation() {
     let server_cert = std::fs::read(dir.path().join(format!("pki/pairs/{id}/server.crt"))).unwrap();
     first.shutdown().await;
 
-    let second = Gateway::start(GatewayConfig {
-        tunnel: None,
-        pki: Some(cfg),
-        opts: options(keys),
-    })
-    .await
-    .unwrap();
+    let second = Gateway::start(GatewayConfig::pki(cfg, options(keys)))
+        .await
+        .unwrap();
     let base = format!("http://{}", second.http_addr);
     let status: serde_json::Value = client
         .get(format!("{base}/admin/pki/status"))
@@ -251,13 +239,9 @@ async fn connect_with_bundle(
 async fn downloaded_client_bundle_completes_mtls_and_marks_connected() {
     let dir = tempdir().unwrap();
     let keys = dir.path().join("keys.db");
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: None,
-        pki: Some(pki_config(dir.path())),
-        opts: options(keys),
-    })
-    .await
-    .unwrap();
+    let gw = Gateway::start(GatewayConfig::pki(pki_config(dir.path()), options(keys)))
+        .await
+        .unwrap();
     let base = format!("http://{}", gw.http_addr);
     let client = reqwest::Client::new();
     let created: serde_json::Value = client
@@ -345,13 +329,9 @@ async fn download(base: &str, client: &reqwest::Client, id: &str) -> Vec<u8> {
 async fn pair_a_client_cannot_validate_pair_b_and_revoke_blocks_new_handshakes() {
     let dir = tempdir().unwrap();
     let keys = dir.path().join("keys.db");
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: None,
-        pki: Some(pki_config(dir.path())),
-        opts: options(keys),
-    })
-    .await
-    .unwrap();
+    let gw = Gateway::start(GatewayConfig::pki(pki_config(dir.path()), options(keys)))
+        .await
+        .unwrap();
     let base = format!("http://{}", gw.http_addr);
     let client = reqwest::Client::new();
     let a = create_pair(&base, &client, "pair-a", "a.example.com").await;
@@ -392,13 +372,9 @@ async fn https_gate_blocks_plain_downloads_when_required() {
     let keys = dir.path().join("keys.db");
     let mut cfg = pki_config(dir.path());
     cfg.require_https_for_download = true;
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: None,
-        pki: Some(cfg),
-        opts: options(keys),
-    })
-    .await
-    .unwrap();
+    let gw = Gateway::start(GatewayConfig::pki(cfg, options(keys)))
+        .await
+        .unwrap();
     let base = format!("http://{}", gw.http_addr);
     let client = reqwest::Client::new();
     let pair = create_pair(&base, &client, "pair-a", "a.example.com").await;

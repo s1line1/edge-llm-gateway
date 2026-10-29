@@ -81,6 +81,7 @@ describe("Certificates page", () => {
     mocks.createPkiPair.mockResolvedValue(pair);
     renderPage("super_admin");
 
+    expect(await screen.findByText("PKI ENABLED")).toBeDefined();
     fireEvent.change(await screen.findByLabelText("名称"), { target: { value: "laptop-1" } });
     fireEvent.change(screen.getByLabelText("Server name (SNI)"), {
       target: { value: "gateway.example.com" },

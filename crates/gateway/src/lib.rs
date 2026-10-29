@@ -39,5 +39,5 @@ pub mod usage_meter;
 
 // 再导出：保住 `gateway::{Gateway, GatewayConfig, TlsPem}` 这些既有导入路径
 // （src/config.rs、main.rs 与 tests/e2e/* 都按这些路径引用）。
-pub use gateway::{Gateway, GatewayConfig, Options, TunnelTls};
+pub use gateway::{Gateway, GatewayConfig, GatewayIdentity, Options, TunnelTls};
 pub use tls::TlsPem;

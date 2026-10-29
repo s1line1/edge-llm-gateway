@@ -1,9 +1,72 @@
-//! Dynamic client certificate verification + fingerprint revocation.
+//! SNI-based server certificate resolver. Empty is a valid, fail-closed state.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{Arc, RwLock},
 };
+
+use rustls::{
+    server::{ClientHello, ResolvesServerCert},
+    sign::CertifiedKey,
+};
+
+#[derive(Default)]
+pub struct PkiServerCerts {
+    certs: RwLock<HashMap<String, Arc<CertifiedKey>>>,
+}
+
+impl std::fmt::Debug for PkiServerCerts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PkiServerCerts")
+            .field("count", &self.len())
+            .finish()
+    }
+}
+
+impl PkiServerCerts {
+    pub fn insert(&self, server_name: &str, key: Arc<CertifiedKey>) {
+        self.certs
+            .write()
+            .expect("pki resolver lock poisoned")
+            .insert(server_name.to_ascii_lowercase(), key);
+    }
+
+    pub fn remove(&self, server_name: &str) {
+        self.certs
+            .write()
+            .expect("pki resolver lock poisoned")
+            .remove(&server_name.to_ascii_lowercase());
+    }
+
+    pub fn contains(&self, server_name: &str) -> bool {
+        self.certs
+            .read()
+            .expect("pki resolver lock poisoned")
+            .contains_key(&server_name.to_ascii_lowercase())
+    }
+
+    pub fn len(&self) -> usize {
+        self.certs.read().expect("pki resolver lock poisoned").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl ResolvesServerCert for PkiServerCerts {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let name = client_hello.server_name()?;
+        self.certs
+            .read()
+            .expect("pki resolver lock poisoned")
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+    }
+}
+// Dynamic client certificate verification + fingerprint revocation.
+
+use std::collections::HashSet;
 
 use rustls::{
     client::danger::HandshakeSignatureValid,
@@ -164,5 +227,65 @@ impl ClientCertVerifier for PkiClientVerifier {
         self.inner()
             .map(|inner| inner.supported_verify_schemes())
             .unwrap_or_default()
+    }
+}
+
+/// Runtime TLS state shared by the QUIC listener, the verifier, and admin handlers.
+#[derive(Clone, Default)]
+pub struct PkiRuntime {
+    pub resolver: Arc<PkiServerCerts>,
+    pub verifier: Arc<PkiClientVerifier>,
+    pub pairs_by_server: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+}
+
+impl PkiRuntime {
+    pub fn add_pair(
+        &self,
+        server_name: &str,
+        pair_id: &str,
+        key: rustls::sign::CertifiedKey,
+        ca: rustls::pki_types::CertificateDer<'static>,
+    ) -> Result<(), PkiError> {
+        self.verifier.add_ca(ca)?;
+        self.resolver.insert(server_name, Arc::new(key));
+        self.pairs_by_server
+            .write()
+            .expect("pki pair map lock poisoned")
+            .insert(server_name.to_ascii_lowercase(), pair_id.to_string());
+        Ok(())
+    }
+
+    pub fn remove_pair(
+        &self,
+        server_name: &str,
+        ca: &rustls::pki_types::CertificateDer<'static>,
+        client_cert: &rustls::pki_types::CertificateDer<'_>,
+    ) -> Result<(), PkiError> {
+        self.resolver.remove(server_name);
+        self.verifier.remove_ca(ca)?;
+        self.verifier.revoke(client_cert);
+        self.pairs_by_server
+            .write()
+            .expect("pki pair map lock poisoned")
+            .remove(&server_name.to_ascii_lowercase());
+        Ok(())
+    }
+
+    pub fn pair_id_for_server(&self, server_name: &str) -> Option<String> {
+        self.pairs_by_server
+            .read()
+            .expect("pki pair map lock poisoned")
+            .get(&server_name.to_ascii_lowercase())
+            .cloned()
+    }
+
+    pub fn server_config(&self) -> Result<Arc<rustls::ServerConfig>, PkiError> {
+        use rustls::server::danger::ClientCertVerifier;
+        let verifier: Arc<dyn ClientCertVerifier> = self.verifier.clone();
+        let mut config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_cert_resolver(self.resolver.clone());
+        config.alpn_protocols = vec![proto::ALPN.to_vec()];
+        Ok(Arc::new(config))
     }
 }

@@ -12,10 +12,12 @@ async fn main() -> anyhow::Result<()> {
     // 身份材料在 `cfg.tunnel` 下（必填），可调旋钮在 `cfg.opts` 下。
     // `TunnelTls::server_config()` 直接给出 mTLS 的 rustls 配置：它含 ALPN，并自己确保
     // rustls crypto provider 已安装（幂等）——所以这里不再自己复制一份构造逻辑。
-    let tunnel = cfg
-        .tunnel
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("this example requires a fixed test tunnel fixture"))?;
+    let tunnel = match &cfg.identity {
+        gateway::GatewayIdentity::TestFixed(tunnel) => tunnel,
+        gateway::GatewayIdentity::Pki(_) => {
+            anyhow::bail!("this example requires a fixed test tunnel fixture")
+        }
+    };
     let tls = tunnel.server_config()?;
     let mut server = s2n_quic::Server::builder()
         .with_tls(Server::from(tls))? // ← From<Arc<rustls::ServerConfig>>（s2n-quic-rustls/src/server.rs:60）

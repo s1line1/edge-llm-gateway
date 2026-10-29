@@ -27,17 +27,41 @@ pub use crate::options::Options;
 /// 隧道身份材料住在 [`crate::tls`]；同样再导出以保住 `gateway::TunnelTls` 路径。
 pub use crate::tls::TunnelTls;
 
-/// 启动配置：**必填的身份材料** + 全部可选项。
+/// The single gateway identity source.
+#[derive(Debug)]
+pub enum GatewayIdentity {
+    /// Production: credentials are created on demand and loaded dynamically.
+    Pki(PkiConfig),
+    /// Test-only fixed tunnel fixture. Production YAML cannot construct this.
+    #[doc(hidden)]
+    TestFixed(TunnelTls),
+}
+
+/// 启动配置：**唯一身份来源** + 全部可选项。
 ///
 /// **不要**给它加 `#[non_exhaustive]`：`tests/e2e` 是独立 crate，加了之后连
 /// `..Options::default()` 这种 FRU 写法都用不了，正好毁掉本结构存在的意义。
 #[derive(Debug)]
 pub struct GatewayConfig {
-    /// Test/legacy fixture only. Production YAML never sets this.
-    pub tunnel: Option<TunnelTls>,
-    /// On-demand credential management. Mutually exclusive with `tunnel`.
-    pub pki: Option<PkiConfig>,
+    pub identity: GatewayIdentity,
     pub opts: Options,
+}
+
+impl GatewayConfig {
+    pub fn pki(config: PkiConfig, opts: Options) -> Self {
+        Self {
+            identity: GatewayIdentity::Pki(config),
+            opts,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn test_fixed(tunnel: TunnelTls, opts: Options) -> Self {
+        Self {
+            identity: GatewayIdentity::TestFixed(tunnel),
+            opts,
+        }
+    }
 }
 
 pub struct Gateway {
@@ -92,16 +116,7 @@ impl Gateway {
     /// `Verifier`、`Io`（端口占用）、`QuicStart`。**已知的刻意放宽**（保持原有设计）：NOFILE 抬不动
     /// 只 WARN、`ui_dir` 不可用只降级成占位页，两者都不阻止启动。
     pub async fn start(cfg: GatewayConfig) -> Result<Self, GatewayError> {
-        let GatewayConfig {
-            tunnel,
-            pki: pki_config,
-            opts,
-        } = cfg;
-        if tunnel.is_some() == pki_config.is_some() {
-            return Err(GatewayError::Config(
-                "exactly one of fixed tunnel fixtures or pki credentials is required".into(),
-            ));
-        }
+        let GatewayConfig { identity, opts } = cfg;
 
         // ⓪ 旋钮校验（记录 P2-8）：零值不是"关闭"而是"立刻超时"，其中 `head_timeout`/`agent_stale`
         //    的零值会让网关起来就开始全量 503。放在最前面——比 TLS 材料还早，因为这是配置作者的
@@ -123,20 +138,19 @@ impl Gateway {
                  empty key store (every request would 401 while the gateway looks healthy)"
             )));
         }
-        let pki_service = match pki_config {
-            Some(config) => Some(std::sync::Arc::new(
-                PkiService::new(config, store.clone())
-                    .map_err(|e| GatewayError::Config(e.to_string()))?,
-            )),
-            None => None,
-        };
-        let quic_tls = match (&tunnel, &pki_service) {
-            (Some(tunnel), None) => tunnel.server_config()?,
-            (None, Some(service)) => service
-                .runtime()
-                .server_config()
-                .map_err(|e| GatewayError::Config(e.to_string()))?,
-            _ => unreachable!("validated above"),
+        let (pki_service, quic_tls) = match identity {
+            GatewayIdentity::Pki(config) => {
+                let service = std::sync::Arc::new(
+                    PkiService::new(config, store.clone())
+                        .map_err(|e| GatewayError::Config(e.to_string()))?,
+                );
+                let tls = service
+                    .runtime()
+                    .server_config()
+                    .map_err(|e| GatewayError::Config(e.to_string()))?;
+                (Some(service), tls)
+            }
+            GatewayIdentity::TestFixed(tunnel) => (None, tunnel.server_config()?),
         };
         let https = opts.https.as_ref().map(TlsPem::server_config).transpose()?;
 

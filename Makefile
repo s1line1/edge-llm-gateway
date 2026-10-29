@@ -199,7 +199,7 @@ dev: build-debug gateway-config.yml ## 一键起全栈（mock-llm + gateway + ag
 		sleep 0.2; \
 	done
 	@echo "== 创建 on-demand 凭证对（Gateway 启动本身不生成证书） =="
-	@bash scripts/dev-pki-client.sh http://127.0.0.1:8080 .tmp/dev-client
+	@bash scripts/dev/pki-client.sh http://127.0.0.1:8080 .tmp/dev-client
 	@echo "== 启动 agent =="
 	@nohup $(AGENT_BIN) --config .tmp/agent-config.dev.yml > $(LOGDIR)/agent.log 2>&1 & echo $$! > .tmp/agent.pid
 	@sleep 1

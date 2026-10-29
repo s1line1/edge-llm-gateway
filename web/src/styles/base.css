@@ -1,0 +1,14 @@
+/* Global element baseline. */
+body {
+  margin: 0;
+  background: var(--ui-canvas);
+  color: var(--ui-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--ui-accent) 30%, transparent);
+  color: var(--ui-text);
+}

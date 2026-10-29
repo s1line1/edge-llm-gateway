@@ -89,9 +89,9 @@ fn write_and_load_pair_with_private_permissions() {
 fn invalid_names_and_ip_server_names_are_rejected() {
     // Name/SAN validation is in PkiService; generation itself also accepts only a DNS name
     // through the service layer. This test pins the accepted pair-name shape.
-    assert!(super::service::valid_name_for_test("laptop-1"));
-    assert!(!super::service::valid_name_for_test("Laptop"));
-    assert!(!super::service::valid_name_for_test(""));
+    assert!(super::model::valid_name("laptop-1"));
+    assert!(!super::model::valid_name("Laptop"));
+    assert!(!super::model::valid_name(""));
 }
 
 #[test]

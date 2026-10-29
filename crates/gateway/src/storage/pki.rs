@@ -166,6 +166,20 @@ impl Storage {
         Ok(changed > 0)
     }
 
+    pub fn delete_pki_record(&self, id: &str) -> Result<(), String> {
+        let db = self
+            .inner
+            .db
+            .lock()
+            .map_err(|_| "pki db lock poisoned".to_string())?;
+        let Some(conn) = db.as_ref() else {
+            return Err("pki requires a persistent keys_file database".into());
+        };
+        conn.execute("DELETE FROM pki_credentials WHERE id=?1", [id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn update_pki(&self, id: &str, column: &str, at: i64) -> Result<(), String> {
         debug_assert!(column == "downloaded_at");
         let db = self

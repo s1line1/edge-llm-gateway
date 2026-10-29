@@ -4,13 +4,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { AgentInfo } from "../api/types";
+import { OrbitBeacon } from "./orbit/OrbitBeacon";
+import { OrbitCenter } from "./orbit/OrbitCenter";
 import {
   agentKey,
   agentStatus,
   orbitAgents,
   pointForIndex,
   indexFromPointer,
-  type AgentStatusTone,
 } from "./orbitGeometry";
 import { Icon } from "./icons";
 import { Badge, IconButton } from "./ui";
@@ -19,18 +20,6 @@ const SVG_SIZE = 400;
 const SVG_CENTER = SVG_SIZE / 2;
 const SVG_RADIUS = 160;
 const NODE_RADIUS = 0.4;
-
-function PixelBeacon({ tone }: { tone: AgentStatusTone }) {
-  return (
-    <svg viewBox="0 0 8 8" className={`orbit-pixel orbit-pixel-${tone}`} aria-hidden="true">
-      <rect x="1" y="1" width="2" height="2" />
-      <rect x="5" y="1" width="2" height="2" opacity="0.55" />
-      <rect x="1" y="5" width="2" height="2" opacity="0.55" />
-      <rect x="5" y="5" width="2" height="2" />
-      <rect x="3" y="3" width="2" height="2" opacity="0.9" />
-    </svg>
-  );
-}
 
 function tickLines() {
   return Array.from({ length: 60 }, (_, i) => {
@@ -239,44 +228,14 @@ export function EdgeOrbit({
             )}
           </svg>
 
-          <div className="orbit-center" data-orbit-center>
-            <div className="micro-label">{selected ? "SELECTED" : "FLEET"}</div>
-            {selected ? (
-              <>
-                <div className="orbit-center-title">{selected.agent_id}</div>
-                <div className="mt-1 flex items-center justify-center gap-1.5">
-                  <PixelBeacon tone={agentStatus(selected).tone} />
-                  <span className="font-mono text-[10px] text-mist">
-                    {agentStatus(selected).label}
-                  </span>
-                </div>
-                <div className="orbit-center-meta">
-                  <span>{selected.tenant_id ?? "default"}</span>
-                  <span>{selected.ip ?? "—"}</span>
-                </div>
-                <div className="orbit-center-readout">
-                  {selected.inflight} /{" "}
-                  {selected.max_concurrency === 0 ? "∞" : selected.max_concurrency}
-                  <span> in flight</span>
-                </div>
-                <div className="orbit-center-models">
-                  {selected.models.join(" · ") || "no declared model"}
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="orbit-center-title">{tenantLabel}</div>
-                <div className="orbit-center-readout">
-                  {healthy} / {visible.length}
-                  <span> healthy</span>
-                </div>
-                <div className="orbit-center-meta">
-                  <span>{inflight} in flight</span>
-                  <span>{agents.length} registered</span>
-                </div>
-              </>
-            )}
-          </div>
+          <OrbitCenter
+            selected={selected}
+            tenantLabel={tenantLabel}
+            healthy={healthy}
+            total={visible.length}
+            inflight={inflight}
+            registered={agents.length}
+          />
 
           {visible.map((agent, index) => {
             const point = pointForIndex(index, visible.length, NODE_RADIUS);
@@ -306,7 +265,7 @@ export function EdgeOrbit({
                   setFocusedIndex(index);
                 }}
               >
-                <PixelBeacon tone={status.tone} />
+                <OrbitBeacon tone={status.tone} />
                 <span className="orbit-node-label">{agent.agent_id}</span>
                 <span className="orbit-node-load">
                   {agent.inflight}/{agent.max_concurrency === 0 ? "∞" : agent.max_concurrency}

@@ -130,6 +130,13 @@ impl LoadedPair {
     pub fn server_name(&self) -> &str {
         &self.server_name
     }
+
+    pub fn client_cert(&self) -> Result<CertificateDer<'static>, PkiError> {
+        parse_certs(&self.client_cert_pem)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| PkiError::Invalid("client.crt is empty".into()))
+    }
 }
 
 fn parse_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, PkiError> {
