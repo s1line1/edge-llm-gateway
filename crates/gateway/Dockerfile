@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
-# home-llm-gateway **网关**镜像（gateway 二进制 + Dashboard 静态产物）
+# edge-llm-gateway **网关**镜像（gateway 二进制 + Dashboard 静态产物）
 #
 # 构建（⚠️ 上下文必须是**仓库根**：本文件要 COPY 工作区根的 `Cargo.toml` / `crates/*` / `web/`）：
-#   在仓库根：       docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
-#   在 crate 目录里：cd crates/gateway && docker build -f Dockerfile -t home-llm-gateway ../..
+#   在仓库根：       docker build -f crates/gateway/Dockerfile -t edge-llm-gateway .
+#   在 crate 目录里：cd crates/gateway && docker build -f Dockerfile -t edge-llm-gateway ../..
 #     （两条完全等价：上下文都是仓库根，而 Dockerfile 也在上下文内 ⇒ 合法。
 #      **不能**写成 `docker build .`：那会把上下文取成 `crates/gateway/`，里面既没有工作区清单
 #      （`Cargo.toml` 用了 `workspace = true` 继承与 `proto = { path = "../proto" }`），也没有
@@ -27,17 +27,17 @@
 #   ⚠️ ENTRYPOINT 已经是 gateway 二进制，命令行里**不要再写一个 "gateway"**——那会被 clap
 #      当成未声明的位置参数，容器以退出码 2 立刻退出（配 restart 就是崩溃重启循环）。
 #   ⚠️ 挂载点必须与配置里的路径对齐：`gateway-config.example.yml` 用的是绝对路径
-#      `/etc/home-llm-gateway/...`，所以这里做**同路径挂载**，配置可原样使用。
-#      若改用 `-v /etc/home-llm-gateway:/config`，则 YAML 里的 cert/key/ca/keys_file
+#      `/etc/edge-llm-gateway/...`，所以这里做**同路径挂载**，配置可原样使用。
+#      若改用 `-v /etc/edge-llm-gateway:/config`，则 YAML 里的 cert/key/ca/keys_file
 #      都要一起改成 `/config/...`，否则容器内找不到文件（见 DEPLOY.md §11）。
 #   docker run -d --name gateway --restart unless-stopped \
-#     -v /etc/home-llm-gateway:/etc/home-llm-gateway \
+#     -v /etc/edge-llm-gateway:/etc/edge-llm-gateway \
 #     -p 8443:8443 -p 4433:4433/udp \
-#     home-llm-gateway --config /etc/home-llm-gateway/gateway-config.yml
+#     edge-llm-gateway --config /etc/edge-llm-gateway/gateway-config.yml
 #
 # Dashboard 已经编进镜像：容器内既不用挂载宿主机的 `web/dist`，也**不用写 `ui_dir`** ——
 # `config.rs::default_ui_dir()` 的默认值就是下面那个 COPY 目标
-# `/usr/local/share/home-llm-gateway/web`（见 DEPLOY.md §11.5）。
+# `/usr/local/share/edge-llm-gateway/web`（见 DEPLOY.md §11.5）。
 # 也可以用配套的 `crates/gateway/docker-compose.yml` 起（compose 入口，见 DEPLOY.md §11.6）。
 
 # 构建基底**必须与运行阶段的发行版对齐**：运行阶段是 `debian:bookworm-slim`（Debian 12，
@@ -168,16 +168,16 @@ COPY --from=builder /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf
 COPY --from=builder /build/target/release/gateway /usr/local/bin/gateway
 
 # Dashboard 静态产物（`web-builder` 阶段构建）。**位置必须在挂载点之外**：容器里相对路径按
-# **进程 CWD**（`/etc/home-llm-gateway`，见 DEPLOY.md §11.1）解析，而那个目录是配置 + 证书 +
+# **进程 CWD**（`/etc/edge-llm-gateway`，见 DEPLOY.md §11.1）解析，而那个目录是配置 + 证书 +
 # `keys.db` 的挂载点 —— 产物放进去会被宿主目录**遮住**，`/` 照样是"UI 未构建"。
 # 所以放 `/usr/local/share/...`，并把 `config.rs::default_ui_dir()` 的默认值指向**同一个路径**：
 # 于是容器**不写 `ui_dir` 也有 Dashboard**（有配置则用配置）。⚠️ 改这个路径要两处一起改
 # （这里 + `default_ui_dir`），`config.rs` 里那条断言会盯着。
-COPY --from=web-builder /build/web/dist /usr/local/share/home-llm-gateway/web
+COPY --from=web-builder /build/web/dist /usr/local/share/edge-llm-gateway/web
 
 # 工作目录 = 配置目录：配置里的**相对路径**（`ui_dir`、`keys_file` 等）按进程 CWD 解析
 # （`gateway/src/config.rs` 不按配置文件所在目录重写路径），所以必须显式定 CWD，
-# 语义与 `deploy/gateway.service` 的 `WorkingDirectory=/etc/home-llm-gateway` 保持一致。
-WORKDIR /etc/home-llm-gateway
+# 语义与 `deploy/gateway.service` 的 `WorkingDirectory=/etc/edge-llm-gateway` 保持一致。
+WORKDIR /etc/edge-llm-gateway
 ENTRYPOINT ["/usr/local/bin/gateway"]
-CMD ["--config", "/etc/home-llm-gateway/gateway-config.yml"]
+CMD ["--config", "/etc/edge-llm-gateway/gateway-config.yml"]

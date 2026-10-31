@@ -1,4 +1,4 @@
-# home-llm-gateway TODO
+# edge-llm-gateway TODO
 
 > 基于实际代码审查与需求梳理（2026-08），按优先级排列。
 > 状态：P0 主体已实施（2026-09）；其余按优先级推进，`[x]` 表示已完成，未勾选项为待办。
@@ -222,7 +222,7 @@
       `crates/gateway/docker-compose.yml` 的注释都已给出规则；缺的是"部署步骤里真的装上"。
       **2026-09-26 订正**：原文说"`DEPLOY.md` 只提了一句"**已不成立**——今天 `grep -n 'logrotate\|轮转' DEPLOY.md README.md`
       为空，两条路径里只有 **compose** 那份给了安装命令（`docker-compose.yml:76-84` 的 cp/chown/chmod/`logrotate -d`），
-      **`deploy/gateway.service`（systemd）那条路径与 `DEPLOY.md` 一句都没有**）：`StandardOutput=append:/var/log/home-llm-gateway/gateway.log`，
+      **`deploy/gateway.service`（systemd）那条路径与 `DEPLOY.md` 一句都没有**）：`StandardOutput=append:/var/log/edge-llm-gateway/gateway.log`，
       每请求至少一行 INFO，实测单日 **652MB**（`tail -c 6000000` 只覆盖约 20 秒，
       排查时按时间 grep 会误以为"日志里什么都没有"）。修法：`logrotate` + 降级为
       `RUST_LOG=info,gateway::access=debug` 之类的分级，或按请求采样。
@@ -230,7 +230,7 @@
       目的是排查时"错误不被 info 淹没"。**硬约束：进程目前只写 stdout**——
       `crates/gateway/src/main.rs:48` 的 `tracing_subscriber::fmt().try_init()` **没有**
       `with_writer`，落盘是部署侧做的（`deploy/gateway.service:35` 的
-      `StandardOutput=append:/var/log/home-llm-gateway/gateway.log`，或 docker 的 stdout 采集）。
+      `StandardOutput=append:/var/log/edge-llm-gateway/gateway.log`，或 docker 的 stdout 采集）。
       而 **systemd / docker 只能把 stdout 重定向到"一个"文件，无法按级别分流** ⇒ 要分流就得让
       **进程自己开文件**。可选修法：① 进程内多 layer——`tracing_subscriber::registry()` +
       每级一个 `fmt::Layer`，各自 `with_writer(..)` 与 `with_filter(LevelFilter::…)`；writer 用
@@ -473,10 +473,10 @@
       `setup-node node-version: 22` / `pnpm/action-setup version: 10`），不照抄本机的 24/11
       （那会造出"只有镜像里才有、没人验过"的组合）；pnpm 用 npm 装而非 corepack（corepack 不认
       npm registry 镜像配置，墙内会卡）。运行阶段
-      `COPY --from=web-builder /build/web/dist /usr/local/share/home-llm-gateway/web`
+      `COPY --from=web-builder /build/web/dist /usr/local/share/edge-llm-gateway/web`
       —— 运行镜像里**不带 Node**，容器不再需要宿主机挂 `web/dist`。产物**不能**放
-      `/etc/home-llm-gateway/web`（那是配置/证书/keys.db 的挂载点，会被挂载遮住），所以放在
-      `/usr/local/share/home-llm-gateway/web`，并且
+      `/etc/edge-llm-gateway/web`（那是配置/证书/keys.db 的挂载点，会被挂载遮住），所以放在
+      `/usr/local/share/edge-llm-gateway/web`，并且
       **`config.rs::default_ui_dir()` 的部署默认值也改成同一个绝对路径**
       （`crates/gateway/src/config.rs`，`config.rs` 里那条断言钉住它）：容器**不写 `ui_dir`
       也有 Dashboard**，有配置则用配置；代价是**原生部署必须显式写 `ui_dir`**（默认值给镜像用）。
@@ -1577,7 +1577,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
         `readelf -l` INTERP=0、`readelf -d` NEEDED=0（三个二进制都是）
       · `x86_64-unknown-linux-musl` → `file` = `ELF 64-bit LSB pie executable, x86-64, static-pie linked`；
         INTERP=0、NEEDED=0（本机**没有 nasm** 也编得过：aws-lc-sys 走了预生成汇编那条路）
-      · 产物：`dist/home-llm-gateway-0.1.2-{x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,
+      · 产物：`dist/edge-llm-gateway-0.1.2-{x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,
         aarch64-apple-darwin}.tar.gz` + `dist/SHA256SUMS`
 - [x] **新增 `.github/workflows/release.yml`**：`v*` tag 或手动触发。meta（tag 必须与
       `Cargo.toml` 版本一致，否则产物名与二进制自报版本会打架）→ gate（fmt + clippy + nextest；

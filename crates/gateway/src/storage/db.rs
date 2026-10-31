@@ -121,7 +121,7 @@ pub(super) fn open(file: Option<&Path>) -> OpenedDb {
 
 /// 把库文件**及其 WAL 侧车**权限收紧到 `0600`（评估 §7 步骤 6 / P3-7；复扫 C2-1）。
 ///
-/// 库文件是按调用方 umask 创建的（常见 0644），而它通常放在 `/etc/home-llm-gateway/`
+/// 库文件是按调用方 umask 创建的（常见 0644），而它通常放在 `/etc/edge-llm-gateway/`
 /// 下（`DEPLOY.md` 的目录清单）。库里只有 argon2 哈希与 sha256 lookup，属纵深防御；
 /// 但升级/拷贝过来的旧库往往仍是宽权限，所以**每次打开都收紧一次**。
 ///

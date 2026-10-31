@@ -1,7 +1,7 @@
 # Edge LLM 网关 — 重建蓝图
 
 > **用途**：从零重建同类项目（edge LLM 网关）的实施规格。
-> 以现有 `home-llm-gateway`（HEAD `6609a8c`，216 commits）为参考实现，把"哪些必须照做、
+> 以现有 `edge-llm-gateway`（HEAD `6609a8c`，216 commits）为参考实现，把"哪些必须照做、
 > 哪些必须改、怎么验收"写成可执行的约束。
 >
 > **与 DESIGN.md 的分工**：`DESIGN.md` 回答"这个系统是什么"；本文回答

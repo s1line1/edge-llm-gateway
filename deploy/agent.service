@@ -1,9 +1,9 @@
 # edge-agent systemd 单元（部署在 LLM 所在机器 / edge 节点）
 # 安装：
 #   1. 把二进制放到 /usr/local/bin/agent
-#   2. 把证书与 agent 配置放到 /etc/home-llm-gateway/
+#   2. 把证书与 agent 配置放到 /etc/edge-llm-gateway/
 #      （基于 agent-config.example.yml 修改：cloud_addr、证书路径、upstream 等）
-#   3. 建日志目录：sudo mkdir -p /var/log/home-llm-gateway
+#   3. 建日志目录：sudo mkdir -p /var/log/edge-llm-gateway
 #   4. sudo cp deploy/agent.service /etc/systemd/system/ && sudo systemctl daemon-reload \
 #      && sudo systemctl enable --now agent
 [Unit]
@@ -13,15 +13,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 所有参数都在 /etc/home-llm-gateway/agent-config.yml 中配置（见 agent-config.example.yml）
-ExecStart=/usr/local/bin/agent --config /etc/home-llm-gateway/agent-config.yml
+# 所有参数都在 /etc/edge-llm-gateway/agent-config.yml 中配置（见 agent-config.example.yml）
+ExecStart=/usr/local/bin/agent --config /etc/edge-llm-gateway/agent-config.yml
 Restart=always
 RestartSec=3
 # 日志落盘（追加，重启不丢）。stdout/stderr 不再进 journald；
-# 查看：tail -f /var/log/home-llm-gateway/agent.log
+# 查看：tail -f /var/log/edge-llm-gateway/agent.log
 # 建议配 logrotate 轮转（见 deploy/logrotate.example）。
-StandardOutput=append:/var/log/home-llm-gateway/agent.log
-StandardError=append:/var/log/home-llm-gateway/agent.log
+StandardOutput=append:/var/log/edge-llm-gateway/agent.log
+StandardError=append:/var/log/edge-llm-gateway/agent.log
 
 [Install]
 WantedBy=multi-user.target

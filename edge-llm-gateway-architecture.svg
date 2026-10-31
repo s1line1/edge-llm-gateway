@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1220" viewBox="0 0 1800 1220" role="img" aria-labelledby="title desc">
-  <title id="title">home-llm-gateway architecture</title>
+  <title id="title">edge-llm-gateway architecture</title>
   <desc id="desc">Architecture diagram showing clients, cloud gateway modules, QUIC tunnel, edge agent, and local OpenAI-compatible LLM services.</desc>
   <defs>
     <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
@@ -45,7 +45,7 @@
   </defs>
 
   <rect class="bg" x="0" y="0" width="1800" height="1220"/>
-  <text x="70" y="70" class="panel-title">home-llm-gateway 架构图</text>
+  <text x="70" y="70" class="panel-title">edge-llm-gateway 架构图</text>
   <text x="70" y="100" class="panel-sub">边缘 LLM 通过主动 QUIC 隧道接入公网网关，对外提供 OpenAI 兼容 API 与流式 SSE。</text>
 
   <rect class="panel" x="60" y="150" width="300" height="770"/>

@@ -192,7 +192,7 @@ assert_static_elf() {
 # （原来把三个二进制平铺在包根，scp 解包时会散在宿主机当前目录里）。
 package() {
   local target="$1" tarball="$2" stage name
-  name="home-llm-gateway-${VERSION}-${target}"
+  name="edge-llm-gateway-${VERSION}-${target}"
   stage="$(mktemp -d)"
   mkdir -p "${stage}/${name}/bin" "${stage}/${name}/deploy"
   cp "target/${target}/release/gateway" "target/${target}/release/agent" \
@@ -288,7 +288,7 @@ for target in "${TARGETS[@]}"; do
     echo "    ✔ 三个二进制都是静态链接（file + readelf 已核）"
   fi
 
-  tarball="${DIST}/home-llm-gateway-${VERSION}-${target}.tar.gz"
+  tarball="${DIST}/edge-llm-gateway-${VERSION}-${target}.tar.gz"
   if package "$target" "$tarball"; then
     echo "    -> ${tarball}"
     built+=("$target")
@@ -302,7 +302,7 @@ if [ "${#built[@]}" -gt 0 ]; then
   (
     cd "$DIST"
     for t in "${built[@]}"; do
-      sha256_lines "home-llm-gateway-${VERSION}-${t}.tar.gz"
+      sha256_lines "edge-llm-gateway-${VERSION}-${t}.tar.gz"
     done >SHA256SUMS
   )
   echo "==> 校验和：${DIST}/SHA256SUMS"
