@@ -21,7 +21,7 @@
 |---|---|---|
 | `crates/gateway/src/main.rs:13` | `cloud-gateway: 家庭 LLM 远程访问网关（公网入口 + QUIC 隧道服务端）` | `cloud-gateway: Edge LLM 网关（公网入口 + QUIC 隧道服务端）` |
 | `crates/gateway/src/proxy/routing.rs:275` | API 错误 `no home agent available` | `no edge available`（客户端可见） |
-| `crates/gateway/src/quic.rs:77` | 日志 `home agent connected` | `edge connected` |
+| `crates/gateway/src/tunnel/accept.rs:67` | 日志 `home agent connected` | `edge connected` |
 | `crates/agent/src/main.rs:13` | `home-agent: 常驻 LLM 所在机器，通过 QUIC 隧道接入云端网关` | `edge-agent: 常驻 LLM 所在机器（edge），通过 QUIC 隧道接入云端网关` |
 | `crates/agent/src/lib.rs:1` | 模块注释 `home-agent：常驻家里...` | edge-agent 表述 |
 

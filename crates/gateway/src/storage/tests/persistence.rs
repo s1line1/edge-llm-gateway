@@ -319,3 +319,58 @@ fn preexisting_wal_sidecars_are_tightened_too() {
         "遗留的 -shm 必须显式收紧（不能只靠继承）"
     );
 }
+
+/// 规格（Phase 2）：一个真实文件库重启后，tenant / user / session / key / audit 五类聚合
+/// 都从 SQLite 重新装载，而不是只恢复 key 表。
+#[test]
+fn all_aggregates_reload_after_restart() {
+    let _cheap = crate::storage::hash::CheapArgon2::install();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("keys.db");
+
+    let (tenant_id, user_id, session_token, key_plaintext) = {
+        let store = Storage::new(Some(path.clone()));
+        let tenant = store.create_tenant("restart-tenant".into(), 3, 30).unwrap();
+        let tenant_id = tenant.record.id().to_string();
+        let user = store
+            .create_user(
+                "restart-user".into(),
+                "correct horse battery".into(),
+                UserRole::TenantAdmin,
+                Some(tenant_id.clone()),
+                None,
+            )
+            .unwrap();
+        let user_id = user.record.id().to_string();
+        let session = store.create_session(&user_id, 3600).unwrap();
+        let key = store
+            .create_in(&tenant_id, Some(&user_id), "restart-key".into())
+            .unwrap();
+        store
+            .append_audit(
+                Some(&user_id),
+                "restart-user",
+                Some(&tenant_id),
+                "test.restart",
+                &user_id,
+            )
+            .unwrap();
+        (tenant_id, user_id, session.token, key.plaintext)
+    };
+
+    let reloaded = Storage::new(Some(path));
+    assert_eq!(
+        reloaded.tenant(&tenant_id).map(|t| t.name().to_string()),
+        Some("restart-tenant".into())
+    );
+    assert_eq!(
+        reloaded.user(&user_id).map(|u| u.username().to_string()),
+        Some("restart-user".into())
+    );
+    assert!(reloaded.authorize_session(&session_token).is_some());
+    assert!(reloaded.authorize(&key_plaintext));
+    assert!(reloaded
+        .audit_records(Some(&tenant_id), 10)
+        .iter()
+        .any(|a| a.action() == "test.restart"));
+}

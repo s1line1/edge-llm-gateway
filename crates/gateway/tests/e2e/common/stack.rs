@@ -57,6 +57,10 @@ pub fn e2e_options(keys_file: Option<PathBuf>) -> Options {
 }
 
 /// 用给定旋钮组装一份 [`GatewayConfig`]（不启动）——要断言"启动**之前**就失败"的用例需要它。
+///
+/// **Test-only fixed TLS fixture.** This is the legacy low-level fixture; the production identity
+/// path is covered by `tests/e2e/pki_identity.rs` and `tests/pki.rs`. Do not use this helper for a
+/// new identity/PKI test.
 pub fn gateway_config(certs: &TestCerts, opts: Options) -> GatewayConfig {
     GatewayConfig::test_fixed(certs.tunnel_tls(), opts)
 }

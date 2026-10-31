@@ -5,9 +5,9 @@ use axum::{
 };
 
 use crate::{
-    pki::PkiError,
+    pki::{blocking, PkiError},
     rbac::{authorize, response as rbac_response, Action, Principal},
-    state::AppState,
+    state::AdminRuntime,
 };
 
 use super::errors::{audit, pki_error_response};
@@ -20,15 +20,15 @@ fn https_or_test(headers: &HeaderMap) -> bool {
 }
 
 pub(crate) async fn download(
-    State(state): State<AppState>,
+    State(state): State<AdminRuntime>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(pki) = state.pki.as_ref() else {
+    let Some(pki) = state.pki.clone() else {
         return crate::openai::error_response(StatusCode::NOT_FOUND, "PKI is not enabled");
     };
-    let record = match pki.record(&id) {
+    let record = match blocking::record(pki.clone(), id.clone()).await {
         Ok(record) => record,
         Err(PkiError::NotFound) => return pki_error_response(PkiError::NotFound),
         Err(e) => return pki_error_response(e),
@@ -39,7 +39,7 @@ pub(crate) async fn download(
     if pki.config().require_https_for_download && !https_or_test(&headers) {
         return pki_error_response(PkiError::HttpsRequired);
     }
-    match pki.download(&id) {
+    match blocking::download(pki, id.clone()).await {
         Ok(bundle) => {
             audit(
                 &state,

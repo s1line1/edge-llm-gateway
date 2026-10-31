@@ -3,6 +3,7 @@
 //! 本文件只做模块声明与再导出，不放实现：`Gateway` 及其配置在 [`gateway`]，
 //! TLS 材料与 rustls 配置构造在 [`tls`]。
 
+pub mod access;
 pub mod admin;
 mod admin_auth;
 mod admin_users;
@@ -31,8 +32,11 @@ mod shutdown;
 pub mod state;
 pub mod storage;
 mod sync;
+mod task_scope;
+mod tenant;
 mod tenant_limits;
 mod tls;
+pub mod tunnel;
 pub mod ui;
 pub mod usage_flush;
 pub mod usage_meter;

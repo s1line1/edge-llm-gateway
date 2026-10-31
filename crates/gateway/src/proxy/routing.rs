@@ -20,30 +20,21 @@
 //! 状态码与文案留在本模块就地决定：只有这里知道这次请求是第几次尝试、还有没有别的候选
 //! （同样的 502 在"还能重试"和"没得试了"两种处境下含义不同）。
 
-use axum::http::StatusCode;
 use proto::Frame;
 use s2n_quic::stream::{ReceiveStream, SendStream};
 use tracing::warn;
 
 use crate::registry::{AcquireError, Disposition, Entry, SlotGuard};
-use crate::state::AppState;
+use crate::state::RequestRuntime;
 
+use super::error::{RequestError, RouteFailure};
 use super::tunnel::{open_tunnel, tunnel_write, OpenFailure};
-
-/// 一次请求的路由失败：状态码 + 给客户端的文案。
-///
-/// **刻意不做成 `Err(Response)`**：`Response` 是 128+ 字节，塞进 `Err` 会触发 clippy 的
-/// `result_large_err`（CI 曾因此失败），而这里只需要两个字段。
-pub(super) struct RouteFailure {
-    pub status: StatusCode,
-    pub message: String,
-}
 
 /// 选路成功的结果：注册表条目、占用中的 agent 槽位、隧道流的两半。
 type Routed = (Entry, SlotGuard, ReceiveStream, SendStream);
 
 pub(super) async fn open_and_send(
-    state: &AppState,
+    state: &RequestRuntime,
     tenant_id: &str,
     model: &str,
     request: &Frame,
@@ -81,7 +72,7 @@ pub(super) async fn open_and_send(
                 | AcquireError::AllExcluded),
             ) => {
                 let st = state.registry.status(state.policy.agent_stale_after);
-                let (why, status, message) = rejection_response(reason, st.registered);
+                let (why, failure) = rejection_response(reason, st.registered);
                 state.metrics.record_agent_rejection(why);
                 warn!(
                     tenant = %tenant_id,
@@ -97,15 +88,11 @@ pub(super) async fn open_and_send(
                 // 而不是报一个会误导的 503/404。
                 if let Some(err) = last_failure {
                     state.metrics.record_tunnel_retry("no-alternative");
-                    return Err(RouteFailure {
-                        status: StatusCode::BAD_GATEWAY,
-                        message: format!("{err}; no other agent available to retry"),
-                    });
+                    return Err(RequestError::BadGateway(format!(
+                        "{err}; no other agent available to retry"
+                    )));
                 }
-                return Err(RouteFailure {
-                    status,
-                    message: message.to_string(),
-                });
+                return Err(failure);
             }
         };
 
@@ -171,17 +158,10 @@ pub(super) async fn open_and_send(
                 }
                 if tried.len() >= MAX_TUNNEL_ATTEMPTS {
                     state.metrics.record_tunnel_retry("failed");
-                    return Err(RouteFailure {
-                        status: if busy {
-                            StatusCode::TOO_MANY_REQUESTS
-                        } else {
-                            StatusCode::BAD_GATEWAY
-                        },
-                        message: if busy {
-                            "agent at capacity".to_string()
-                        } else {
-                            err
-                        },
+                    return Err(if busy {
+                        RequestError::AtCapacity
+                    } else {
+                        RequestError::BadGateway(err)
                     });
                 }
                 warn!(
@@ -233,10 +213,7 @@ pub(super) async fn open_and_send(
                 // （2026-09-26 复扫 A4 之后：429 不再自带一个写死的 `Retry-After: 60`，只有
                 // 算得出真实重试时间的来源才带它——所以那条"让客户端白等一分钟"的旁证不再成立，
                 // 但上面那个状态码语义的理由本身就足够。）
-                return Err(RouteFailure {
-                    status: StatusCode::BAD_GATEWAY,
-                    message: e,
-                });
+                return Err(RequestError::BadGateway(e));
             }
             warn!(
                 request_id,
@@ -265,10 +242,7 @@ pub(super) async fn open_and_send(
 /// 还把原因记成 `all-candidates-stale`（"有人但心跳全过期"），两处都与事实相反。
 ///
 /// `registered` = 注册表里的条目数（含失联未关的），用来把 `NoAgent` 分成"真没人"与"全 stale"。
-fn rejection_response(
-    reason: AcquireError,
-    registered: usize,
-) -> (&'static str, StatusCode, &'static str) {
+fn rejection_response(reason: AcquireError, registered: usize) -> (&'static str, RequestError) {
     let why = match reason {
         AcquireError::NoAgent if registered == 0 => "registry-empty",
         AcquireError::NoAgent => "all-candidates-stale",
@@ -277,16 +251,14 @@ fn rejection_response(
         // "谁发现的"——前者是重试把所有候选试过了一遍，后者是一次就占不到位。
         AcquireError::AtCapacity | AcquireError::AllExcluded => "all-candidates-at-capacity",
     };
-    let (status, message) = match reason {
-        AcquireError::NoAgent => (StatusCode::SERVICE_UNAVAILABLE, "no edge available"),
-        AcquireError::NoModel => (StatusCode::NOT_FOUND, "model not found on any agent"),
+    let failure = match reason {
+        AcquireError::NoAgent => RequestError::NoEdge,
+        AcquireError::NoModel => RequestError::ModelNotFound,
         // "忙"走到底：调用方只在 `last_failure` 为空时走到这里，而"忙"刻意不写
         // `last_failure`（见上面 `if !busy { last_failure = ... }`）——所以这里必须回 429。
-        AcquireError::AtCapacity | AcquireError::AllExcluded => {
-            (StatusCode::TOO_MANY_REQUESTS, "agent at capacity")
-        }
+        AcquireError::AtCapacity | AcquireError::AllExcluded => RequestError::AtCapacity,
     };
-    (why, status, message)
+    (why, failure)
 }
 
 #[cfg(test)]
@@ -301,11 +273,7 @@ mod tests {
     fn at_capacity_is_429_and_not_confused_with_no_agent() {
         assert_eq!(
             rejection_response(AcquireError::AllExcluded, 1),
-            (
-                "all-candidates-at-capacity",
-                StatusCode::TOO_MANY_REQUESTS,
-                "agent at capacity"
-            ),
+            ("all-candidates-at-capacity", RequestError::AtCapacity),
             "候选都在、都在忙 ⇒ 429 容量不足（修复前这里是 503 no edge available）"
         );
         assert_eq!(
@@ -317,11 +285,7 @@ mod tests {
         // 对照：真没人 / 全 stale / 没模型，各自仍然走自己那条。
         assert_eq!(
             rejection_response(AcquireError::NoAgent, 0),
-            (
-                "registry-empty",
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no edge available"
-            )
+            ("registry-empty", RequestError::NoEdge)
         );
         assert_eq!(
             rejection_response(AcquireError::NoAgent, 3).0,
@@ -330,11 +294,7 @@ mod tests {
         );
         assert_eq!(
             rejection_response(AcquireError::NoModel, 3),
-            (
-                "no-agent-serves-model",
-                StatusCode::NOT_FOUND,
-                "model not found on any agent"
-            )
+            ("no-agent-serves-model", RequestError::ModelNotFound)
         );
     }
 }

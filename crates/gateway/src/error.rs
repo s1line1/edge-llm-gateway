@@ -32,6 +32,10 @@ pub enum GatewayError {
     Infallible(#[from] std::convert::Infallible),
 }
 
+/// Startup/composition error. Kept as an alias of `GatewayError` so existing public paths and
+/// constructors remain source-compatible while new code uses the boundary name.
+pub type StartupError = GatewayError;
+
 impl From<String> for GatewayError {
     fn from(s: String) -> Self {
         GatewayError::Other(s)

@@ -14,9 +14,9 @@ use proto::{io::FrameReader, Frame};
 use tracing::warn;
 
 use crate::registry::{Disposition, Entry, HeadSilence};
-use crate::state::AppState;
+use crate::state::RequestRuntime;
 
-use super::routing::RouteFailure;
+use super::error::{RequestError, RouteFailure};
 use super::tunnel::tunnel_cancel;
 
 /// 读到响应头，或读到"在给头之前就结束/出错"的信号。
@@ -108,7 +108,7 @@ where
 /// （实测 40 并发 → 620MB 内存被钉住、日志停更）。也不能用 `tunnel_op_timeout`（2s）：
 /// 上游"思考"是合法的，本地模型 1–3s 很常见。
 pub(super) async fn await_head<R>(
-    state: &AppState,
+    state: &RequestRuntime,
     reader: &mut FrameReader<R>,
     send: &mut s2n_quic::stream::SendStream,
     entry: &Entry,
@@ -127,14 +127,11 @@ where
         }
         Ok(Ok(HeadOutcome::Error(status, message))) => {
             let _ = send.finish();
-            Err(RouteFailure { status, message })
+            Err(RequestError::UpstreamStatus(status, message))
         }
         Ok(Err(e)) => {
             let _ = send.finish();
-            Err(RouteFailure {
-                status: StatusCode::BAD_GATEWAY,
-                message: format!("tunnel read failed: {e}"),
-            })
+            Err(RequestError::TunnelRead(format!("tunnel read failed: {e}")))
         }
         Err(_) => {
             // 响应头超时：请求已经发出去了、对端却什么都没回。**两种情况必须分开**：
@@ -185,10 +182,7 @@ where
             // `Cancel`（P3-3）——只靠半关会让"响应前 EOF"变成一条契约违背告警。
             tunnel_cancel(send, request_id, state.policy.tunnel_op_timeout).await;
             let _ = send.finish();
-            Err(RouteFailure {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                message: "upstream timed out".to_string(),
-            })
+            Err(RequestError::HeadTimeout)
         }
     }
 }

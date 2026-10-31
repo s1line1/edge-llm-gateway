@@ -75,7 +75,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn start(cfg: AgentConfig) -> anyhow::Result<Self> {
+    pub fn start(cfg: AgentConfig) -> Result<Self, error::AgentError> {
         // provider 由 `tls::rustls_client_tls` 自己确保（幂等），这里不再需要显式安装。
         let client_config = tls::rustls_client_tls(
             &cfg.ca_cert,

@@ -1,7 +1,7 @@
 use axum::{http::StatusCode, response::Response};
 use tracing::error;
 
-use crate::{pki::PkiError, rbac::Principal, state::AppState};
+use crate::{pki::PkiError, rbac::Principal, state::AdminRuntime};
 
 pub(super) fn pki_error_response(err: PkiError) -> Response {
     let (status, message) = match err {
@@ -49,7 +49,7 @@ pub(super) fn pki_error_response(err: PkiError) -> Response {
 }
 
 pub(super) fn audit(
-    state: &AppState,
+    state: &AdminRuntime,
     principal: &Principal,
     tenant_id: Option<&str>,
     action: &str,
@@ -63,5 +63,35 @@ pub(super) fn audit(
         target_id,
     ) {
         error!(error = %e, action, "admin audit write failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::*;
+
+    #[test]
+    fn pki_error_mapping_is_stable() {
+        let cases = [
+            (PkiError::Invalid("x".into()), StatusCode::BAD_REQUEST),
+            (PkiError::Conflict("x".into()), StatusCode::CONFLICT),
+            (PkiError::NotFound, StatusCode::NOT_FOUND),
+            (PkiError::DownloadConsumed, StatusCode::GONE),
+            (PkiError::Expired, StatusCode::GONE),
+            (PkiError::HttpsRequired, StatusCode::CONFLICT),
+            (
+                PkiError::Storage("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                PkiError::Generate("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (error, status) in cases {
+            assert_eq!(pki_error_response(error).status(), status);
+        }
     }
 }

@@ -28,6 +28,8 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 use tower::Service as TowerService;
+
+use crate::task_scope::{DetachOnDrop, TaskScope};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -150,7 +152,9 @@ async fn serve_entry<S>(
     S: AcceptSource,
 {
     let mut consecutive_failures: u32 = 0;
+    let connections = DetachOnDrop(TaskScope::new("http-connections"));
     loop {
+        connections.0.reap();
         let Some(permit) = acquire_connection(&limiter, &mut shutdown).await else {
             info!(
                 entry,
@@ -220,7 +224,7 @@ async fn serve_entry<S>(
         // 每条连接一个接收端（`clone()`，不动 accept 循环自己那个）：网关对象被 drop 时
         // 硬停这条连接。见 `shutdown::wait_closed`——**只认通道关闭**，阶段推进不算。
         let mut conn_shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        connections.0.spawn(async move {
             // 额度随这个任务存活：响应写完 / 停滞超时 / 握手失败才归还。
             let _permit = permit;
             let serve = async move {

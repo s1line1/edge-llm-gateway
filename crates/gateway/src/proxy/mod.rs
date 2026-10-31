@@ -2,6 +2,7 @@
 //!
 //! 请求准备在 `prepare`，响应回传在 `forward`；本文件只保留两段之间的编排与响应组装。
 
+mod error;
 mod forward;
 mod head;
 mod prepare;
@@ -22,11 +23,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
 use crate::openai::error_response;
-use crate::state::AppState;
+use crate::state::RequestRuntime;
 use forward::{forward_body, ForwardCtx, ForwardGuard};
 
-pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
-    let prepared = match prepare::prepare(&state, req).await {
+pub async fn proxy(State(state): State<RequestRuntime>, req: Request) -> Response {
+    let request_state = &state;
+    request_state.forward_tasks.reap();
+    let prepared = match prepare::prepare(request_state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
@@ -42,9 +45,10 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     } = prepared;
 
     let (entry, slot, recv, mut send) =
-        match routing::open_and_send(&state, &tenant_id, &model, &request, request_id).await {
+        match routing::open_and_send(request_state, &tenant_id, &model, &request, request_id).await
+        {
             Ok(routed) => routed,
-            Err(failure) => return error_response(failure.status, failure.message),
+            Err(failure) => return error_response(failure.status(), failure.message()),
         };
 
     debug!(request_id, "proxying request to agent");
@@ -58,9 +62,9 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     // 读取响应头：超时窗口、慢/死判据的渲染、Cancel 与 finish 全在 `head` 模块里
     // （一处改动理由 = 上游响应头契约），这里只把失败渲染成响应。
     let (status, mut out_headers) =
-        match head::await_head(&state, &mut reader, &mut send, &entry, request_id).await {
+        match head::await_head(request_state, &mut reader, &mut send, &entry, request_id).await {
             Ok(v) => v,
-            Err(failure) => return error_response(failure.status, failure.message),
+            Err(failure) => return error_response(failure.status(), failure.message()),
         };
     out_headers.retain(|(k, _)| !proto::headers::is_hop_by_hop(k.as_str()));
 
@@ -69,18 +73,18 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     // slot 守卫随任务结束释放，期间该请求计入 agent 在途并发。
     // usage 收集：提取上游 usage；无 usage（估算/取消/断流）→ 估算降级。
     let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(32);
-    let idle = state.policy.request_timeout;
-    let op_timeout = state.policy.tunnel_op_timeout;
-    let state_client_stall = state.policy.client_stall;
-    let metrics = state.metrics.clone();
-    let store = state.store.clone();
+    let idle = request_state.policy.request_timeout;
+    let op_timeout = request_state.policy.tunnel_op_timeout;
+    let state_client_stall = request_state.policy.client_stall;
+    let metrics = request_state.metrics.clone();
+    let store = request_state.store.clone();
     // 关闭阶段的接收端：`Terminating` 时这条流要带一个明确事件收尾（见 `forward.rs`）。
     let shutdown = state.subscribe_shutdown();
     // SSE 响应是流式（usage 在每个 chunk 尾部，逐块预过滤）；非 SSE 为整包 JSON
     let is_stream = out_headers
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("text/event-stream"));
-    tokio::spawn(async move {
+    request_state.forward_tasks.spawn(async move {
         // 守卫必须**在 `forward_body` 之前**建好：`tx` 会被移进它，而 panic 展开时我们还得有
         // 一个发送端把"这份响应不完整"送出去（复扫 B3，见 `ForwardGuard` 的文档）。
         let mut guard = ForwardGuard::new(tx.clone(), metrics.clone(), request_id);

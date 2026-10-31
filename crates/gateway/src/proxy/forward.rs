@@ -275,7 +275,7 @@ pub(super) struct ForwardCtx {
     /// 该请求占用的 agent 在途槽位；随任务结束释放。
     pub(super) slot: crate::registry::SlotGuard,
     /// 该请求占用的 tenant 并发槽位；随任务结束释放。
-    pub(super) tenant_slot: crate::tenant_limits::TenantSlot,
+    pub(super) tenant_slot: crate::access::limits::TenantSlot,
     pub(super) metrics: crate::metrics::Metrics,
     pub(super) store: crate::storage::Storage,
     pub(super) key_id: String,

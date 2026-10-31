@@ -28,7 +28,7 @@ use axum::{
 use tracing::warn;
 
 use crate::metrics::{Admission, AdmissionDomain};
-use crate::state::AppState;
+use crate::state::RequestRuntime;
 
 /// 探针（`/healthz`）域的独立上限（复扫 A3）。
 ///
@@ -119,7 +119,7 @@ fn hold_until_body_ends(resp: Response, admission: Admission) -> Response {
 }
 
 pub(super) async fn admission_middleware(
-    State(state): State<AppState>,
+    State(state): State<RequestRuntime>,
     req: Request,
     next: Next,
 ) -> Response {

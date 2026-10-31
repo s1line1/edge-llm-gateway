@@ -17,15 +17,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::FromRef;
 use tokio::sync::watch;
 
-use crate::login_limiter::LoginLimiter;
+use crate::access::limits::{LoginLimiter, RateLimiter, TenantLimiter, TenantRateLimiter};
 use crate::metrics::Metrics;
 use crate::options::Options;
-use crate::ratelimit::{RateLimiter, TenantRateLimiter};
 use crate::registry::Registry;
 use crate::storage::Storage;
-use crate::tenant_limits::TenantLimiter;
+use crate::task_scope::TaskScope;
 use crate::ui::{resolve_ui, IndexHtml};
 
 // 关闭阶段的所有权在 `crate::shutdown`（唯一发送端 + 单向推进 + 等待窗口）。
@@ -34,9 +34,9 @@ pub use crate::shutdown::ShutdownPhase;
 
 /// 请求路径上的运行时策略：从 [`Options`] 投影一次，不含身份材料/UI/存储配置。
 ///
-/// 为什么单独成类型（核心评估 C2）：这些值原先由 `AppState::new` 逐个手抄到 10 个 `pub` 字段，
-/// 新增一个旋钮要改 5 处，漏抄一个不会编译失败。现在投影只发生在 [`RequestPolicy::from_options`]，
-/// `AppState` 只持一个 `policy`；handler 通过 `state.policy.*` 读到的是同一份派生值。
+/// 这些值原先由 `AppState::new` 逐个手抄到多个公开字段；新增一个旋钮要改多处，
+/// 漏抄一个不会编译失败。现在投影只发生在 [`RequestPolicy::from_options`]，
+/// 请求侧只持一个 `policy`；handler 通过 `RequestRuntime.policy` 读到同一份派生值。
 #[derive(Debug, Clone, Copy)]
 pub struct RequestPolicy {
     /// 单次请求转发空闲超时（逐帧）。SSE 长流靠“有帧就不超时”活着。
@@ -84,53 +84,95 @@ impl RequestPolicy {
     }
 }
 
+/// Request-path capabilities. Handlers receive this narrow context, not the whole app.
+#[derive(Clone)]
+pub struct RequestRuntime {
+    pub(crate) registry: Registry,
+    pub(crate) shutdown_rx: watch::Receiver<ShutdownPhase>,
+    pub(crate) store: Storage,
+    pub(crate) policy: RequestPolicy,
+    pub(crate) rate_limiter: Option<RateLimiter>,
+    pub(crate) tenant_rate_limiter: TenantRateLimiter,
+    pub(crate) tenant_limiter: TenantLimiter,
+    pub(crate) metrics: Metrics,
+    pub(crate) forward_tasks: std::sync::Arc<TaskScope>,
+}
+
+/// Admin/dashboard capabilities: credentials, sessions, and audit-facing stores.
+#[derive(Clone)]
+pub struct AdminRuntime {
+    pub(crate) store: Storage,
+    pub(crate) registry: Registry,
+    pub(crate) policy: RequestPolicy,
+    pub(crate) admin_token: Option<String>,
+    pub(crate) session_ttl_secs: u64,
+    pub(crate) session_cookie_secure: bool,
+    pub(crate) bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) rate_limiter: Option<RateLimiter>,
+    pub(crate) tenant_rate_limiter: TenantRateLimiter,
+    pub(crate) tenant_limiter: TenantLimiter,
+    pub(crate) login_limiter: LoginLimiter,
+    pub(crate) pki: Option<Arc<crate::pki::PkiService>>,
+}
+
+/// UI-only capabilities. Kept separate so public request handlers cannot reach index files.
+#[derive(Clone)]
+pub struct UiRuntime {
+    pub(crate) ui: Option<PathBuf>,
+    pub(crate) ui_index: Option<IndexHtml>,
+    pub(crate) ui_problem: Option<String>,
+}
+
+/// Process-wide axum state. All fields are private; consumers extract a capability group.
 #[derive(Clone)]
 pub struct AppState {
-    pub registry: Registry,
-    pub store: Storage,
-    /// Admin token（None 表示不启用 /admin/*）。
-    pub admin_token: Option<String>,
-    /// dashboard session 的绝对有效期与 cookie Secure 派生值。
-    pub session_ttl_secs: u64,
-    pub session_cookie_secure: bool,
-    /// 首次 bootstrap 的串行锁：两个并发请求不能各创建一个 super_admin。
-    pub bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
-    /// 请求路径策略（超时、并发上限、流额度）；派生只在 [`RequestPolicy::from_options`]。
-    pub policy: RequestPolicy,
-    pub rate_limiter: Option<RateLimiter>,
-    pub tenant_rate_limiter: TenantRateLimiter,
-    pub tenant_limiter: TenantLimiter,
-    pub login_limiter: LoginLimiter,
-    pub pki: Option<Arc<crate::pki::PkiService>>,
-    pub metrics: Metrics,
-    /// React UI 静态目录（None = `/` 显示构建提示页）。
-    pub ui: Option<PathBuf>,
-    /// `ui/index.html` 的缓存读（按 mtime 校验），`ui` 为 None 时也是 None。
-    /// 从 `ui` 派生而不是各自 `dir.join("index.html")`：读盘只有这一条路径。
-    ///
-    /// `pub(crate)` 而非 `pub`：其余字段是"配置值"，外部（`config.rs`/`main.rs`）会读；
-    /// 这个字段只给 `http` 的 handler 用，没必要把 [`IndexHtml`] 带进公开 API。
-    pub(crate) ui_index: Option<IndexHtml>,
-    /// `ui_dir` 不可用的具体原因（None = 没配 ui_dir，或配了且可用）。
-    /// 由启动时 [`resolve_ui`] 判定后写入，占位页会把它显示出来——否则用户只看到白屏/通用文案。
-    pub ui_problem: Option<String>,
-    /// 关闭阶段的接收端：查询与订阅都从这里出发。
-    ///
-    /// **发送端不在本结构里**（`shutdown::Controller` 由 `Gateway` 独占）：`AppState` 的克隆
-    /// 因此不可能把 `watch` 通道钉活；`Controller` 被 drop（= `Gateway` 没了）时，所有接收端
-    /// 看到 `Err`，`shutdown::wait_closed` 据此硬停连接。
+    request: RequestRuntime,
+    admin: AdminRuntime,
+    ui: UiRuntime,
     shutdown_rx: watch::Receiver<ShutdownPhase>,
 }
 
+#[cfg(test)]
+impl std::ops::Deref for AppState {
+    type Target = RequestRuntime;
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for AppState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
+    }
+}
+
+impl RequestRuntime {
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<ShutdownPhase> {
+        self.shutdown_rx.clone()
+    }
+}
+
+impl FromRef<AppState> for RequestRuntime {
+    fn from_ref(state: &AppState) -> Self {
+        state.request.clone()
+    }
+}
+
+impl FromRef<AppState> for AdminRuntime {
+    fn from_ref(state: &AppState) -> Self {
+        state.admin.clone()
+    }
+}
+
+impl FromRef<AppState> for UiRuntime {
+    fn from_ref(state: &AppState) -> Self {
+        state.ui.clone()
+    }
+}
+
 impl AppState {
-    /// 从 [`Options`] 组装请求处理状态：配置 → `AppState` 的映射与**派生只在这一处发生**。
-    ///
-    /// 两个派生量都不单独设旋钮：
-    /// - `head_alive_window = head_timeout × 4`：连续四个窗口一次响应头都没回来，才算"不是慢，是死"；
-    /// - `max_open_tunnel_streams = opts.stream_ceiling()`：0 → 默认值，与绑 QUIC 端点同一口径。
-    ///
-    /// `ui_dir` 的可用性判定（[`resolve_ui`]）也在这里：它是**非致命**的启动自检，
-    /// 不通过就降级成占位页，并把原因交给页面自己显示。
+    /// Build the process state and all derived values in one place.
     pub fn new(
         registry: Registry,
         store: Storage,
@@ -138,25 +180,29 @@ impl AppState {
         opts: &Options,
         shutdown_rx: watch::Receiver<ShutdownPhase>,
     ) -> Self {
+        let registry_clone = registry.clone();
         let (ui, ui_problem) = resolve_ui(opts.ui_dir.as_deref());
         let ui_index = ui
             .as_ref()
             .map(|dir| IndexHtml::new(dir.join("index.html")));
-        Self {
+        let rate_limiter = RateLimiter::new(opts.rate_limit_per_min);
+        let tenant_rate_limiter = TenantRateLimiter::new();
+        let tenant_limiter = TenantLimiter::new();
+        let request = RequestRuntime {
             registry,
+            store: store.clone(),
+            policy: RequestPolicy::from_options(opts),
+            rate_limiter: rate_limiter.clone(),
+            tenant_rate_limiter: tenant_rate_limiter.clone(),
+            tenant_limiter: tenant_limiter.clone(),
+            metrics,
+            forward_tasks: std::sync::Arc::new(TaskScope::new("forward")),
+            shutdown_rx: shutdown_rx.clone(),
+        };
+        let admin = AdminRuntime {
             store,
-            // `admin_token` 的**首尾空白在这里剪掉**（复扫 D2）。不剪的话它是"配了却用不了"：
-            // `Options::validate` 只拒"全是空白"，而 `admin_token: " x "` 能过校验、`/admin/*`
-            // 也照样挂载（下面的挂载判据与 `admin.rs` 的比较都看这个字段），但每个管理请求都是
-            // 401——因为入站凭据到不了带空白的那一步：`auth::bearer_token` 在 scheme 之后
-            // `trim_start_matches(' ')`，httparse 解析头部时又 **trim trailing whitespace**
-            // （它显式去掉 `' '`、`'\t'`、`'\r'`、`'\n'`，见 `httparse::parse_headers` 里那句
-            // 注释）。这里剪的两端正是这组字符，而不是 `str::trim()` 的 Unicode 空白——后者会把
-            // 一个**本来能用**的（比如尾随 NBSP）token 改成不能用的。
-            //
-            // 修好它而不是拒绝它，与 E3 的 `upstream` 尾斜杠同一口径（等价写法不该把一份合法
-            // 配置判死）；空串 / 全空白仍在 `Options::validate` 里拒绝——那种剪完什么都不剩，
-            // 是另一回事。
+            registry: registry_clone,
+            policy: RequestPolicy::from_options(opts),
             admin_token: opts
                 .admin_token
                 .as_deref()
@@ -164,18 +210,53 @@ impl AppState {
             session_ttl_secs: opts.session_ttl_secs,
             session_cookie_secure: opts.session_cookie_secure.unwrap_or(opts.https.is_some()),
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
-            policy: RequestPolicy::from_options(opts),
-            rate_limiter: RateLimiter::new(opts.rate_limit_per_min),
-            tenant_rate_limiter: TenantRateLimiter::new(),
-            tenant_limiter: TenantLimiter::new(),
+            rate_limiter,
+            tenant_rate_limiter,
+            tenant_limiter,
             login_limiter: LoginLimiter::new(),
             pki: None,
-            metrics,
+        };
+        let ui = UiRuntime {
             ui,
             ui_index,
             ui_problem,
+        };
+        Self {
+            request,
+            admin,
+            ui,
             shutdown_rx,
         }
+    }
+
+    pub(crate) fn request(&self) -> &RequestRuntime {
+        &self.request
+    }
+
+    pub(crate) fn admin(&self) -> &AdminRuntime {
+        &self.admin
+    }
+
+    pub(crate) fn task_scope(&self) -> std::sync::Arc<TaskScope> {
+        self.request.forward_tasks.clone()
+    }
+
+    pub(crate) fn ui(&self) -> &UiRuntime {
+        &self.ui
+    }
+
+    pub(crate) fn set_pki(&mut self, pki: Option<Arc<crate::pki::PkiService>>) {
+        self.admin.pki = pki;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admin_mut(&mut self) -> &mut AdminRuntime {
+        &mut self.admin
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ui_mut(&mut self) -> &mut UiRuntime {
+        &mut self.ui
     }
 
     /// 测试专用：没有 `Gateway` 推进关闭，但需要一个**保持打开**的接收端。
@@ -221,9 +302,35 @@ mod tests {
         )
     }
 
+    /// 规格（Phase 1）：请求、管理、UI 三个能力组必须能从同一个 `AppState` 独立提取。
+    ///
+    /// 这条钉的是边界本身：axum handler 只拿自己需要的组，而不是整个 `AppState`。
+    #[test]
+    fn capability_runtimes_are_extractable_and_separate() {
+        let controller = shutdown::Controller::new();
+        let opts = Options {
+            admin_token: Some("admin-token".into()),
+            ..Options::default()
+        };
+        let state = state_with(&opts, &controller);
+
+        let request = RequestRuntime::from_ref(&state);
+        let admin = AdminRuntime::from_ref(&state);
+        let ui = UiRuntime::from_ref(&state);
+
+        assert_eq!(request.policy.max_concurrent_requests, 0);
+        assert_eq!(admin.admin_token.as_deref(), Some("admin-token"));
+        assert_eq!(
+            admin.policy.max_concurrent_requests,
+            request.policy.max_concurrent_requests
+        );
+        assert!(ui.ui.is_none());
+        assert!(ui.ui_index.is_none());
+    }
+
     /// 规格（复扫 D2）：**`admin_token` 的首尾空白在装配时剪掉**，否则它是"配了却用不了"。
     ///
-    /// 这条钉的是装配点：字段是 `pub`，如果有人绕过 `AppState::new` 直接塞一个带空白的值，
+    /// 这条钉的是装配点：能力组字段是私有的，如果有人绕过 `AppState::new` 直接构造状态，
     /// 鉴权仍然会 401——但那不是配置作者的路径，`Options::validate` 也拦不住空白（只拦全空白）。
     /// 走完整路由的版本在 `admin::tests::a_padded_admin_token_still_authenticates`。
     #[test]
@@ -235,7 +342,7 @@ mod tests {
         };
         let state = state_with(&opts, &controller);
         assert_eq!(
-            state.admin_token.as_deref(),
+            state.admin().admin_token.as_deref(),
             Some("tok"),
             "两端空白必须剪掉（入站凭据到不了带空白的那一步，见 `AppState::new` 的说明）"
         );
@@ -246,11 +353,11 @@ mod tests {
             ..Options::default()
         };
         let state = state_with(&opts, &controller);
-        assert_eq!(state.admin_token.as_deref(), Some("to k"));
+        assert_eq!(state.admin().admin_token.as_deref(), Some("to k"));
 
         // `None`（不启用 /admin/*）不受影响
         let no_admin = state_with(&Options::default(), &controller);
-        assert!(no_admin.admin_token.is_none());
+        assert!(no_admin.admin().admin_token.is_none());
     }
 
     /// 规格（并集评估 §2 S3）：关闭阶段**可查、可订阅**，但推进阶段的能力只属于

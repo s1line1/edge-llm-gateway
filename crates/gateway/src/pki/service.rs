@@ -30,8 +30,8 @@ impl PkiService {
         Ok(service)
     }
 
-    pub fn runtime(&self) -> &PkiRuntime {
-        &self.runtime
+    pub fn server_config(&self) -> Result<std::sync::Arc<rustls::ServerConfig>, PkiError> {
+        self.runtime.server_config()
     }
 
     pub fn config(&self) -> &PkiConfig {
@@ -43,7 +43,7 @@ impl PkiService {
         Ok(PkiStatus {
             enabled: self.config.enabled,
             credentials: active.len(),
-            tunnel_ready: !self.runtime.resolver.is_empty(),
+            tunnel_ready: self.runtime.tunnel_ready(),
             waiting_for_credentials: active.is_empty(),
         })
     }
@@ -175,7 +175,7 @@ impl PkiService {
             self.files.remove_pair(&id);
             return Err(e);
         }
-        if !self.runtime.resolver.contains(server_name) {
+        if !self.runtime.has_server(server_name) {
             let _ = self.repo.delete(&id);
             self.files.remove_pair(&id);
             return Err(PkiError::Storage(

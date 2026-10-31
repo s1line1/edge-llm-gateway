@@ -19,7 +19,7 @@ use crate::{
     auth::authenticate,
     body::{read_body_with_stall, BodyRead, MAX_REQUEST_BODY},
     openai::error_response,
-    state::AppState,
+    state::RequestRuntime,
     usage_meter,
 };
 
@@ -64,11 +64,11 @@ pub(super) struct Prepared {
     pub key_id: String,
     pub key_name: String,
     pub tenant_id: String,
-    pub tenant_slot: crate::tenant_limits::TenantSlot,
+    pub tenant_slot: crate::access::limits::TenantSlot,
 }
 
 /// 按固定顺序准备一次代理请求；任何一步失败都返回已经渲染好的响应。
-pub(super) async fn prepare(state: &AppState, req: Request) -> Result<Prepared, Response> {
+pub(super) async fn prepare(state: &RequestRuntime, req: Request) -> Result<Prepared, Response> {
     // 先取 method/uri/headers，body 留到**认证之后再读**：
     // 以前 `Bytes` 是提取器，于是未认证的请求也能让网关先缓冲 16MB（认证在 handler 里，
     // 比提取器晚一步）。现在认证在最前，读 body 在后，顺带把这个放大面收掉。

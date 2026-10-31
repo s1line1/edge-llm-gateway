@@ -14,7 +14,7 @@ use axum::{
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::state::AppState;
+use crate::state::UiRuntime;
 
 /// `Accept` 里是否明确接受 HTML（浏览器导航）。
 ///
@@ -30,7 +30,7 @@ pub(super) fn wants_html(headers: &HeaderMap) -> bool {
 /// SPA fallback：浏览器导航（Accept: text/html）→ index.html；静态资源
 /// （带扩展名路径，如 /assets/*.js）→ 文件，**未命中就是 404**；其余（API 类未注册路径）→ 404。
 pub(super) async fn ui_fallback(
-    State(state): State<AppState>,
+    State(state): State<UiRuntime>,
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
@@ -107,7 +107,7 @@ pub(super) async fn ui_fallback(
 
 /// UI 未构建 / ui_dir 不可用时的占位提示页——不再内嵌任何管理功能。
 /// `state.ui_problem` 有值时把具体原因一并显示：浏览器本身就是诊断面。
-pub(super) async fn ui_missing(State(state): State<AppState>) -> Html<String> {
+pub(super) async fn ui_missing(State(state): State<UiRuntime>) -> Html<String> {
     Html(render_ui_missing(state.ui_problem.as_deref()))
 }
 
@@ -158,6 +158,7 @@ mod tests {
     use super::*;
     use crate::http::app;
     use crate::http::test_util::{body_str, test_state};
+    use crate::state::AppState;
 
     /// 取响应的 `Vary`（没有就是 None）。
     fn vary(resp: &Response) -> Option<&str> {
@@ -177,7 +178,7 @@ mod tests {
         let (parts, _) = req.into_parts();
         let headers = parts.headers.clone();
         let uri = parts.uri.clone();
-        ui_fallback(State(state), headers, uri).await
+        ui_fallback(State(state.ui().clone()), headers, uri).await
     }
 
     #[tokio::test]
@@ -320,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn ui_missing_route_serves_the_problem() {
         let mut state = test_state(None);
-        state.ui_problem = Some("ui_dir 指向源码目录：web".into());
+        state.ui_mut().ui_problem = Some("ui_dir 指向源码目录：web".into());
         let resp = app(state)
             .oneshot(
                 axum::extract::Request::builder()
