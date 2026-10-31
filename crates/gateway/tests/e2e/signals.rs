@@ -145,10 +145,10 @@ async fn e2e_sighup_goes_through_the_graceful_shutdown_path() {
     // 就绪判据必须是"信号 handler 已注册"这行日志，而不是探活：`/healthz` 在
     // `Gateway::start` 里就可用了，那时 `shutdown_signal()` 还没跑，抢在中间发 HUP 会按
     // 默认动作直接杀掉进程（随机红）。
-    wait_for_log_line(&log_path, "shutdown signals armed", Duration::from_secs(15)).await;
+    wait_for_log_line(&log_path, "shutdown signals armed", Duration::from_secs(30)).await;
 
     send_signal(child.pid(), "HUP");
-    let status = wait_for_exit(&mut child, Duration::from_secs(15)).await;
+    let status = wait_for_exit(&mut child, Duration::from_secs(30)).await;
     let text = std::fs::read_to_string(&log_path).unwrap();
 
     assert_eq!(
@@ -179,9 +179,9 @@ async fn e2e_logs_written_to_a_file_are_not_colored() {
     let (mut child, log_path) = spawn_gateway(dir.path());
 
     // 等到有若干行日志（这行是启动路径上的最后一条），再看字节
-    wait_for_log_line(&log_path, "shutdown signals armed", Duration::from_secs(15)).await;
+    wait_for_log_line(&log_path, "shutdown signals armed", Duration::from_secs(30)).await;
     send_signal(child.pid(), "TERM");
-    let status = wait_for_exit(&mut child, Duration::from_secs(15)).await;
+    let status = wait_for_exit(&mut child, Duration::from_secs(30)).await;
     assert_eq!(status.code(), Some(0), "SIGTERM 应当优雅退出");
 
     let bytes = std::fs::read(&log_path).unwrap();

@@ -1,6 +1,6 @@
 //! 按 API Key 的令牌桶限流（无外部依赖）。
 //!
-//! **桶键是 [`KeyRecord::id`]，不是明文 key**（由 [`crate::auth`] 决定）：明文只该活在
+//! **桶键是 [`KeyRecord::id`]，不是明文 key**（由 [`crate::access::api_key`] 决定）：明文只该活在
 //! 认证那一刻的栈上（keystore 只留 sha256 + argon2），而桶表是**只增不减**的内存状态——
 //! 拿明文作键等于把它常驻到进程退出，还会随 key 轮换 / 吊销无上限增长。
 //!
@@ -121,7 +121,7 @@ impl RateLimiter {
 
     /// 丢掉某个 key 的桶，返回是否确有桶被丢掉。
     ///
-    /// 吊销时显式调用（[`crate::admin::delete_key`]）：不等空闲清扫，立即回收。
+    /// 吊销时显式调用（[`crate::http::admin::keys::delete_key`]）：不等空闲清扫，立即回收。
     pub(crate) fn evict(&self, key: &str) -> bool {
         lock_or_recover(&self.inner).map.remove(key).is_some()
     }

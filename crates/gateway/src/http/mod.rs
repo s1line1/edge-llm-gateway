@@ -71,53 +71,56 @@ pub fn app(state: AppState) -> Router {
                 .patch(crate::proxy::proxy),
         );
     let admin_public = Router::new()
-        .route("/auth/status", get(crate::admin_auth::status))
+        .route("/auth/status", get(crate::access::session::status))
         .route(
             "/auth/bootstrap",
-            axum::routing::post(crate::admin_auth::bootstrap),
+            axum::routing::post(crate::access::session::bootstrap),
         )
-        .route("/auth/login", axum::routing::post(crate::admin_auth::login));
+        .route(
+            "/auth/login",
+            axum::routing::post(crate::access::session::login),
+        );
     let admin_protected = Router::new()
         .route(
             "/auth/logout",
-            axum::routing::post(crate::admin_auth::logout),
+            axum::routing::post(crate::access::session::logout),
         )
-        .route("/auth/me", get(crate::admin_auth::me))
+        .route("/auth/me", get(crate::access::session::me))
         .route(
             "/auth/password",
-            axum::routing::post(crate::admin_auth::change_password),
+            axum::routing::post(crate::access::session::change_password),
         )
         .route(
             "/keys",
-            get(crate::admin::list_keys_filtered).post(crate::admin::create_key),
+            get(crate::http::admin::list_keys_filtered).post(crate::http::admin::create_key),
         )
-        .route("/keys/{id}", delete(crate::admin::delete_key))
+        .route("/keys/{id}", delete(crate::http::admin::delete_key))
         .route(
             "/tenants",
-            get(crate::admin::list_tenants).post(crate::admin::create_tenant),
+            get(crate::http::admin::list_tenants).post(crate::http::admin::create_tenant),
         )
         .route(
             "/tenants/{id}",
-            get(crate::admin::tenant_by_id)
-                .patch(crate::admin::update_tenant)
-                .delete(crate::admin::delete_tenant),
+            get(crate::http::admin::tenant_by_id)
+                .patch(crate::http::admin::update_tenant)
+                .delete(crate::http::admin::delete_tenant),
         )
         .route(
             "/tenants/{id}/agent-token",
-            axum::routing::post(crate::admin::rotate_agent_token),
+            axum::routing::post(crate::http::admin::rotate_agent_token),
         )
-        .route("/agents", get(crate::admin::list_agents))
-        .route("/usage", get(crate::admin::usage_filtered))
+        .route("/agents", get(crate::http::admin::list_agents))
+        .route("/usage", get(crate::http::admin::usage_filtered))
         .route(
             "/users",
-            get(crate::admin_users::list_users).post(crate::admin_users::create_user),
+            get(crate::http::admin::users::list_users).post(crate::http::admin::users::create_user),
         )
         .route(
             "/users/{id}",
-            axum::routing::patch(crate::admin_users::update_user)
-                .delete(crate::admin_users::delete_user),
+            axum::routing::patch(crate::http::admin::users::update_user)
+                .delete(crate::http::admin::users::delete_user),
         )
-        .route("/audit", get(crate::admin_users::list_audit))
+        .route("/audit", get(crate::http::admin::users::list_audit))
         .route("/pki/status", get(crate::http::admin_pki::status))
         .route(
             "/pki/pairs",
@@ -133,7 +136,7 @@ pub fn app(state: AppState) -> Router {
         )
         .route_layer(middleware::from_fn_with_state(
             state.admin().clone(),
-            crate::admin_auth::admin_auth,
+            crate::access::session::admin_auth,
         ));
     router = router.nest(
         "/admin",
