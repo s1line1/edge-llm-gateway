@@ -7,8 +7,9 @@ use axum::{
 use serde_json::json;
 
 use crate::{
+    pki::blocking,
     rbac::{authorize, effective_tenant, response as rbac_response, Action, Principal},
-    state::AppState,
+    state::AdminRuntime,
 };
 
 use super::{
@@ -17,16 +18,16 @@ use super::{
 };
 
 pub(crate) async fn status(
-    State(state): State<AppState>,
+    State(state): State<AdminRuntime>,
     Extension(principal): Extension<Principal>,
 ) -> Response {
     if let Err(e) = authorize(&principal, Action::PkiRead, None) {
         return rbac_response(e);
     }
-    let Some(pki) = state.pki.as_ref() else {
+    let Some(pki) = state.pki.clone() else {
         return crate::openai::error_response(StatusCode::NOT_FOUND, "PKI is not enabled");
     };
-    match pki.status() {
+    match blocking::status(pki).await {
         Ok(status) => Json(json!({
             "enabled": status.enabled,
             "credentials": status.credentials,
@@ -39,7 +40,7 @@ pub(crate) async fn status(
 }
 
 pub(crate) async fn list(
-    State(state): State<AppState>,
+    State(state): State<AdminRuntime>,
     Extension(principal): Extension<Principal>,
     Query(query): Query<PkiQuery>,
 ) -> Response {
@@ -50,10 +51,10 @@ pub(crate) async fn list(
         Ok(t) => t,
         Err(e) => return rbac_response(e),
     };
-    let Some(pki) = state.pki.as_ref() else {
+    let Some(pki) = state.pki.clone() else {
         return crate::openai::error_response(StatusCode::NOT_FOUND, "PKI is not enabled");
     };
-    match pki.list(tenant.as_deref()) {
+    match blocking::list(pki, tenant.clone()).await {
         Ok(records) => Json(json!(records
             .iter()
             .map(|r| pair_json(
@@ -71,7 +72,7 @@ pub(crate) async fn list(
 }
 
 pub(crate) async fn create(
-    State(state): State<AppState>,
+    State(state): State<AdminRuntime>,
     Extension(principal): Extension<Principal>,
     Json(body): Json<CreatePairBody>,
 ) -> Response {
@@ -86,21 +87,28 @@ pub(crate) async fn create(
     if let Err(e) = authorize(&principal, Action::PkiWrite, Some(&tenant)) {
         return rbac_response(e);
     }
-    let Some(pki) = state.pki.as_ref() else {
+    let Some(pki) = state.pki.clone() else {
         return crate::openai::error_response(StatusCode::NOT_FOUND, "PKI is not enabled");
     };
     let mut sans = body.server_sans;
     if !sans.iter().any(|s| s == &body.server_name) {
         sans.push(body.server_name.clone());
     }
-    match pki.create_pair(
-        &body.name,
-        &tenant,
-        &body.server_name,
-        &sans,
-        principal.user_id.as_deref().unwrap_or("break-glass"),
-        "Home LLM Gateway CA",
-    ) {
+    match blocking::create_pair(
+        pki,
+        body.name,
+        tenant.clone(),
+        body.server_name,
+        sans,
+        principal
+            .user_id
+            .as_deref()
+            .unwrap_or("break-glass")
+            .to_string(),
+        "Home LLM Gateway CA".to_string(),
+    )
+    .await
+    {
         Ok(record) => {
             audit(
                 &state,
@@ -117,14 +125,14 @@ pub(crate) async fn create(
 }
 
 pub(crate) async fn revoke(
-    State(state): State<AppState>,
+    State(state): State<AdminRuntime>,
     Extension(principal): Extension<Principal>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let Some(pki) = state.pki.as_ref() else {
+    let Some(pki) = state.pki.clone() else {
         return crate::openai::error_response(StatusCode::NOT_FOUND, "PKI is not enabled");
     };
-    let record = match pki.record(&id) {
+    let record = match blocking::record(pki.clone(), id.clone()).await {
         Ok(record) => record,
         Err(crate::pki::PkiError::NotFound) => {
             return pki_error_response(crate::pki::PkiError::NotFound)
@@ -134,7 +142,7 @@ pub(crate) async fn revoke(
     if let Err(e) = authorize(&principal, Action::PkiWrite, Some(&record.tenant_id)) {
         return rbac_response(e);
     }
-    match pki.revoke(&id) {
+    match blocking::revoke(pki, id.clone()).await {
         Ok(()) => {
             audit(
                 &state,

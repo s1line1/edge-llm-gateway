@@ -233,13 +233,13 @@ impl ClientCertVerifier for PkiClientVerifier {
 /// Runtime TLS state shared by the QUIC listener, the verifier, and admin handlers.
 #[derive(Clone, Default)]
 pub struct PkiRuntime {
-    pub resolver: Arc<PkiServerCerts>,
-    pub verifier: Arc<PkiClientVerifier>,
-    pub pairs_by_server: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    resolver: Arc<PkiServerCerts>,
+    verifier: Arc<PkiClientVerifier>,
+    pairs_by_server: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
 }
 
 impl PkiRuntime {
-    pub fn add_pair(
+    pub(crate) fn add_pair(
         &self,
         server_name: &str,
         pair_id: &str,
@@ -255,7 +255,7 @@ impl PkiRuntime {
         Ok(())
     }
 
-    pub fn remove_pair(
+    pub(crate) fn remove_pair(
         &self,
         server_name: &str,
         ca: &rustls::pki_types::CertificateDer<'static>,
@@ -271,7 +271,15 @@ impl PkiRuntime {
         Ok(())
     }
 
-    pub fn pair_id_for_server(&self, server_name: &str) -> Option<String> {
+    pub(crate) fn tunnel_ready(&self) -> bool {
+        !self.resolver.is_empty()
+    }
+
+    pub(crate) fn has_server(&self, server_name: &str) -> bool {
+        self.resolver.contains(server_name)
+    }
+
+    pub(crate) fn pair_id_for_server(&self, server_name: &str) -> Option<String> {
         self.pairs_by_server
             .read()
             .expect("pki pair map lock poisoned")

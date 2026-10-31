@@ -21,6 +21,8 @@ mod client;
 pub use client::*;
 mod pki;
 pub use pki::*;
+mod pki_gateway;
+pub use pki_gateway::*;
 mod waits;
 pub use waits::*;
 mod stack;

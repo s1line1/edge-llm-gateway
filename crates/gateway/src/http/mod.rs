@@ -11,6 +11,7 @@ use tracing::info;
 
 use crate::state::AppState;
 
+pub mod admin;
 mod admin_pki;
 mod admission;
 mod api;
@@ -131,7 +132,7 @@ pub fn app(state: AppState) -> Router {
             axum::routing::post(crate::http::admin_pki::revoke),
         )
         .route_layer(middleware::from_fn_with_state(
-            state.clone(),
+            state.admin().clone(),
             crate::admin_auth::admin_auth,
         ));
     router = router.nest(
@@ -145,7 +146,7 @@ pub fn app(state: AppState) -> Router {
     // 如 /keys、/metrics 的浏览器直接访问/刷新）fallback 到 index.html。
     // 注意：API 类未注册路径（无 Accept: text/html、无文件扩展名）返回真 404，
     //       不能被 SPA fallback 吞成 index.html（否则前端拿到的不是合法 JSON）。
-    match &state.ui {
+    match &state.ui().ui {
         Some(dir) => {
             router = router.fallback(ui_fallback);
             info!(path = %dir.display(), "serving web UI from disk");
@@ -161,11 +162,11 @@ pub fn app(state: AppState) -> Router {
         // 层序**不能反**：准入（里）→ id/日志/状态码（外）。被闸门拒掉的 429 必须经过外层
         // 才能带上回显的 `x-request-id`，而状态码记账只在最外层发生一次（见两个模块头）。
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            state.request().clone(),
             admission_middleware,
         ))
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            state.request().clone(),
             request_id_middleware,
         ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
@@ -178,6 +179,65 @@ mod tests {
     // 造测试用 `AppState` 的辅助在 `http/test_util.rs`——测试已随被测代码分散到各子模块，
     // 那是它们的共同前提。本模块只剩"路由表能不能装起来"这一条测试。
     use crate::http::test_util::test_state;
+
+    /// 规格（Phase 6）：admin 资源拆分后，每个资源的路径/方法仍然挂在同一个鉴权层后面。
+    /// 这里用“未认证必须 401”作为路由存在的判据；404 会让测试立刻抓到漏挂的路由。
+    #[tokio::test]
+    async fn admin_resource_routes_are_registered_behind_auth() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let router = app(test_state(None));
+        let routes = [
+            (Method::GET, "/admin/keys"),
+            (Method::POST, "/admin/keys"),
+            (Method::DELETE, "/admin/keys/test"),
+            (Method::GET, "/admin/tenants"),
+            (Method::POST, "/admin/tenants"),
+            (Method::GET, "/admin/tenants/test"),
+            (Method::PATCH, "/admin/tenants/test"),
+            (Method::POST, "/admin/tenants/test/agent-token"),
+            (Method::GET, "/admin/agents"),
+            (Method::GET, "/admin/usage"),
+            (Method::GET, "/admin/users"),
+            (Method::POST, "/admin/users"),
+            (Method::GET, "/admin/pki/status"),
+            (Method::GET, "/admin/pki/pairs"),
+            (Method::POST, "/admin/pki/pairs"),
+            (Method::GET, "/admin/pki/pairs/test/download"),
+            (Method::POST, "/admin/pki/pairs/test/revoke"),
+        ];
+        for (method, path) in routes {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must be routed through admin auth"
+            );
+        }
+
+        let public = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public.status(), StatusCode::OK);
+    }
 
     #[test]
     fn app_builds_with_ui_dir() {

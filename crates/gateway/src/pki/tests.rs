@@ -144,3 +144,51 @@ fn service_creates_lists_downloads_once_and_revokes() {
     assert_eq!(service.record(&record.id).unwrap().status, "revoked");
     assert!(service.status().unwrap().waiting_for_credentials);
 }
+
+/// 规格（Phase 4）：PKI 的同步核心只能通过 blocking adapter 进入 async handler。
+/// 并发创建不应互相卡住；一次性下载语义在 adapter 下保持不变。
+#[tokio::test]
+async fn blocking_adapter_handles_concurrent_creates_and_one_time_downloads() {
+    let dir = tempdir().unwrap();
+    let service = std::sync::Arc::new(
+        PkiService::new(
+            config(dir.path()),
+            Storage::new(Some(dir.path().join("keys.db"))),
+        )
+        .unwrap(),
+    );
+
+    let a = blocking::create_pair(
+        service.clone(),
+        "concurrent-a".into(),
+        "tenant-a".into(),
+        "a.example.com".into(),
+        vec!["a.example.com".into()],
+        "test".into(),
+        "Test CA".into(),
+    );
+    let b = blocking::create_pair(
+        service.clone(),
+        "concurrent-b".into(),
+        "tenant-a".into(),
+        "b.example.com".into(),
+        vec!["b.example.com".into()],
+        "test".into(),
+        "Test CA".into(),
+    );
+    let (a, b) = tokio::join!(a, b);
+    let a = a.unwrap();
+    let b = b.unwrap();
+
+    let status = blocking::status(service.clone()).await.unwrap();
+    assert_eq!(status.credentials, 2);
+    assert!(status.tunnel_ready);
+
+    let first = blocking::download(service.clone(), a.id.clone())
+        .await
+        .unwrap();
+    assert!(first.filename.starts_with("hlmg-client-concurrent-a"));
+    let second = blocking::download(service, a.id).await;
+    assert!(matches!(second, Err(PkiError::DownloadConsumed)));
+    let _ = b;
+}

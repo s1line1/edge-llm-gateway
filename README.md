@@ -12,7 +12,7 @@
 任何地方用标准的 OpenAI SDK 调它，同时**不把本地推理端点直接暴露到公网**。
 
 <p align="center">
-  <img alt="测试" src="https://img.shields.io/badge/tests-456%20passed-brightgreen">
+  <img alt="测试" src="https://img.shields.io/badge/tests-474%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -44,8 +44,8 @@ flowchart TB
 
 公网唯一入口就是 `cloud-gateway`。它暴露 **OpenAI 兼容** 的 `/v1/*` 路径
 （`/v1/chat/completions`、`/v1/embeddings` 等按原样透传给 edge；`/v1/models` 由网关自己聚合回答），
-支持 **SSE 流式**，并且在转发前完成 API Key 认证与限流。HTTPS 由网关直接用 `rustls` 监听，
-**不需要反向代理**——隧道走的是私有帧协议，反代本来也代理不了。
+支持 **SSE 流式**，并且在转发前完成 API Key 认证与限流。管理面的 HTTPS 由反向代理/SSH
+隧道终止；QUIC 隧道使用独立的 mTLS，不依赖该 HTTPS 入口。
 
 ### Gateway → Agent
 
@@ -329,8 +329,8 @@ fmt · clippy -D warnings · nextest · e2e 接线 · toolchain-check · check-r
 
 `make check` 在它之外再加 `cargo deny` 与前端四项（web-format / web-lint / web-test / web-build）。
 
-> **当前规模（`cargo nextest run --workspace` 实测）**：**456 个被执行且通过的测试（0 skipped）**，其中
-> **77 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
+> **当前规模（`cargo nextest run --workspace` 实测）**：**474 个被执行且通过的测试（0 skipped）**，其中
+> **82 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
 >
 > 两点与 `cargo test` 不同的行为要知道：**nextest 每条测试一个进程**，所以 `serial_test` 的
 > `#[serial]`（进程内锁）在它下面失效——e2e 的串行改由 `.config/nextest.toml` 的 `test-group`

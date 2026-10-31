@@ -73,6 +73,9 @@ pub struct PkiStatus {
     pub waiting_for_credentials: bool,
 }
 
+/// Credential-boundary error. `PkiError` remains the implementation name for compatibility.
+pub type CredentialError = PkiError;
+
 #[derive(Debug, Error)]
 pub enum PkiError {
     #[error("pki: {0}")]

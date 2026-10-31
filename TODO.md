@@ -525,8 +525,8 @@
 | 环节 | 位置 | 事实 |
 |---|---|---|
 | 发号 | `storage/hash.rs:119` | key 恒为 `sk-` + 24 随机字节（**192 位熵**）；`/admin/keys` 只收 `name`，**不存在"运维自己填 key"的入口**（`admin.rs:98`） |
-| 存储 | `storage/mod.rs:109` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
-| 校验 | `storage/mod.rs:530` → `hash.rs:87` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
+| 存储 | `storage/keys.rs:18` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
+| 校验 | `storage/keys.rs:136` → `hash.rs:87` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
 | 缓存 | `storage/verified.rs:55` | `(lookup, cred_version)` 命中即跳过校验；有 TTL 与上限（`verified_cache_max: 1650`） |
 | 单飞 | `storage/verified.rs:73` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
 
@@ -1452,7 +1452,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 - [x] **`S2-4` key id 只有 32 位，且 `create` 用 `INSERT OR REPLACE`：撞 id 时静默删掉另一把 key 的库行**：
       `storage/hash.rs:119-127` 把 4 个随机字节格式化成 8 位十六进制；这条 id 同时是主键、吊销的键
-      与用量归因的键（`storage/mod.rs:388` 的 `INSERT OR REPLACE`，无碰撞检查/重试）。生日碰撞：
+      与用量归因的键（`storage/keys.rs:90` 的 `INSERT OR REPLACE`，无碰撞检查/重试）。生日碰撞：
       1 万把 key ≈1.2%、6.5 万把 ≈39%。后果：旧 key 的库行被销毁（内存里两把都还在、继续放行，
       重启后旧 key 静默 401）、`delete(id)` 会一次吊销两把、两把用量并进同一行。**修法要单独定**
       （扩 id 位数是库/接口层面的变化）。**复核**：我自己读了代码；子代理另用 `sqlite3 :memory:`
@@ -1545,7 +1545,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       **真实到达**字节增长，且 `len > MAX_FRAME` 在载荷到达前就拒绝（`proto/src/io/mod.rs:93,105-111`）。
 - [ ] **`S2-21` `待核` `DESIGN` 的 `cred_generation` 缓存失效只存在于文档**：DESIGN 写"命中条件是
       `cred_version == 当前代次`、变更即 bump 失效"，而代码里 `cred_generation` **只写不读**
-      （`storage/mod.rs:324-329,452`），库里 `cred_version` 恒为列默认值（`create` 不写该列）；
+      （`storage/keys.rs:109-111,336`），库里 `cred_version` 恒为列默认值（`create` 不写该列）；
       真正让吊销生效的只有"记录被删除"。
 
 ## 2026-09-28 交付工程化：多平台 release（Linux 静态 musl）
@@ -1804,7 +1804,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       不是 SQL。
 
       **P0 的第一件事是定死 `create()` 的语义**（详见 `STORAGE.md` §2.1①）：
-      它今天写的是 `INSERT OR REPLACE`（`storage/mod.rs:388`），而它在 SQLite 是**删+插**不是更新——
+      它今天写的是 `INSERT OR REPLACE`（`storage/keys.rs:90`），而它在 SQLite 是**删+插**不是更新——
       未列出的列会**退回默认值**（插入列清单里没有 `cred_version`）。**但结论不是"换个 upsert 写法"，
       而是 `create()` 根本不该是 upsert**：它的语义是"造一把新 key"，冲突该报错而不是覆盖。
       主键冲突**不是天文概率**——`generate_id_key()` 的 id 只有 **4 随机字节 = 32 位**
@@ -1817,7 +1817,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       **用量 flush 不动**——它已经是真 upsert（`usage.rs:233` 的 `ON CONFLICT(key_id) DO UPDATE`）；
       所以端口有**两个**写操作：`insert`（冲突即错）与 `upsert_batch`（幂等），**刻意不合并**。
       另两处：`u64` 时间戳映射到 PG `bigint` 是**收窄**，`as i64` 现散在多处
-      （`storage/mod.rs:344`、`storage/usage.rs:246-250`），应收敛到一处类型映射；
+      （`storage/keys.rs:293`、`storage/usage.rs:246-250`），应收敛到一处类型映射；
       还有一条不要带错结论——放弃"每请求写库"的那个 **~190 QPS** 是被**单连接 + Mutex** 摁住的，
       不是被数据库摁住的，换带连接池的服务器库后**必须重测**。
 
@@ -1827,8 +1827,8 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 - [ ] **⛔ `api_keys.cred_version` 这一列是死重（前置登记——留给 P4）**：
       独立发现，与多库无关但同一片代码。它不只"没被写对"——**它的值跨进程没有意义**：
-      `cred_generation` 每次启动都是 `AtomicU64::new(1)`（`storage/mod.rs:316`），**不从库里的最大值
-      播种**（`bump_cred_generation()`，`storage/mod.rs:324`）⇒ 库里恒为 1、内存里是 2/3/4…，
+      `cred_generation` 每次启动都是 `AtomicU64::new(1)`（`storage/engine.rs:122`），**不从库里的最大值
+      播种**（`bump_cred_generation()`，`storage/keys.rs:109`）⇒ 库里恒为 1、内存里是 2/3/4…，
       重启后两者又都回到 1；而缓存比对的是**内存那份记录**，**没有任何东西读这一列的实际值**。
       两个方向（详见 `STORAGE.md` §2.1④）：**(A) 让它成真**（从库里 `MAX(cred_version)` 播种 +
       `create()` 真正写入）——这才是**跨副本吊销传播**的天然载体；**(B) 删列**。
@@ -1877,7 +1877,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       （`crates/gateway/src/registry/routing.rs:38` 的 `pick`：精确优先 → 通配兜底 → 取 `inflight`
       最小者），node 内部怎么分它看不见、也不需要看见 ⇒ **协议 / 网关 / 注册表 / 准入 /
       `/v1/models` 聚合全部零改动**（`Heartbeat.inflight` 那个空洞也不必为它而补：网关拿到它
-      只打一条 debug 日志，`crates/gateway/src/quic.rs:216`）。
+      只打一条 debug 日志，`crates/gateway/src/tunnel/protocol.rs:118`）。
       **改动形状**：`upstream` 允许是**一组** `{origin, models}`（字符串继续合法，向后兼容）；
       agent 按请求 `model` 筛候选 → 取在途最少 → 转发；**本地熔断**沿用「同一原因连续 N 次」
       的既有纪律（同 `crates/gateway/src/registry/table.rs:432` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），

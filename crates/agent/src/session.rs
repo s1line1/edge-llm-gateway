@@ -11,6 +11,7 @@ use proto::{
 };
 use s2n_quic::{client::Connect, provider::limits::Limits};
 use tokio::io::AsyncWriteExt;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -133,12 +134,14 @@ pub(crate) async fn connect_once(
     // 所以必须观察它：它一结束就结束这条连接，交回 run() 的重连循环。
     // 本机并发闸门（记录 P2-3）：`max_concurrency > 0` 时才有闸门，"0 = 不限"与网关侧同理。
     let mut gate = ConcurrencyGate::new(cfg.max_concurrency);
+    let mut streams = JoinSet::new();
     loop {
         tokio::select! {
             r = &mut hb => {
                 report_heartbeat_down(r);
                 break;
             }
+            _ = streams.join_next(), if !streams.is_empty() => {}
             accepted = acceptor.accept_bidirectional_stream() => match accepted {
                 Ok(Some(stream)) => {
                     // 先拿许可**再**接手：闸门满了就停在这里不再 accept 下一条流——未接收的流
@@ -154,7 +157,7 @@ pub(crate) async fn connect_once(
                     let http = http.clone();
                     let upstream_base = cfg.upstream_base.clone();
                     let request_log = cfg.request_log;
-                    tokio::spawn(async move {
+                    streams.spawn(async move {
                         let _permit = permit;
                         // 记录 P2-2：以前这里是 `let _ = ...`，`handle_stream` 的所有失败
                         // （上游连不上、首帧不是 ProxyRequest、写帧失败…）连一行日志都没有。
@@ -174,6 +177,7 @@ pub(crate) async fn connect_once(
     }
 
     hb.abort();
+    streams.abort_all();
     Ok(())
 }
 

@@ -35,7 +35,7 @@ use axum::{
 };
 use tracing::{debug, error, info};
 
-use crate::state::AppState;
+use crate::state::RequestRuntime;
 
 use super::admission::RouteClass;
 
@@ -87,7 +87,7 @@ impl Drop for AbortGuard<'_> {
 }
 
 pub(super) async fn request_id_middleware(
-    State(state): State<AppState>,
+    State(state): State<RequestRuntime>,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -510,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn an_aborted_request_is_counted_so_the_zombie_identity_holds() {
         let mut state = test_state(None);
-        state.admin_token = Some("admin".into());
+        state.admin_mut().admin_token = Some("admin".into());
         state.policy.max_concurrent_requests = 1;
         let router = app(state.clone());
 
@@ -556,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn aborted_request_does_not_leak_concurrency_slot() {
         let mut state = test_state(None);
-        state.admin_token = Some("admin".into());
+        state.admin_mut().admin_token = Some("admin".into());
         state.policy.max_concurrent_requests = 1;
         let router = app(state);
 

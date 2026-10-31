@@ -15,6 +15,8 @@ mod https;
 mod lifecycle;
 mod metrics;
 mod nofile;
+mod pki_categories;
+mod pki_identity;
 mod signals;
 mod stalls;
 mod takeover;

@@ -13,7 +13,7 @@ port), and you want to call it from anywhere with a standard OpenAI SDK — **wi
 local inference endpoint to the public Internet.**
 
 <p align="center">
-  <img alt="tests" src="https://img.shields.io/badge/tests-456%20passed-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-474%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -50,9 +50,8 @@ flowchart TB
 The single public entry point is `cloud-gateway`. It exposes **OpenAI-compatible** `/v1/*` paths
 (`/v1/chat/completions`, `/v1/embeddings`, … are forwarded verbatim to an edge; `/v1/models` is answered
 by the gateway itself, aggregated across edges), supports **SSE streaming**, and performs API-key
-authentication and rate limiting before forwarding. HTTPS is served directly with `rustls` —
-**no reverse proxy required** (the tunnel speaks a private frame protocol, so a reverse proxy could not
-handle it anyway).
+authentication and rate limiting before forwarding. Admin HTTPS is terminated by a reverse proxy
+or SSH tunnel; the QUIC tunnel uses its own mTLS identity and does not depend on that entry.
 
 ### Gateway → Agent
 
@@ -368,8 +367,8 @@ fmt · clippy -D warnings · nextest · e2e wiring · toolchain-check · check-r
 
 `make check` adds `cargo deny` and the four web targets on top (web-format / web-lint / web-test / web-build).
 
-> **Current scale (`cargo nextest run --workspace`, measured)**: **456 tests executed and passed (0 skipped)**, of which
-> **77 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
+> **Current scale (`cargo nextest run --workspace`, measured)**: **474 tests executed and passed (0 skipped)**, of which
+> **82 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
 > per commit; trust the actual run output.
 >
 > Two behaviours differ from `cargo test` and are worth knowing: **nextest runs one process per test**,

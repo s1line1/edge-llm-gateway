@@ -14,7 +14,10 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::{auth, state::AppState};
+use crate::{
+    auth,
+    state::{AppState, RequestRuntime},
+};
 
 use super::ui::wants_html;
 
@@ -37,7 +40,7 @@ use super::ui::wants_html;
 ///
 /// body 是 JSON（早期是纯文本 `ok`）；**状态码与 body 的 `status` 永远一致**，
 /// `agents.oldest_last_seen_secs_ago` 用来区分"没人注册"与"有人但全过期"（`null` = 注册表为空）。
-pub(super) async fn healthz(State(state): State<AppState>) -> Response {
+pub(super) async fn healthz(State(state): State<RequestRuntime>) -> Response {
     let accepting = state.metrics.quic_accepting() == 1;
     let status = state.registry.status(state.policy.agent_stale_after);
 
@@ -66,7 +69,10 @@ pub(super) async fn healthz(State(state): State<AppState>) -> Response {
 /// OpenAI 兼容 `/v1/models`：聚合所有**健康** agent 显式声明的模型并集
 /// （`["*"]` 全匹配的 agent 不贡献条目——它接受任意请求，但具体能跑什么
 /// 只有上游知道，列出会误导客户端）。与代理入口同级的认证 + 限流。
-pub(super) async fn models_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub(super) async fn models_route(
+    State(state): State<RequestRuntime>,
+    headers: HeaderMap,
+) -> Response {
     let key = match auth::authenticate(&state, &headers).await {
         Ok(key) => key,
         Err(rejection) => return rejection.into_response(),
@@ -91,10 +97,12 @@ pub(super) async fn models_route(State(state): State<AppState>, headers: HeaderM
 /// 浏览器直接访问/刷新（`Accept: text/html`）时返回 SPA 页面，让前端路由渲染指标页；
 /// Prometheus 抓取与前端解析（`Accept: */*`）仍拿到文本。
 pub(super) async fn metrics_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let ui = state.ui();
+    let state = state.request();
     if wants_html(&headers) {
         // 走 `AppState` 里的缓存读（按 mtime 校验）：以前这里每次请求同步
         // `std::fs::read_to_string`，是在 async 上下文里做阻塞 I/O。
-        if let Some(index) = &state.ui_index {
+        if let Some(index) = &ui.ui_index {
             if let Some(html) = index.load().await {
                 // 同一 URI 也能回 Prometheus 文本 ⇒ 必须声明"按 Accept 协商"（复扫 A5）
                 return super::vary_on_accept(Html(html.to_string()).into_response());
@@ -167,7 +175,7 @@ mod tests {
         // 测试态默认置成"接受中"（见 test_util），这里显式制造"入口停摆"
         state.metrics.set_quic_accepting_for_test(false);
 
-        let resp = healthz(State(state)).await;
+        let resp = healthz(State(state.request().clone())).await;
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -239,7 +247,7 @@ mod tests {
         // 守卫要活到断言结束：Drop 会把 gauge 置回 0
         let _accepting = state.metrics.mark_accepting();
 
-        let resp = healthz(State(state)).await;
+        let resp = healthz(State(state.request().clone())).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value =
             serde_json::from_str(&body_str(resp).await).expect("body 是 JSON");

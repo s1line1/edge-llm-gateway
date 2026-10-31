@@ -12,12 +12,11 @@ use crate::{
     metrics::Metrics,
     nofile,
     pki::{PkiConfig, PkiService},
-    quic,
     registry::Registry,
     shutdown, state,
     storage::Storage,
     tls::TlsPem,
-    usage_flush,
+    tunnel, usage_flush,
 };
 
 /// 启动旋钮住在 [`crate::options`]；这里再导出，保住 `gateway::Options` 这个既有公开路径
@@ -87,6 +86,7 @@ pub struct Gateway {
     /// 用量落库需要在关闭前强制 flush 一次（见 [`Gateway::shutdown`]）。
     store: Storage,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    forward_tasks: std::sync::Arc<crate::task_scope::TaskScope>,
     /// 「启动时抬过 NOFILE 额度」的凭证，见 [`nofile::Raised`] 与 [`nofile::install`]。
     ///
     /// **它没有任何运行时用途，唯一作用是编译期保险**：这个字段只能由
@@ -145,7 +145,6 @@ impl Gateway {
                         .map_err(|e| GatewayError::Config(e.to_string()))?,
                 );
                 let tls = service
-                    .runtime()
                     .server_config()
                     .map_err(|e| GatewayError::Config(e.to_string()))?;
                 (Some(service), tls)
@@ -207,8 +206,22 @@ impl Gateway {
             &opts,
             shutdown.subscribe(),
         );
-        app_state.pki = pki_service.clone();
+        app_state.set_pki(pki_service.clone());
+        let forward_tasks = app_state.task_scope();
         let app = http::app(app_state);
+
+        // Tenant-token verification is injected into the transport policy; tunnel code does not
+        // depend on Storage.
+        let token_store = store.clone();
+        let registration_policy = tunnel::RegistrationPolicy::new(
+            opts.allow_legacy_agent_registration,
+            std::sync::Arc::new(move |tenant_id: &str, token: &str| {
+                token_store
+                    .verify_agent_token(tenant_id, token)
+                    .map(|_| ())
+                    .map_err(|e| tunnel::RegistrationError::Rejected(e.to_string()))
+            }),
+        );
 
         // ⑤ 起任务。入列顺序有意义：用量 flusher 必须在 serve 任务之前就位（它按周期
         //    批量写库，见 `proxy::UsageCollector::finish`；关闭时由 `shutdown` 补最后一刀）。
@@ -223,13 +236,12 @@ impl Gateway {
                 shutdown.subscribe(),
                 metrics.clone(),
             ),
-            tokio::spawn(quic::accept_loop(
+            tokio::spawn(tunnel::accept_loop(
                 sockets.server,
                 registry.clone(),
                 metrics.clone(),
-                store.clone(),
+                registration_policy,
                 opts.stream_ceiling(),
-                opts.allow_legacy_agent_registration,
                 opts.evict_close_grace,
                 shutdown.subscribe(),
                 pki_service.clone(),
@@ -239,7 +251,7 @@ impl Gateway {
         // 「`start()` 返回 ⇒ 隧道入口接受中」：把这条不变量在这里做出来，而不是让探针在启动
         // 窗口里误报 degraded（判据见 `quic::await_accepting`）。等不到只告警、不失败启动——
         // 端口已经绑好，"入口还没标上"是**健康信号**该说的事，不是启动失败。
-        if !quic::await_accepting(&metrics, std::time::Duration::from_secs(5)).await {
+        if !tunnel::await_accepting(&metrics, std::time::Duration::from_secs(5)).await {
             tracing::warn!(
                 "the tunnel entry has not marked itself as accepting yet; /healthz will report \
                  degraded until it does"
@@ -257,6 +269,7 @@ impl Gateway {
             registry,
             store,
             tasks,
+            forward_tasks,
             nofile,
         })
     }
@@ -360,8 +373,16 @@ impl Gateway {
                  (usage settled since the last periodic flush may be lost)"
             ),
         }
-        // ⑤ abort；`Drop` 还会再兜一次（对已结束的任务是 no-op）。用 `&self.tasks` 而不是
-        //    `self.tasks`：`Gateway` 有 `Drop`，不能把字段移出去。
+        // ⑤ 终止还没结束的转发任务：排空/收尾与落库已经完成，此时 abort 不会丢已结算用量。
+        if self.forward_tasks.live() > 0 {
+            tracing::warn!(
+                live = self.forward_tasks.live(),
+                "aborting remaining forward tasks"
+            );
+            self.forward_tasks.abort_all();
+        }
+        // ⑥ abort 主任务；`Drop` 还会再兜一次（对已结束的任务是 no-op）。用 `&self.tasks`
+        //    而不是 `self.tasks`：`Gateway` 有 `Drop`，不能把字段移出去。
         for t in &self.tasks {
             t.abort();
         }
@@ -441,6 +462,7 @@ impl Drop for Gateway {
     /// 不可预期的上下文（runtime worker、unwind）里阻塞；丢的只是最后一个 flush 周期
     /// （≤1s），与崩溃同级。要"已结算用量不丢"就调 `shutdown()`（`main` 就是这么做的）。
     fn drop(&mut self) {
+        self.forward_tasks.abort_all();
         // 三个主任务先 abort：accept 循环停了才不会再有新连接进来。
         for t in &self.tasks {
             t.abort();

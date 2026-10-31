@@ -6,7 +6,7 @@
 
 use crate::storage::hash::hex_lower;
 
-pub(crate) const DEFAULT_TENANT_ID: &str = "default";
+pub(crate) use crate::tenant::DEFAULT_TENANT_ID;
 pub(crate) const DEFAULT_TENANT_NAME: &str = "default";
 
 /// 一条租户记录。`agent_token_hash` 是 `sha256(token)` 的小写十六进制；
