@@ -11,10 +11,12 @@ use serde_json::json;
 use tracing::error;
 
 use crate::{
-    admin_auth::{user_error_response, user_json_public},
-    rbac::{
-        authorize, can_change_user_scope, can_create_user, can_manage_user, effective_tenant,
-        response as rbac_response, Action, Principal,
+    access::{
+        rbac::{
+            authorize, can_change_user_scope, can_create_user, can_manage_user, effective_tenant,
+            response as rbac_response, Action, Principal,
+        },
+        session::{user_error_response, user_json_public},
     },
     state::AdminRuntime,
     storage::{UserPatch, UserRole},

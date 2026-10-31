@@ -4,10 +4,6 @@
 //! TLS 材料与 rustls 配置构造在 [`tls`]。
 
 pub mod access;
-pub mod admin;
-mod admin_auth;
-mod admin_users;
-pub mod auth;
 pub mod body;
 pub mod config;
 pub mod error;
@@ -23,9 +19,7 @@ pub mod openai;
 pub mod options;
 pub mod pki;
 pub mod proxy;
-pub mod quic;
 pub mod ratelimit;
-pub mod rbac;
 pub mod registry;
 mod request_id;
 mod shutdown;
@@ -40,6 +34,12 @@ pub mod tunnel;
 pub mod ui;
 pub mod usage_flush;
 pub mod usage_meter;
+
+// Compatibility module aliases: keep the old public paths without extra shim files.
+pub use access::api_key as auth;
+pub use access::rbac;
+pub use http::admin;
+pub use tunnel as quic;
 
 // 再导出：保住 `gateway::{Gateway, GatewayConfig, TlsPem}` 这些既有导入路径
 // （src/config.rs、main.rs 与 tests/e2e/* 都按这些路径引用）。

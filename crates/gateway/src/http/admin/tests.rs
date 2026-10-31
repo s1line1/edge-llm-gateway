@@ -3,7 +3,7 @@
 pub use crate::http::admin::*;
 
 #[cfg(test)]
-mod tests {
+mod handler_tests {
     use super::*;
     use std::sync::Arc;
     use std::time::Duration;

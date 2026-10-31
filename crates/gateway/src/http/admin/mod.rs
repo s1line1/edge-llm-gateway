@@ -14,3 +14,6 @@ pub use tenants::{
 };
 pub use usage::{usage_filtered, usage_route};
 pub use users::{create_user, delete_user, list_audit, list_users, update_user};
+
+#[cfg(test)]
+mod tests;
