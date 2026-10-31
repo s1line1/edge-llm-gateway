@@ -144,11 +144,11 @@ jobs:
           set -euo pipefail
           version="${{ needs.meta.outputs.version }}"
           target="${{ matrix.target }}"
-          tarball="dist/home-llm-gateway-${version}-${target}.tar.gz"
+          tarball="dist/edge-llm-gateway-${version}-${target}.tar.gz"
           test -f "$tarball"
           rm -rf verify && mkdir verify
           tar -C verify -xzf "$tarball"
-          root="verify/home-llm-gateway-${version}-${target}"
+          root="verify/edge-llm-gateway-${version}-${target}"
           # 1) 产物真的能跑：Linux 静态 ELF 在同架构 glibc runner 上直接执行，
           #    这同时说明"不依赖 glibc 版本"不是纸面结论。
           "$root/bin/gateway" --version
@@ -220,7 +220,7 @@ jobs:
           # 用 glob 数组而不是 `ls | wc -l`：文件名由矩阵决定，但 `ls` 解析在
           # 非字母数字文件名上不可靠（shellcheck SC2012，actionlint 会红）。
           shopt -s nullglob
-          tarballs=(home-llm-gateway-*.tar.gz)
+          tarballs=(edge-llm-gateway-*.tar.gz)
           if [ "${#tarballs[@]}" -ne 3 ]; then
             echo "期望 3 个平台产物，实际 ${#tarballs[@]} 个"
             printf '%s\n' "${tarballs[@]-}"

@@ -35,7 +35,7 @@ Gateway 启动时**不会生成 CA 或证书**，也不再从 `gateway-config.ym
 ```yaml
 pki:
   enabled: true
-  dir: /etc/home-llm-gateway/pki
+  dir: /etc/edge-llm-gateway/pki
   server_validity_days: 397
   client_validity_days: 90
   require_https_for_download: true
@@ -66,7 +66,7 @@ pki:
 > （或本机/SSH 隧道）。反向代理需发送 `X-Forwarded-Proto: https`。
 
 > **持久化**：`pki.dir` 必须在持久卷上。容器部署要挂载
-> `/etc/home-llm-gateway`（含 `pki/` 和 `keys.db`）；目录丢失会导致启动加载 active pair 失败，
+> `/etc/edge-llm-gateway`（含 `pki/` 和 `keys.db`）；目录丢失会导致启动加载 active pair 失败，
 > 不会静默重新生成。
 
 ## 2. 安全组 + 防火墙
@@ -94,8 +94,8 @@ sudo ufw allow 8443/tcp && sudo ufw allow 4433/udp && sudo ufw enable
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 # 国内网络建议配 crates 镜像（rsproxy.cn / tuna），加快下载
-git clone git@github.com:s1line1/home-llm-gateway.git
-cd home-llm-gateway
+git clone git@github.com:s1line1/edge-llm-gateway.git
+cd edge-llm-gateway
 cargo build --release            # 产出 target/release/{gateway,agent,mock-llm}
 ```
 
@@ -124,10 +124,10 @@ rustup target add aarch64-apple-darwin
 ./scripts/build-release.sh --strict --target x86_64-unknown-linux-musl
 ```
 
-产物：`dist/home-llm-gateway-<版本>-<平台>.tar.gz` + `dist/SHA256SUMS`。包内结构：
+产物：`dist/edge-llm-gateway-<版本>-<平台>.tar.gz` + `dist/SHA256SUMS`。包内结构：
 
 ```
-home-llm-gateway-<版本>-<平台>/
+edge-llm-gateway-<版本>-<平台>/
   bin/{gateway,agent,mock-llm}
   deploy/{gateway.service,agent.service,logrotate.example}
   gateway-config.example.yml  agent-config.example.yml
@@ -158,19 +158,19 @@ home-llm-gateway-<版本>-<平台>/
 ## 4. 目录规划（中转服务器）
 
 ```bash
-sudo mkdir -p /etc/home-llm-gateway
-# 二进制（方案 A 构建后在 home-llm-gateway/target/release/ 下，方案 B 解包 dist/）
+sudo mkdir -p /etc/edge-llm-gateway
+# 二进制（方案 A 构建后在 edge-llm-gateway/target/release/ 下，方案 B 解包 dist/）
 sudo cp target/release/gateway /usr/local/bin/gateway
 # 凭证：Gateway 启动时不再读取固定证书。首次启动后在 Dashboard 的 Certificates
 # 页面按需创建 client/server 成对凭证；server 半部分写入
-# /etc/home-llm-gateway/pki/pairs/<id>/，client 半部分只下载一次。
+# /etc/edge-llm-gateway/pki/pairs/<id>/，client 半部分只下载一次。
 # 确保该目录是持久卷，且不要手工放 server.key/ca.key 到配置根目录。
 # Web UI（可选）：本机构建后把产物整个上传（含 index.html + assets/）。
 # ⚠️ **层次要和配置里的 ui_dir 对齐**：下面保持 `web/dist/` 这一层，对应 ui_dir: web/dist
 #   cd web && pnpm install && pnpm build
-#   ssh <服务器> 'sudo mkdir -p /etc/home-llm-gateway/web/dist'
-#   scp -r web/dist/* <服务器>:/etc/home-llm-gateway/web/dist/
-# （另一种常见写法是 `scp -r web/dist <服务器>:/etc/home-llm-gateway/web` —— scp 会把目录**改名**
+#   ssh <服务器> 'sudo mkdir -p /etc/edge-llm-gateway/web/dist'
+#   scp -r web/dist/* <服务器>:/etc/edge-llm-gateway/web/dist/
+# （另一种常见写法是 `scp -r web/dist <服务器>:/etc/edge-llm-gateway/web` —— scp 会把目录**改名**
 #   成 `web`，产物落在 `…/web/` 下少一层，那时 `ui_dir` 要写 `web` 而不是 `web/dist`。
 #   两种都由你定，但**配置必须和实际层次一致**，否则 `/` 只显示"UI 未构建"的占位页。）
 ```
@@ -182,18 +182,18 @@ sudo cp target/release/gateway /usr/local/bin/gateway
 openssl rand -hex 32        # Admin Token（记下来，登录管理页 / 调 /admin/* 用）
 
 # 2) 基于模板生成网关配置（所有参数都在这里）
-sudo cp gateway-config.example.yml /etc/home-llm-gateway/gateway-config.yml
-sudo vi /etc/home-llm-gateway/gateway-config.yml
+sudo cp gateway-config.example.yml /etc/edge-llm-gateway/gateway-config.yml
+sudo vi /etc/edge-llm-gateway/gateway-config.yml
 
 # 3) 安装并启动（systemd 单元只负责 --config 指向配置文件）
-sudo mkdir -p /var/log/home-llm-gateway
+sudo mkdir -p /var/log/edge-llm-gateway
 sudo cp deploy/gateway.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now gateway
 
 # 4) 看日志（deploy/gateway.service 的 StandardOutput/StandardError 把应用日志**落盘**，
 #    所以 journalctl -u gateway 里只有 systemd 自己的启停消息，没有网关日志）
-sudo tail -f /var/log/home-llm-gateway/gateway.log
+sudo tail -f /var/log/edge-llm-gateway/gateway.log
 ```
 
 `gateway-config.yml` 关键参数（按需修改，完整示例见 `gateway-config.example.yml`）：
@@ -203,17 +203,17 @@ listen_addr: "0.0.0.0:8443"        # HTTPS API 入口
 quic_addr: "0.0.0.0:4433"          # QUIC 隧道（UDP）
 pki:                               # 按需凭证管理；启动不生成任何证书
   enabled: true
-  dir: /etc/home-llm-gateway/pki
+  dir: /etc/edge-llm-gateway/pki
   server_validity_days: 397
   client_validity_days: 90
   require_https_for_download: true
 admin_token: <强随机串>             # Admin API 口令（必配；用它创建第一个 API key）
-keys_file: /etc/home-llm-gateway/keys.db   # 动态 key 持久化数据库（SQLite，默认 keys.db）
+keys_file: /etc/edge-llm-gateway/keys.db   # 动态 key 持久化数据库（SQLite，默认 keys.db）
 rate_limit_per_min: 60             # 每个 Key 每分钟上限
 ui_dir: web/dist                   # Web UI 目录（§4 上传的产物；相对 WorkingDirectory，
                                    # 所以要带 `web/dist` 这一层——层次必须与实际目录一致）
                                    # ⚠️ 原生部署**必须显式写**：不写时的默认值是**镜像内**的
-                                   # /usr/local/share/home-llm-gateway/web（给容器用的绝对路径）。
+                                   # /usr/local/share/edge-llm-gateway/web（给容器用的绝对路径）。
                                    # 目录里没有可用产物时 `/` 显示构建提示页，API 不受影响
 ```
 
@@ -251,22 +251,22 @@ curl -s http://127.0.0.1:11434/v1/models          # 本机确认 OpenAI 兼容�
 安装 agent（同样放二进制 + 证书，注意用**该机器自己那份** client 证书）：
 
 ```bash
-sudo mkdir -p /etc/home-llm-gateway
+sudo mkdir -p /etc/edge-llm-gateway
 # 二进制（agent.service 的 ExecStart 是 /usr/local/bin/agent）
 sudo cp target/release/agent /usr/local/bin/agent
 # 从 Dashboard 下载该 agent 对应 pair 的 client tar，解压后复制三件套
 # （每台 agent 使用独立 pair；不要共享 client.key）
-sudo mkdir -p /etc/home-llm-gateway
-sudo cp ca.crt client.crt client.key /etc/home-llm-gateway/
-sudo chmod 600 /etc/home-llm-gateway/client.key
+sudo mkdir -p /etc/edge-llm-gateway
+sudo cp ca.crt client.crt client.key /etc/edge-llm-gateway/
+sudo chmod 600 /etc/edge-llm-gateway/client.key
 
 # 基于 agent-config.example.yml 生成 agent 配置：
 #   cloud_addr: <公网IP>:4433
 #   server_name: <创建 pair 时填写的 DNS server_name>   ← 关键！不一致会 TLS 握手失败
 #   agent_id: <每台机器唯一！>                              ← 关键！同名会让两台机器互踢（见下方警告）
 #   upstream: http://127.0.0.1:11434
-sudo cp agent-config.example.yml /etc/home-llm-gateway/agent-config.yml
-sudo vi /etc/home-llm-gateway/agent-config.yml
+sudo cp agent-config.example.yml /etc/edge-llm-gateway/agent-config.yml
+sudo vi /etc/edge-llm-gateway/agent-config.yml
 ```
 
 > ⚠️ **`agent_id` 必须每台机器唯一**：`agent-config.example.yml` 与 `Makefile` 生成的默认值都是
@@ -280,13 +280,13 @@ sudo vi /etc/home-llm-gateway/agent-config.yml
 
 ```bash
 # deploy/agent.service 只负责 --config 指向配置文件
-sudo mkdir -p /var/log/home-llm-gateway
+sudo mkdir -p /var/log/edge-llm-gateway
 sudo cp deploy/agent.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now agent
 
 # 看到 connected to cloud gateway / registered with cloud gateway 即成功
-sudo tail -f /var/log/home-llm-gateway/agent.log
+sudo tail -f /var/log/edge-llm-gateway/agent.log
 ```
 
 > agent 侧的关闭信号与网关同款：`SIGTERM` / `SIGINT` / `SIGHUP` 都走 `agent.shutdown()`。
@@ -321,7 +321,7 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 | curl 返回 503 | 网关没注册到健康 agent（看网关/agent 日志） |
 | curl 返回 429 | 限流超了（等下一分钟）或 agent 并发占满 |
 | **大请求体（≥1 MB）或大响应吞吐上不去、成片 504** | **云服务器的出口带宽上限**：实测该 ECS 出口 ≈0.40 MB/s（3.2 Mbps），`QPS × (请求字节+响应字节)` 超了就排队；并发大请求还会按 `1/N` 摊薄每条可用速率，于是 15 s 的 `head_timeout` 先到 ⇒ 504（日志是 `… still answering; not evicting`）。**这不是网关缺陷**：先按字节预算设计负载，或把带宽调上去；判据与实测表见 `OPTIMIZATION.md` §8《云出口带宽上限》《请求体阶梯复测》 |
-| 浏览器打开 8443 显示"尚未构建"提示页 | **systemd/原生部署**：`ui_dir` 指向的目录里没有可用产物——没构建、没上传（§4）、只上传了源码目录，或者**根本没写 `ui_dir`**（此时默认值是镜像内路径 `/usr/local/share/home-llm-gateway/web`，宿主上不存在 ⇒ 原生部署必须显式写）；**容器部署**：镜像自带产物、默认就能用，出现本页说明产物不在镜像里，或配置把 `ui_dir` 覆盖成了宿主路径（§11.5）。两种情况都是**非致命降级**，API 不受影响，改完重启即可（容器 `docker compose up -d`） |
+| 浏览器打开 8443 显示"尚未构建"提示页 | **systemd/原生部署**：`ui_dir` 指向的目录里没有可用产物——没构建、没上传（§4）、只上传了源码目录，或者**根本没写 `ui_dir`**（此时默认值是镜像内路径 `/usr/local/share/edge-llm-gateway/web`，宿主上不存在 ⇒ 原生部署必须显式写）；**容器部署**：镜像自带产物、默认就能用，出现本页说明产物不在镜像里，或配置把 `ui_dir` 覆盖成了宿主路径（§11.5）。两种情况都是**非致命降级**，API 不受影响，改完重启即可（容器 `docker compose up -d`） |
 | edge 侧 IP 变了连不上 | 用域名 SAN 证书 + `server_name` 填域名，配 DDNS 指向新 IP |
 
 ## 9. 部署后安全清单（必做）
@@ -361,7 +361,7 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 **只加列、不重建表、不重算哈希，旧 key 全部继续可用**。升级后建议确认一下：
 
 ```bash
-sqlite3 /etc/home-llm-gateway/keys.db "PRAGMA table_info(api_keys);"   # 应含 cred_version
+sqlite3 /etc/edge-llm-gateway/keys.db "PRAGMA table_info(api_keys);"   # 应含 cred_version
 curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
 # 稳态下 hits 快速累积、misses 几乎不动（每个不同 token 只付一次 argon2）
 ```
@@ -373,9 +373,9 @@ curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
 Dashboard 编进镜像），**上下文必须是仓库根**：
 
 ```bash
-docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
+docker build -f crates/gateway/Dockerfile -t edge-llm-gateway .
 # 或者在 crate 目录里（等价，上下文仍然是仓库根）：
-#   cd crates/gateway && docker build -f Dockerfile -t home-llm-gateway ../..
+#   cd crates/gateway && docker build -f Dockerfile -t edge-llm-gateway ../..
 # 或直接 compose（仓库里只有这一份 compose）：
 #   docker compose -f crates/gateway/docker-compose.yml build
 ```
@@ -390,18 +390,18 @@ docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
 按**进程的工作目录**解析。
 
 - systemd 那份之所以能用相对路径（`ui_dir: web/dist`、`keys_file: keys.db`），靠的是单元里的
-  `WorkingDirectory=/etc/home-llm-gateway`；
-- 镜像里已补 `WORKDIR /etc/home-llm-gateway`，语义与之一致。
+  `WorkingDirectory=/etc/edge-llm-gateway`；
+- 镜像里已补 `WORKDIR /etc/edge-llm-gateway`，语义与之一致。
 
 ### 11.2 挂载点必须与配置里的路径对齐（二选一）
 
 `gateway-config.example.yml` 和 `agent-config.example.yml` 用的都是绝对路径
-`/etc/home-llm-gateway/...`，所以：
+`/etc/edge-llm-gateway/...`，所以：
 
 | 方案 | 挂载 | 配置文件 |
 |---|---|---|
-| **A. 同路径挂载**（推荐） | `-v /etc/home-llm-gateway:/etc/home-llm-gateway` | **零改动**，示例配置原样可用（`ui_dir` 是唯一例外，见 §11.5） |
-| **B. 挂到 `/config`** | `-v /etc/home-llm-gateway:/config` | 必须把 cert/key/ca 改成 `/config/...`、`keys_file` 改成 `/config/keys.db` |
+| **A. 同路径挂载**（推荐） | `-v /etc/edge-llm-gateway:/etc/edge-llm-gateway` | **零改动**，示例配置原样可用（`ui_dir` 是唯一例外，见 §11.5） |
+| **B. 挂到 `/config`** | `-v /etc/edge-llm-gateway:/config` | 必须把 cert/key/ca 改成 `/config/...`、`keys_file` 改成 `/config/keys.db` |
 
 ⚠️ 两者混用是最常见的启动失败：容器内会报读不到证书/密钥（`cert/key/ca paths are required`
 之后是文件读取失败）。**挂载点了，配置里的路径就得跟着走**，反之亦然。
@@ -440,7 +440,7 @@ docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
   `web-builder` 阶段
   **在镜像内构建**（`pnpm install --frozen-lockfile` + `pnpm build`，末尾照样跑
   `scripts/check-bundle.mjs` 那道产物泄漏守卫——它红了整次构建就失败），产物在
-  `/usr/local/share/home-llm-gateway/web`；运行镜像里**不带 Node**，只多一份静态产物。
+  `/usr/local/share/edge-llm-gateway/web`；运行镜像里**不带 Node**，只多一份静态产物。
 
   **容器部署什么都不用配**：`ui_dir` 不写时的默认值就是上面那个镜像内路径
   （`config.rs` 的 `default_ui_dir()`）——不构建、不挂载、不加配置项，起来就有 Dashboard。
@@ -452,8 +452,8 @@ docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
   `ui_dir` 那一行**（如果它指向宿主上那份 `web/dist` —— 现在镜像自带、且更省事），
   再把宿主上的 `web/` 目录删掉。不删配置也能跑，只是还在用你挂的那份。
 
-  为什么默认值必须是**绝对路径**、而且不能放在 `/etc/home-llm-gateway/web`：容器里 `ui_dir`
-  的相对路径按**进程 CWD**（`/etc/home-llm-gateway`，见 §11.1）解析，而那是配置/证书/`keys.db`
+  为什么默认值必须是**绝对路径**、而且不能放在 `/etc/edge-llm-gateway/web`：容器里 `ui_dir`
+  的相对路径按**进程 CWD**（`/etc/edge-llm-gateway`，见 §11.1）解析，而那是配置/证书/`keys.db`
   的挂载点 —— 镜像里放那儿的东西会被宿主目录**遮住**，`/` 照样是"UI 未构建"（`ui.rs` 的启动期
   判定会打 warn，浏览器看到占位页）。所以产物放挂载点之外，默认值也指向那里；代价是**原生部署
   必须显式写 `ui_dir`**（默认值是给镜像用的）。
@@ -465,9 +465,9 @@ docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
 docker compose -f crates/gateway/docker-compose.yml build   # 先编 Rust（release）再编前端，然后打包运行镜像
 docker compose -f crates/gateway/docker-compose.yml config -q   # 只校验配置，不起容器
 docker compose -f crates/gateway/docker-compose.yml up -d gateway
-# 日志：compose 的 command 把 stdout 重定向到了 /var/log/home-llm-gateway/gateway.log，
+# 日志：compose 的 command 把 stdout 重定向到了 /var/log/edge-llm-gateway/gateway.log，
 # 所以 `docker compose logs -f gateway` 是**空的**（容器 stdout 没有内容）——直接看那个文件：
-sudo tail -f /var/log/home-llm-gateway/gateway.log
+sudo tail -f /var/log/edge-llm-gateway/gateway.log
 ```
 
 前端阶段的可调 build-arg（都有默认值，见 `crates/gateway/Dockerfile`）：`NPM_MIRROR`（默认

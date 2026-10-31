@@ -1,4 +1,4 @@
-# home-llm-gateway — Edge 定位与模型路由方案（2026-09 定稿）
+# edge-llm-gateway — Edge 定位与模型路由方案（2026-09 定稿）
 
 > 项目定位从"家庭网关"升级为 **Edge LLM 网关**：统一公网入口接入多台边缘节点（edge），
 > 每台 edge 声明异构模型能力，网关按请求 model 做调度。家庭部署是第一个实例（单 edge）。
@@ -92,7 +92,7 @@ edge 优先，其次才轮到 `models: ["*"]` 的通配 edge；同组内按**最
 ```yaml
 # --- edge 节点 1（家庭，跑 qwen2.5）---
 cloud_addr: "<网关>:4433"
-ca/cert/key: /etc/home-llm-gateway/*.crt
+ca/cert/key: /etc/edge-llm-gateway/*.crt
 agent_id: edge-1                 # ⚠️ 必须全网关唯一，见下
 upstream: "http://127.0.0.1:11434"
 models: [qwen2.5]                # 声明能力：网关据此路由
@@ -100,7 +100,7 @@ max_concurrency: 2
 
 # --- 机器 2（云上 GPU，跑 llama3）---
 cloud_addr: "<网关>:4433"
-ca/cert/key: /etc/home-llm-gateway/*.crt
+ca/cert/key: /etc/edge-llm-gateway/*.crt
 agent_id: edge-2
 upstream: "http://127.0.0.1:8000"
 models: [llama3]

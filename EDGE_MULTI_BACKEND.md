@@ -1,4 +1,4 @@
-# home-llm-gateway — 一个 edge-agent 连接多台 vLLM（设计；⛔ 未实现）
+# edge-llm-gateway — 一个 edge-agent 连接多台 vLLM（设计；⛔ 未实现）
 
 > **状态：设计已定，未实现。** 登记见 `TODO.md`《2026-10-09 一个 edge 连多台 vLLM》。
 > 按顶部范围约定，本文**全部内容 ⛔**（新功能 + 配置形状变更）：只登记、不排期、不开工。

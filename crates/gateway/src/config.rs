@@ -144,7 +144,7 @@ pub struct ConfigFile {
     pki: Option<PkiConfig>,
     /// React UI 静态目录（含 index.html）。
     ///
-    /// **不写这一项 = 用 [`default_ui_dir`] 的镜像内路径**（`/usr/local/share/home-llm-gateway/web`），
+    /// **不写这一项 = 用 [`default_ui_dir`] 的镜像内路径**（`/usr/local/share/edge-llm-gateway/web`），
     /// 那是 `Dockerfile` 把前端产物 COPY 进去的位置 ⇒ 容器部署开箱即用，配置里不需要这一行。
     /// 原生（systemd）部署要显式写自己的目录（例如 `web/dist`，相对 `WorkingDirectory`）。
     /// 目录里没有可用产物时是**非致命降级**：`/` 显示构建提示页，进程照常启动。
@@ -162,15 +162,15 @@ fn default_keys_file() -> Option<PathBuf> {
     Some(PathBuf::from("keys.db"))
 }
 /// 部署默认的 UI 目录：**镜像内那个绝对路径**（`Dockerfile` 的
-/// `COPY --from=web-builder … /usr/local/share/home-llm-gateway/web`）。
+/// `COPY --from=web-builder … /usr/local/share/edge-llm-gateway/web`）。
 ///
 /// 为什么是绝对路径而不是曾经的 `web/dist`：容器里 `ui_dir` 通常不写（镜像是自包含的），
-/// 而相对路径按**进程 CWD** 解析 —— 镜像的 CWD 是 `/etc/home-llm-gateway`，正是配置/证书/
+/// 而相对路径按**进程 CWD** 解析 —— 镜像的 CWD 是 `/etc/edge-llm-gateway`，正是配置/证书/
 /// `keys.db` 的**挂载点**，镜像里放那儿的东西会被宿主目录遮住 ⇒ 曾经的默认值在容器里必然
 /// 降级成"UI 未构建"。换成绝对路径后：**有配置用配置，没配置就用镜像内这份**。
 /// （原生部署因此要显式写自己的目录，`gateway-config.example.yml` 里给的就是那种写法。）
 fn default_ui_dir() -> Option<PathBuf> {
-    Some(PathBuf::from("/usr/local/share/home-llm-gateway/web"))
+    Some(PathBuf::from("/usr/local/share/edge-llm-gateway/web"))
 }
 fn default_session_ttl_secs() -> u64 {
     Options::DEFAULT_SESSION_TTL_SECS
@@ -533,7 +533,7 @@ mod tests {
         assert_eq!(
             opts.ui_dir,
             Some(std::path::PathBuf::from(
-                "/usr/local/share/home-llm-gateway/web"
+                "/usr/local/share/edge-llm-gateway/web"
             )),
             "部署默认 UI 目录 = 镜像内路径（Dockerfile 的 COPY 目标）"
         );

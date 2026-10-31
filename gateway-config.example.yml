@@ -1,4 +1,4 @@
-# home-llm-gateway 网关配置示例
+# edge-llm-gateway 网关配置示例
 # 使用：cp gateway-config.example.yml gateway-config.yml，按需修改后
 #       gateway --config gateway-config.yml
 # 所有字段都有默认值。服务器证书不再从 YAML 加载；凭证通过 /admin/pki/pairs 按需创建。
@@ -16,7 +16,7 @@ quic_addr: "0.0.0.0:4433"
 # 管理员在 Dashboard 的 Certificates 页面创建 client/server 成对凭证。
 pki:
   enabled: true
-  dir: /etc/home-llm-gateway/pki
+  dir: /etc/edge-llm-gateway/pki
   server_validity_days: 397
   client_validity_days: 90
   require_https_for_download: true
@@ -26,7 +26,7 @@ pki:
 admin_token: CHANGE_ME_admin_token
 
 # 动态 API Key 持久化数据库（SQLite；null = 仅内存）
-keys_file: /etc/home-llm-gateway/keys.db
+keys_file: /etc/edge-llm-gateway/keys.db
 
 # 单次转发空闲超时秒数（逐帧；SSE 长流不受影响）
 # 语义：**响应体**阶段"两帧之间"的最大间隔。SSE 只要有帧来就不会超时，所以调大它
@@ -176,7 +176,7 @@ max_open_tunnel_streams: 1024
 # 客户端私钥下载要求 HTTPS（或本机/SSH 隧道）。
 
 # React Web UI 静态目录（含 index.html；浏览器打开网关地址 `/` 即管理面板）。
-# **不写这一项 = 默认 `/usr/local/share/home-llm-gateway/web`**（`config.rs` 的
+# **不写这一项 = 默认 `/usr/local/share/edge-llm-gateway/web`**（`config.rs` 的
 # `default_ui_dir()`）——那正是本仓库镜像把前端产物 COPY 进去的位置 ⇒ **容器部署不必写这一行**，
 # 开箱即用；有配置就用配置。
 # 反过来，**原生（systemd）部署要显式写**：默认值是给镜像用的绝对路径，宿主机上并不存在。
@@ -187,7 +187,7 @@ max_open_tunnel_streams: 1024
 # 下面给的是原生部署的写法，注意**相对路径按进程 CWD 解析**（`WorkingDirectory`），
 # 所以要与实际目录层次一致：
 #   · 产物落在 `<CWD>/web/dist/` ⇒ 写 `web/dist`（本文件这一行；DEPLOY.md §4 的上传方式）
-#   · 产物落在 `<CWD>/web/`（例如 `scp -r web/dist <服务器>:/etc/home-llm-gateway/web`
+#   · 产物落在 `<CWD>/web/`（例如 `scp -r web/dist <服务器>:/etc/edge-llm-gateway/web`
 #     这种**会把目录改名**的上传）⇒ 写 `web`
 # 写错层次不会报错，只会静默降级成占位页（日志里那行 warn 会点名它实际找的路径）。
 ui_dir: web/dist

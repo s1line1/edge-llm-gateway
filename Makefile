@@ -1,4 +1,4 @@
-# home-llm-gateway 常用命令
+# edge-llm-gateway 常用命令
 # 用法：make <target>；make help 查看全部命令
 # 开发环境：macOS/Linux 均适用（GNU Make）
 

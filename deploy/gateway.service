@@ -1,13 +1,13 @@
 # cloud-gateway systemd 单元（部署在中转云服务器）
 # 安装：
 #   1. 把二进制放到 /usr/local/bin/gateway
-#   2. 把证书与 gateway-config.yml 放到 /etc/home-llm-gateway/
+#   2. 把证书与 gateway-config.yml 放到 /etc/edge-llm-gateway/
 #      （基于 gateway-config.example.yml 修改：证书路径、admin_token、tls、ui_dir 等）
 #   3. Web UI（可选）：本机 cd web && pnpm install && pnpm build 后，
-#      把 web/dist 整个上传到 /etc/home-llm-gateway/web/，gateway-config.yml 配 ui_dir: web
-#      （WorkingDirectory=/etc/home-llm-gateway，相对路径即可；不配 = `/` 显示构建提示页）
+#      把 web/dist 整个上传到 /etc/edge-llm-gateway/web/，gateway-config.yml 配 ui_dir: web
+#      （WorkingDirectory=/etc/edge-llm-gateway，相对路径即可；不配 = `/` 显示构建提示页）
 #   4. 建日志目录（服务以 root 运行，目录 root 所有即可）：
-#      sudo mkdir -p /var/log/home-llm-gateway
+#      sudo mkdir -p /var/log/edge-llm-gateway
 #   5. sudo cp deploy/gateway.service /etc/systemd/system/ && sudo systemctl daemon-reload \
 #      && sudo systemctl enable --now gateway
 [Unit]
@@ -18,9 +18,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 # 工作目录 = 配置目录：ui_dir / keys.db 等相对路径都以此为准
-WorkingDirectory=/etc/home-llm-gateway
-# 所有参数都在 /etc/home-llm-gateway/gateway-config.yml 中配置（见 gateway-config.example.yml）
-ExecStart=/usr/local/bin/gateway --config /etc/home-llm-gateway/gateway-config.yml
+WorkingDirectory=/etc/edge-llm-gateway
+# 所有参数都在 /etc/edge-llm-gateway/gateway-config.yml 中配置（见 gateway-config.example.yml）
+ExecStart=/usr/local/bin/gateway --config /etc/edge-llm-gateway/gateway-config.yml
 Restart=on-failure
 RestartSec=3
 # 关闭序列：停 accept（不再接新请求）→ 等在途请求收尾（`shutdown_grace_secs`，默认 15s）
@@ -29,11 +29,11 @@ RestartSec=3
 # 否则还没走完就被 SIGKILL——超时就白设了。
 #     TimeoutStopSec=60
 # 日志落盘（追加，重启不丢）。stdout/stderr 不再进 journald；
-# 查看：tail -f /var/log/home-llm-gateway/gateway.log
+# 查看：tail -f /var/log/edge-llm-gateway/gateway.log
 # 建议配 logrotate 轮转（见 deploy/logrotate.example 或自行 crontab）。
 # 想保留 journald 双写可去掉以下两行（默认回 journald）。
-StandardOutput=append:/var/log/home-llm-gateway/gateway.log
-StandardError=append:/var/log/home-llm-gateway/gateway.log
+StandardOutput=append:/var/log/edge-llm-gateway/gateway.log
+StandardError=append:/var/log/edge-llm-gateway/gateway.log
 
 # 内存：默认**不设上限**。想让网关超限时只杀自己（而不是触发整机 OOM 把别的进程一起
 # 带走），把 MemoryMax 改成具体值，例如 1G（低于实测的 ~1.09GB 死亡水位）：

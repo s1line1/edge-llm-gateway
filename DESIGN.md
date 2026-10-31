@@ -534,7 +534,7 @@ INFO gateway::nofile: raised NOFILE soft limit from=1024 to=16384 hard=524288 ta
 ## 附：工作区规划（后续实现）
 
 ```
-home-llm-gateway/
+edge-llm-gateway/
 ├── Cargo.toml            # workspace
 ├── DESIGN.md             # 本文档
 ├── crates/

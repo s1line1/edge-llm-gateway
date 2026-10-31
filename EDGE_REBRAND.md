@@ -1,4 +1,4 @@
-# home-llm-gateway — Edge 定位术语统一方案（2026-09 定稿）
+# edge-llm-gateway — Edge 定位术语统一方案（2026-09 定稿）
 
 > 项目定位已从"家庭网关"升级为 **Edge LLM 网关**（家庭是首个实例，见 MODEL_ROUTING.md）。
 > 代码与文档中仍残留"家庭 / 家里 / 家端 / home-*"术语，本方案统一为 edge 语义。
@@ -48,7 +48,7 @@
 
 | 文件 | 处数 | 说明 |
 |---|---|---|
-| `DEPLOY.md` | ~21 | 部署心智"家庭"→"edge 节点（家庭是其一）"；路径 `/etc/home-llm-gateway/` 保留不改 |
+| `DEPLOY.md` | ~21 | 部署心智"家庭"→"edge 节点（家庭是其一）"；路径 `/etc/edge-llm-gateway/` 保留不改 |
 | `DESIGN.md` | ~14 | 与 §1 已改的定位呼应，正文举例统一 |
 | `README.md` | ~11 | 已改过头部，正文/多 agent 段残留补完 |
 | `README.en.md` | ~6 | 同步英文 |
@@ -60,11 +60,11 @@
 
 ## 3. 明确不改（部署/观测锚点，防破坏）
 
-- git remote 与 GitHub 仓库名 `home-llm-gateway`
+- git remote 与 GitHub 仓库名 `edge-llm-gateway`
 - 本地工作目录名
-- `dist/` 打包产物名 `home-llm-gateway-*.tar.gz`（0.2.0 发布时可一并评估）
+- `dist/` 打包产物名 `edge-llm-gateway-*.tar.gz`（0.2.0 发布时可一并评估）
 - metrics 前缀 `hlmg_*`（Prometheus 断档）
-- `/etc/home-llm-gateway/` systemd 部署目录
+- `/etc/edge-llm-gateway/` systemd 部署目录
 - 用户真实配置 `agent_id: home-2`（标识符）
 
 ## 4. 影响与验证

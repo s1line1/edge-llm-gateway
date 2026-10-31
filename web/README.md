@@ -1,4 +1,4 @@
-# home-llm-gateway Web UI
+# edge-llm-gateway Web UI
 
 cloud-gateway 的 React 管理界面（TypeScript + React 19 + Vite + Tailwind CSS v4），
 覆盖 API Key 管理、agent 在线状态、Prometheus 指标可视化。

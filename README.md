@@ -1,11 +1,16 @@
 <p align="center"><b>中文</b> | <a href="README.en.md">English</a></p>
 
-# home-llm-gateway
+# edge-llm-gateway
+
+> **仓库更名说明**：本项目原名为 `home-llm-gateway`，现更名为 `edge-llm-gateway`。
+> 旧的 GitHub 地址会自动重定向。配置文件、systemd/Docker 示例和部署路径也已统一为
+> `/etc/edge-llm-gateway` 与 `/usr/local/share/edge-llm-gateway`；已有安装升级时，请先把旧目录
+> 迁移到新路径，或保留旧目录并同步调整实际部署配置。
 
 **一个 Rust 实现的边缘 LLM 网关：把内网/家庭网络里的本地模型，安全地暴露成公网上的 OpenAI 兼容 API。**
 
 <p align="center">
-  <img src="home-llm-gateway-architecture.svg" alt="架构：调用方 → cloud-gateway（公网）→ QUIC 隧道 → edge-agent（内网）→ 本地 LLM" width="100%">
+  <img src="edge-llm-gateway-architecture.svg" alt="架构：调用方 → cloud-gateway（公网）→ QUIC 隧道 → edge-agent（内网）→ 本地 LLM" width="100%">
 </p>
 
 它解决的是一个具体的网络问题：模型跑在家里或内网的机器上（NAT 后、动态 IP、没有公网入口），而你希望在
@@ -144,7 +149,7 @@ agent 只做一件事：把隧道里收到的请求帧，变成一次对本地 L
 **前置**：Rust 1.97+（工具链版本见 `rust-toolchain.toml`）、`openssl` 命令行、`pnpm`（仅 Dashboard 需要）。
 
 ```bash
-git clone <repo> && cd home-llm-gateway
+git clone <repo> && cd edge-llm-gateway
 
 make setup     # 安装前端依赖（开发证书脚本仍保留，但 Gateway 启动不再加载固定证书）
 make dev       # 编译 debug 二进制，一键起 mock-llm + gateway + agent
@@ -413,7 +418,7 @@ gateway-config.example.yml / agent-config.example.yml   两份配置模板（含
 deny.toml       cargo-deny 策略（依赖许可证 / 公告）
 ```
 
-> README 里引用的架构图是仓库根目录的 `home-llm-gateway-architecture.svg`（**已进版本库**）。
+> README 里引用的架构图是仓库根目录的 `edge-llm-gateway-architecture.svg`（**已进版本库**）。
 > `diagrams/` 下有更细的多语言版（组件图 / 架构图 × 中英），但该目录被 `.gitignore` 排除、
 > **不在仓库里**——所以文档不能引用它（否则克隆下来是坏图）。需要引用时先把它加进版本库。
 

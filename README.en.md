@@ -1,11 +1,16 @@
 <p align="center"><a href="README.md">中文</a> | <b>English</b></p>
 
-# home-llm-gateway
+# edge-llm-gateway
+
+> **Repository rename**: this project was formerly `home-llm-gateway` and is now
+> `edge-llm-gateway`. Old GitHub URLs redirect automatically. Config files, systemd/Docker examples,
+> and deployment paths now use `/etc/edge-llm-gateway` and `/usr/local/share/edge-llm-gateway`.
+> Existing installs must migrate the old directories or keep them and align their deployment config.
 
 **An edge LLM gateway in Rust: it exposes local models running behind NAT on your home or office network as an OpenAI-compatible API on the public Internet.**
 
 <p align="center">
-  <img src="home-llm-gateway-architecture.svg" alt="Architecture: callers → cloud-gateway (public) → QUIC tunnel → edge-agent (private) → local LLM" width="100%">
+  <img src="edge-llm-gateway-architecture.svg" alt="Architecture: callers → cloud-gateway (public) → QUIC tunnel → edge-agent (private) → local LLM" width="100%">
 </p>
 
 It solves one specific networking problem: the model runs on a machine behind NAT (dynamic IP, no inbound
@@ -166,7 +171,7 @@ Everything runs locally, **no real model required** (`mock-llm` stands in for th
 `pnpm` (only for the dashboard).
 
 ```bash
-git clone <repo> && cd home-llm-gateway
+git clone <repo> && cd edge-llm-gateway
 
 make setup     # install frontend deps (the dev certificate script remains, but startup no longer loads fixed certificates)
 make dev       # build debug binaries, then bring up mock-llm + gateway + agent
@@ -465,7 +470,7 @@ deny.toml       cargo-deny policy (dependency licenses / advisories)
 ```
 
 > The architecture diagram referenced above lives at the repository root
-> (`home-llm-gateway-architecture.svg`) and **is tracked**. `diagrams/` holds more detailed
+> (`edge-llm-gateway-architecture.svg`) and **is tracked**. `diagrams/` holds more detailed
 > multi-language versions (component and architecture diagrams), but that directory is
 > `.gitignore`d and **is not in the repository** — documentation must not reference it, or a
 > fresh clone shows a broken image.

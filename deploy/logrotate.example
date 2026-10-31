@@ -1,10 +1,10 @@
-# logrotate 配置示例：轮转 home-llm-gateway 日志
+# logrotate 配置示例：轮转 edge-llm-gateway 日志
 # 安装：
-#   sudo cp deploy/logrotate.example /etc/logrotate.d/home-llm-gateway
+#   sudo cp deploy/logrotate.example /etc/logrotate.d/edge-llm-gateway
 # （路径与 deploy/*.service 中的 StandardOutput/StandardError 一致；
 #   按天轮转、保留 7 份、压缩旧档）
 
-/var/log/home-llm-gateway/*.log {
+/var/log/edge-llm-gateway/*.log {
     daily
     rotate 7
     compress
