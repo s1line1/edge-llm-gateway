@@ -117,13 +117,20 @@ cargo build --release            # 产出 target/release/{gateway,agent,mock-llm
 
 ### 方案 B：发布流水线 / 本机打包
 
-打 tag 即产出正式交付物（`.github/workflows/release.yml`）：三个平台在**各自的 native runner** 上
+**先合并、后打 tag 才发版**（`.github/workflows/release.yml`）：三个平台在**各自的 native runner** 上
 构建（ubuntu-24.04 → x86_64 Linux、ubuntu-24.04-arm → aarch64 Linux、macos-14 → arm64 macOS），
 先过 `fmt + clippy + nextest` 门槛，产物再验一遍静态性，最后附到 GitHub Release。
 
 ```bash
-git tag v0.1.3 && git push origin v0.1.3   # tag 版本必须与 Cargo.toml 一致，否则流水线直接失败
+# 1) 发版前把 Cargo.toml 的 [workspace.package] version 升到新版本（tag 必须与它一致）
+# 2) 开 PR → CI 绿 → merge 进 main
+# 3) 在 main 上打 tag 并推送 —— 这一步才触发流水线：
+git checkout main && git pull
+git tag v0.1.5 && git push origin v0.1.5
 ```
+
+> 流水线会校验 **tag 指向的提交已在 `main` 里**（`git merge-base --is-ancestor`）：在 feature 分支上
+> 打的 tag 会直接失败，所以"先 merge 后打 tag"是强制的，不是约定。
 
 本机只出某个平台：
 
