@@ -1,6 +1,8 @@
 name: Release
 
-# 交付流水线：打 tag（`v*`）时在**原生 runner** 上构建并发布多平台产物；
+# 交付流水线：**打 tag（`v*`）**时在**原生 runner** 上构建并发布多平台产物。
+# tag 必须打在 main 上：meta job 会用 `git merge-base --is-ancestor` 校验 tag 指向的提交
+# 是否已在 main 里，不在就直接失败（"先 merge 到 main、再打 tag"由流水线强制，不靠自觉）。
 # workflow_dispatch 用来演练（只产出 run artifacts，不建 Release）。
 #
 # 为什么用原生 runner 而不是交叉工具链：
@@ -39,6 +41,10 @@ jobs:
       channel: ${{ steps.meta.outputs.channel }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 要判断"这个 tag 的提交是否已在 main 里"，merge-base 需要历史；浅克隆会让
+          # 所有历史看起来都不存在（同一个坑在 ci.yml 的 check-records 上也踩过）。
+          fetch-depth: 0
 
       - name: Read version and pinned toolchain
         id: meta
@@ -66,6 +72,18 @@ jobs:
           echo "version=$version" >>"$GITHUB_OUTPUT"
           echo "channel=$channel" >>"$GITHUB_OUTPUT"
 
+          # 发版前先确认"这个 tag 打在 main 上"：只有已经合并进 main 的提交才允许发版。
+          # 用 merge-base 而不是比对 SHA：tag 可以打在 main 的任意**历史**提交上（补发旧版本），
+          # 只要是 main 的祖先就放行；打在 feature 分支上则一定不是祖先，会被挡下。
+          # 演练（workflow_dispatch）不校验——它不发 Release，允许在任意分支上试跑。
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            git fetch --no-tags origin main:refs/remotes/origin/main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "tag ${GITHUB_REF_NAME:-?} 指向的提交 $GITHUB_SHA 不在 main 上：请先 merge 到 main 再打 tag"
+              exit 1
+            fi
+          fi
+
   gate:
     name: Gate (fmt + clippy + test)
     needs: meta
@@ -83,8 +101,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # tag 推送不会触发 ci.yml（它只监听 feature_* 分支与指向 main 的 PR），
-      # 所以发布前的基本门槛在这里补上：不通过就不产出任何交付物。
+      # tag 推送不会触发 ci.yml（它只监听指向 main 的 PR），所以在发布前把基本门槛
+      # 在这里再补一遍：不通过就不产出任何交付物。
       - name: Format check
         run: cargo fmt --check
 
@@ -202,6 +220,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
+    # 只有 tag 事件会发版（workflow_dispatch 只演练，产物留在 run artifacts 里）。
     if: github.ref_type == 'tag'
     needs: [meta, build]
     runs-on: ubuntu-24.04
@@ -237,7 +256,19 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # tag 已经存在（是本 workflow 的触发器），不用 action 再建；直接用 runs 的 tag。
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
           generate_release_notes: true
+
+# ── 发布流程（先 merge、后打 tag）──────────────────────────────────────
+# 1. 在 feature 分支把 `Cargo.toml` 的 `[workspace.package] version` 升到新版本
+#    （tag 与 Cargo.toml 不一致时 meta 会直接失败，避免"文件名说 0.1.5、二进制说 0.1.4"）。
+# 2. 开 PR → CI 绿 → merge 进 main。
+# 3. 在 main 上打 tag 并推送：`git checkout main && git pull && git tag v0.1.5 && git push origin v0.1.5`。
+#    流水线会先校验这个 tag 的提交**已在 main 里**（merge-base 祖先判断），否则直接失败。
+# 4. 需要重发同一版本：先删 Release 与 tag（`git push --delete origin v0.1.5`），再重新打 tag。
+#
+# 为什么不在 tag 上做"是否已发布"的幂等判断：同一个 tag 名不能重复推送（除非 force，
+# 那本身就意味着重新发布），所以 tag 驱动天然一版一次；幂等只需防"tag 打错分支"，即第 3 步。
