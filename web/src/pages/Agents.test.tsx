@@ -16,7 +16,7 @@ const mocks = vi.hoisted(() => ({ fetchAgents: vi.fn() }));
 vi.mock("../api/client", () => ({
   fetchAgents: mocks.fetchAgents,
   scopeForRole: (role: string) =>
-      role === "user" ? "account" : role === "tenant_admin" ? "admin" : "system",
+    role === "user" ? "account" : role === "tenant_admin" ? "admin" : "system",
 }));
 
 vi.mock("../hooks/useMetricsHistory", () => ({

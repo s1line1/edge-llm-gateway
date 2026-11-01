@@ -173,10 +173,7 @@ export async function createKey(
   return expectObject<CreatedKey>(await handle<unknown>(resp), `POST /${scope}/keys`);
 }
 
-export async function listUsage(
-  scope: ApiScope,
-  tenantId?: string | null,
-): Promise<UsageRecord[]> {
+export async function listUsage(scope: ApiScope, tenantId?: string | null): Promise<UsageRecord[]> {
   const resp = await apiFetch(`${scopeBase(scope)}/usage${adminQuery(tenantId)}`);
   return expectArray<UsageRecord>(await handle<unknown>(resp), `GET /${scope}/usage`);
 }
@@ -252,10 +249,7 @@ export async function rotateAgentToken(
   );
 }
 
-export async function listUsers(
-  scope: ApiScope,
-  tenantId?: string | null,
-): Promise<AdminUser[]> {
+export async function listUsers(scope: ApiScope, tenantId?: string | null): Promise<AdminUser[]> {
   const resp = await apiFetch(`${scopeBase(scope)}/users${adminQuery(tenantId)}`);
   return expectArray<AdminUser>(await handle<unknown>(resp), `GET /${scope}/users`);
 }
@@ -302,10 +296,7 @@ export async function deleteUser(scope: ApiScope, id: string): Promise<void> {
   await handle<void>(resp);
 }
 
-export async function listAudit(
-  scope: ApiScope,
-  tenantId?: string | null,
-): Promise<AuditRecord[]> {
+export async function listAudit(scope: ApiScope, tenantId?: string | null): Promise<AuditRecord[]> {
   const resp = await apiFetch(`${scopeBase(scope)}/audit${adminQuery(tenantId)}`);
   return expectArray<AuditRecord>(await handle<unknown>(resp), `GET /${scope}/audit`);
 }
@@ -315,18 +306,12 @@ export async function fetchPkiStatus(scope: ApiScope): Promise<PkiStatus> {
   return expectObject<PkiStatus>(await handle<unknown>(resp), `GET /${scope}/pki/status`);
 }
 
-export async function listPkiPairs(
-  scope: ApiScope,
-  tenantId?: string | null,
-): Promise<PkiPair[]> {
+export async function listPkiPairs(scope: ApiScope, tenantId?: string | null): Promise<PkiPair[]> {
   const resp = await apiFetch(`${scopeBase(scope)}/pki/pairs${adminQuery(tenantId)}`);
   return expectArray<PkiPair>(await handle<unknown>(resp), `GET /${scope}/pki/pairs`);
 }
 
-export async function createPkiPair(
-  scope: ApiScope,
-  body: CreatePkiPairBody,
-): Promise<PkiPair> {
+export async function createPkiPair(scope: ApiScope, body: CreatePkiPairBody): Promise<PkiPair> {
   const resp = await apiFetch(`${scopeBase(scope)}/pki/pairs`, {
     method: "POST",
     body: JSON.stringify(body),
