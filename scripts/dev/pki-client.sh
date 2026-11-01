@@ -9,7 +9,7 @@ admin_token="${DEV_ADMIN_TOKEN:-dev-admin}"
 
 mkdir -p "$out" .tmp
 name="dev-$(date +%s)"
-server_name="${name}.localhost"
+server_name="default.${name}.localhost"
 
 created="$(curl -fsS \
   -H "Authorization: Bearer ${admin_token}" \

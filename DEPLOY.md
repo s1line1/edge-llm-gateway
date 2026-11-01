@@ -50,6 +50,13 @@ pki:
    - 名称，例如 `gateway-1`
    - **server_name**，必须是 DNS 名，且客户端会用同一个名字做 SNI，例如
      `gateway.example.com`
+   - **不同 tenant 必须使用不同 SNI**，例如
+     `tenant-a.gateway.example.com`、`tenant-b.gateway.example.com`。同一个
+     `server_name` 在所有 tenant 范围内全局唯一；在旧 pair 吊销前不能复用。
+   - Dashboard 的 SNI 输入框会固定显示 tenant 前缀；你只需要填写后缀
+     `gateway.example.com`，最终提交值为 `tenant-a.gateway.example.com`。
+   - 直接调用 Admin API 时，`server_name` 也必须以 `<tenant-name>.` 开头；
+     没有 `tenant_id`、tenant 不存在、或缺少该前缀都会返回 `400`。
    - 额外 SAN（可选；若客户端还要按 IP 校验证书，可填公网 IP）
 4. 服务器自动生成并立即加载：
    - 该 pair 专属 CA
@@ -71,6 +78,11 @@ pki:
 > **持久化**：`pki.dir` 必须在持久卷上。容器部署要挂载
 > `/etc/edge-llm-gateway`（含 `pki/` 和 `keys.db`）；目录丢失会导致启动加载 active pair 失败，
 > 不会静默重新生成。
+
+> **SNI 冲突修复**：如果升级后启动报 `duplicate active PKI server_name`，说明旧库里有多条未
+> revoked 的同 SNI 记录。先备份 `keys.db` 与 `pki/pairs/`，确认要保留的 pair，然后通过
+> `POST /system/pki/pairs/{id}/revoke` 吊销其余记录；不要直接删除证书文件。也可以在有备份的
+> 前提下手工把多余记录的 `revoked_at` 设为当前时间。网关不会自动选择 winner。
 
 ## 2. 安全组 + 防火墙
 

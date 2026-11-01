@@ -192,3 +192,155 @@ async fn blocking_adapter_handles_concurrent_creates_and_one_time_downloads() {
     assert!(matches!(second, Err(PkiError::DownloadConsumed)));
     let _ = b;
 }
+
+#[test]
+fn same_server_name_across_tenants_conflicts() {
+    let dir = tempdir().unwrap();
+    let service = PkiService::new(
+        config(dir.path()),
+        Storage::new(Some(dir.path().join("keys.db"))),
+    )
+    .unwrap();
+    let first = service
+        .create_pair(
+            "a",
+            "tenant-a",
+            "same.example.com",
+            &["same.example.com".into()],
+            "admin",
+            "Test CA",
+        )
+        .unwrap();
+    let err = service
+        .create_pair(
+            "b",
+            "tenant-b",
+            "same.example.com",
+            &["same.example.com".into()],
+            "admin",
+            "Test CA",
+        )
+        .unwrap_err();
+    assert!(matches!(err, PkiError::Conflict(_)), "got {err:?}");
+    assert!(err.to_string().contains("same.example.com"));
+    assert_eq!(service.active_records().unwrap().len(), 1);
+    assert_eq!(service.resolved_pair_id("same.example.com"), Some(first.id));
+}
+
+#[test]
+fn concurrent_same_server_name_creates_one_pair() {
+    let dir = tempdir().unwrap();
+    let service = std::sync::Arc::new(
+        PkiService::new(
+            config(dir.path()),
+            Storage::new(Some(dir.path().join("keys.db"))),
+        )
+        .unwrap(),
+    );
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let results = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for i in 0..2 {
+            let service = service.clone();
+            let barrier = barrier.clone();
+            handles.push(scope.spawn(move || {
+                barrier.wait();
+                service.create_pair(
+                    &format!("pair-{i}"),
+                    &format!("tenant-{i}"),
+                    "race.example.com",
+                    &["race.example.com".into()],
+                    "admin",
+                    "Test CA",
+                )
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(PkiError::Conflict(_))))
+            .count(),
+        1
+    );
+    assert_eq!(service.active_records().unwrap().len(), 1);
+    let pair_dirs = std::fs::read_dir(dir.path().join("pki/pairs"))
+        .unwrap()
+        .count();
+    assert_eq!(pair_dirs, 1, "failed create must remove its pair directory");
+    assert_eq!(
+        service.resolved_pair_id("race.example.com"),
+        Some(service.active_records().unwrap()[0].id.clone())
+    );
+}
+
+#[test]
+fn revoke_then_reuse_server_name_resolves_new_pair() {
+    let dir = tempdir().unwrap();
+    let service = PkiService::new(
+        config(dir.path()),
+        Storage::new(Some(dir.path().join("keys.db"))),
+    )
+    .unwrap();
+    let first = service
+        .create_pair(
+            "first",
+            "tenant-a",
+            "reuse.example.com",
+            &["reuse.example.com".into()],
+            "admin",
+            "Test CA",
+        )
+        .unwrap();
+    service.revoke(&first.id).unwrap();
+    let second = service
+        .create_pair(
+            "second",
+            "tenant-b",
+            "reuse.example.com",
+            &["reuse.example.com".into()],
+            "admin",
+            "Test CA",
+        )
+        .unwrap();
+    assert_eq!(
+        service.resolved_pair_id("reuse.example.com"),
+        Some(second.id)
+    );
+}
+
+#[test]
+fn duplicate_active_rows_fail_startup_with_pair_ids() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("keys.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pki_credentials (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                server_name TEXT NOT NULL, ca_fingerprint_sha256 TEXT NOT NULL,
+                server_fingerprint_sha256 TEXT NOT NULL, client_fingerprint_sha256 TEXT NOT NULL,
+                serial TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL,
+                created_by TEXT NOT NULL, downloaded_at INTEGER, last_connected_at INTEGER,
+                revoked_at INTEGER, client_not_after INTEGER NOT NULL
+            );
+            INSERT INTO pki_credentials VALUES
+                ('a','a','tenant-a','dup.example.com','ca','srv','cli','s','waiting',1,'x',NULL,NULL,NULL,9999999999),
+                ('b','b','tenant-b','dup.example.com','ca','srv','cli','s','waiting',1,'x',NULL,NULL,NULL,9999999999);",
+        )
+        .unwrap();
+    }
+    let store = Storage::new(Some(path));
+    let err = match PkiService::new(config(dir.path()), store) {
+        Ok(_) => panic!("duplicate active SNI must fail startup"),
+        Err(err) => err,
+    };
+    let text = err.to_string();
+    assert!(text.contains("dup.example.com"), "{text}");
+    assert!(text.contains('a') && text.contains('b'), "{text}");
+}

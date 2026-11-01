@@ -374,3 +374,155 @@ fn all_aggregates_reload_after_restart() {
         .iter()
         .any(|a| a.action() == "test.restart"));
 }
+
+fn pki_record(
+    id: &str,
+    tenant_id: &str,
+    server_name: &str,
+    revoked_at: Option<i64>,
+    client_not_after: i64,
+) -> PkiRecord {
+    PkiRecord {
+        id: id.into(),
+        name: id.into(),
+        tenant_id: tenant_id.into(),
+        server_name: server_name.into(),
+        ca_fingerprint_sha256: format!("ca-{id}"),
+        server_fingerprint_sha256: format!("srv-{id}"),
+        client_fingerprint_sha256: format!("cli-{id}"),
+        serial: format!("serial-{id}"),
+        status: if revoked_at.is_some() {
+            "revoked"
+        } else {
+            "waiting"
+        }
+        .into(),
+        created_at: 1,
+        created_by: "test".into(),
+        downloaded_at: None,
+        last_connected_at: None,
+        revoked_at,
+        client_not_after,
+    }
+}
+
+#[test]
+fn duplicate_active_pki_server_name_is_rejected() {
+    let dir = tempdir().unwrap();
+    let store = Storage::new(Some(dir.path().join("keys.db")));
+    store
+        .insert_pki_record(&pki_record(
+            "a",
+            "tenant-a",
+            "same.example.com",
+            None,
+            9999999999,
+        ))
+        .unwrap();
+    let second = store.insert_pki_record(&pki_record(
+        "b",
+        "tenant-b",
+        "same.example.com",
+        None,
+        9999999999,
+    ));
+    assert!(second.is_err(), "active duplicate SNI must be rejected");
+    assert_eq!(store.pki_records(None).unwrap().len(), 1);
+}
+
+#[test]
+fn revoked_pki_server_name_can_be_reused() {
+    let dir = tempdir().unwrap();
+    let store = Storage::new(Some(dir.path().join("keys.db")));
+    store
+        .insert_pki_record(&pki_record(
+            "a",
+            "tenant-a",
+            "reuse.example.com",
+            None,
+            9999999999,
+        ))
+        .unwrap();
+    assert!(store.revoke_pki_record("a", 2).unwrap());
+    store
+        .insert_pki_record(&pki_record(
+            "b",
+            "tenant-b",
+            "reuse.example.com",
+            None,
+            9999999999,
+        ))
+        .unwrap();
+    assert_eq!(store.pki_records(None).unwrap().len(), 2);
+}
+
+#[test]
+fn expired_unrevoked_pki_server_name_stays_reserved() {
+    let dir = tempdir().unwrap();
+    let store = Storage::new(Some(dir.path().join("keys.db")));
+    store
+        .insert_pki_record(&pki_record("a", "tenant-a", "expired.example.com", None, 1))
+        .unwrap();
+    let second = store.insert_pki_record(&pki_record(
+        "b",
+        "tenant-b",
+        "expired.example.com",
+        None,
+        9999999999,
+    ));
+    assert!(
+        second.is_err(),
+        "expired but unrevoked SNI must stay reserved"
+    );
+}
+
+#[test]
+fn pki_active_server_name_index_exists_after_open() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("keys.db");
+    let _store = Storage::new(Some(path.clone()));
+    let conn = Connection::open(path).unwrap();
+    let names: Vec<String> = conn
+        .prepare("PRAGMA index_list('pki_credentials')")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "pki_active_server_name_uq"),
+        "unique active-SNI index missing: {names:?}"
+    );
+}
+
+#[test]
+fn legacy_db_without_active_sni_index_gains_it_on_open() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("keys.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pki_credentials (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                server_name TEXT NOT NULL, ca_fingerprint_sha256 TEXT NOT NULL,
+                server_fingerprint_sha256 TEXT NOT NULL, client_fingerprint_sha256 TEXT NOT NULL,
+                serial TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL,
+                created_by TEXT NOT NULL, downloaded_at INTEGER, last_connected_at INTEGER,
+                revoked_at INTEGER, client_not_after INTEGER NOT NULL
+            );
+            INSERT INTO pki_credentials VALUES
+                ('a','a','tenant-a','legacy.example.com','ca','srv','cli','s','waiting',1,'x',NULL,NULL,NULL,9999999999);",
+        )
+        .unwrap();
+    }
+    let _store = Storage::new(Some(path.clone()));
+    let conn = Connection::open(path).unwrap();
+    let names: Vec<String> = conn
+        .prepare("PRAGMA index_list('pki_credentials')")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(names.iter().any(|n| n == "pki_active_server_name_uq"));
+}

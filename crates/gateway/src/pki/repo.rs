@@ -15,9 +15,17 @@ impl PkiRepository {
     }
 
     pub fn insert(&self, record: &PkiRecord) -> Result<(), PkiError> {
-        self.store
-            .insert_pki_record(record)
-            .map_err(PkiError::Storage)
+        self.store.insert_pki_record(record).map_err(|e| {
+            if e.contains("pki_active_server_name_uq")
+                || e.contains("UNIQUE constraint failed: pki_credentials.server_name")
+            {
+                PkiError::Conflict(
+                    "an active pair already uses this server_name; use a distinct SNI".into(),
+                )
+            } else {
+                PkiError::Storage(e)
+            }
+        })
     }
 
     pub fn get(&self, id: &str) -> Result<Option<PkiRecord>, PkiError> {

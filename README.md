@@ -17,7 +17,7 @@
 任何地方用标准的 OpenAI SDK 调它，同时**不把本地推理端点直接暴露到公网**。
 
 <p align="center">
-  <img alt="测试" src="https://img.shields.io/badge/tests-478%20passed-brightgreen">
+  <img alt="测试" src="https://img.shields.io/badge/tests-489%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -138,7 +138,7 @@ agent 只做一件事：把隧道里收到的请求帧，变成一次对本地 L
 - 结构化请求日志，每个请求带 `request_id`、状态码、耗时
 - 内置 React 管理面板：总览 / API Keys / Agents / 指标；Agents 支持卡片与 Orbit 径向视图
 - 界面支持跟随系统 / 浅色 / 深色主题与强调色，偏好只保存在本浏览器
-- 按需凭证管理：Gateway 启动不生成证书；需要时创建 client/server 成对凭证，server 半部分留在网关，client 半部分一次性下载
+- 按需凭证管理：Gateway 启动不生成证书；需要时创建 client/server 成对凭证，server 半部分留在网关，client 半部分一次性下载。`server_name` 在所有 tenant 范围内全局唯一（未吊销期间），不同 tenant 必须使用不同 SNI；API 要求 `server_name` 以 `<tenant-name>.` 开头
 
 ---
 
@@ -338,7 +338,7 @@ fmt · clippy -D warnings · nextest · e2e 接线 · toolchain-check · check-r
 
 `make check` 在它之外再加 `cargo deny` 与前端四项（web-format / web-lint / web-test / web-build）。
 
-> **当前规模（`cargo nextest run --workspace` 实测）**：**478 个被执行且通过的测试（0 skipped）**，其中
+> **当前规模（`cargo nextest run --workspace` 实测）**：**489 个被执行且通过的测试（0 skipped）**，其中
 > **84 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
 >
 > 两点与 `cargo test` 不同的行为要知道：**nextest 每条测试一个进程**，所以 `serial_test` 的

@@ -24,9 +24,18 @@ export function CreatePairForm({
   onCreate: (body: CreatePkiPairBody) => Promise<unknown>;
 }) {
   const [name, setName] = useState("");
-  const [serverName, setServerName] = useState("");
+  const [serverSuffix, setServerSuffix] = useState("");
   const [sans, setSans] = useState("");
   const [tenantId, setTenantId] = useState("");
+  const selectedTenant = tenants.find((tenant) => tenant.id === tenantId);
+  const tenantPrefix =
+    (isSuper ? selectedTenant?.name : currentTenantLabel)?.trim().toLowerCase() ?? "";
+  const hasTenant = !isSuper || Boolean(tenantId);
+  const prefixValid =
+    tenantPrefix.length > 0 &&
+    tenantPrefix.length <= 63 &&
+    /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(tenantPrefix);
+  const serverName = prefixValid ? `${tenantPrefix}.${serverSuffix.trim()}` : serverSuffix.trim();
 
   return (
     <form
@@ -37,14 +46,14 @@ export function CreatePairForm({
           await onCreate({
             name: name.trim(),
             tenant_id: isSuper ? tenantId : (currentTenantId ?? ""),
-            server_name: serverName.trim(),
+            server_name: serverName,
             server_sans: sans
               .split(",")
               .map((s) => s.trim())
               .filter(Boolean),
           });
           setName("");
-          setServerName("");
+          setServerSuffix("");
           setSans("");
         } catch {
           // The mutation error is rendered by the parent.
@@ -62,14 +71,27 @@ export function CreatePairForm({
         />
       </Field>
       <Field label="Server name (SNI)" htmlFor="pki-server-name">
-        <input
-          id="pki-server-name"
-          className="input"
-          value={serverName}
-          onChange={(e) => setServerName(e.target.value)}
-          placeholder="gateway.example.com"
-          autoComplete="off"
-        />
+        <div className="flex min-h-10 items-stretch">
+          <span className="flex items-center rounded-l-lg border border-r-0 border-line bg-ink-950/50 px-2.5 font-mono text-[11px] text-mist">
+            {prefixValid ? `${tenantPrefix}.` : hasTenant ? "invalid" : "选择 tenant"}
+          </span>
+          <input
+            id="pki-server-name"
+            className="input rounded-l-none"
+            value={serverSuffix}
+            onChange={(e) => setServerSuffix(e.target.value)}
+            placeholder="gateway.example.com"
+            autoComplete="off"
+          />
+        </div>
+        {!hasTenant && (
+          <p className="mt-1 text-[10px] text-mist">选择 Tenant 后自动显示固定前缀。</p>
+        )}
+        {hasTenant && !prefixValid && (
+          <p className="mt-1 text-[10px] text-coral">
+            当前 tenant 名称无法作为 DNS label；请使用小写字母、数字和连字符。
+          </p>
+        )}
       </Field>
       <Field label="额外 SAN（逗号分隔）" htmlFor="pki-sans">
         <input
@@ -104,11 +126,20 @@ export function CreatePairForm({
           </div>
         </Field>
       )}
+      <p className="text-[10px] leading-relaxed text-mist md:col-span-2 xl:col-span-4">
+        不同 tenant 必须使用不同 SNI；同一个 server_name 在凭证对吊销前全局唯一。建议使用
+        tenant-qualified 名称，例如 <code>tenant-a.gateway.example.com</code>。
+      </p>
       <div className="flex items-end md:col-span-2 xl:col-span-4">
         <Button
           type="submit"
           disabled={
-            !enabled || pending || !name.trim() || !serverName.trim() || (isSuper && !tenantId)
+            !enabled ||
+            pending ||
+            !name.trim() ||
+            !prefixValid ||
+            !serverSuffix.trim() ||
+            (isSuper && !tenantId)
           }
         >
           <Icon name="plus" size={13} />

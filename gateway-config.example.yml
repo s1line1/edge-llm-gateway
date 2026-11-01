@@ -14,6 +14,7 @@ quic_addr: "0.0.0.0:4433"
 
 # 按需凭证管理（PKI）。启动时不生成 CA/证书；没有凭证时 QUIC 入口拒绝所有握手，
 # 管理员在 Dashboard 的 Certificates 页面创建 client/server 成对凭证。
+# server_name 在所有 tenant 范围内全局唯一（未吊销期间）；不同 tenant 必须使用不同 SNI。
 pki:
   enabled: true
   dir: /etc/edge-llm-gateway/pki

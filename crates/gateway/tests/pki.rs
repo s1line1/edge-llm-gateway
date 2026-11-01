@@ -60,8 +60,8 @@ async fn starts_with_zero_credentials_and_creates_a_pair_on_demand() {
         .json(&serde_json::json!({
             "name": "laptop-1",
             "tenant_id": "default",
-            "server_name": "gateway.example.com",
-            "server_sans": ["gateway.example.com"]
+            "server_name": "default.gateway.example.com",
+            "server_sans": ["default.gateway.example.com"]
         }))
         .send()
         .await
@@ -148,7 +148,7 @@ async fn active_pairs_are_reloaded_on_restart_without_new_generation() {
         .json(&serde_json::json!({
             "name": "laptop-1",
             "tenant_id": "default",
-            "server_name": "gateway.example.com"
+            "server_name": "default.gateway.example.com"
         }))
         .send()
         .await
@@ -257,7 +257,7 @@ async fn downloaded_client_bundle_completes_mtls_and_marks_connected() {
         .json(&serde_json::json!({
             "name": "laptop-1",
             "tenant_id": "default",
-            "server_name": "gateway.example.com"
+            "server_name": "default.gateway.example.com"
         }))
         .send()
         .await
@@ -275,7 +275,7 @@ async fn downloaded_client_bundle_completes_mtls_and_marks_connected() {
         .bytes()
         .await
         .unwrap();
-    let _conn = connect_with_bundle(gw.quic_addr, "gateway.example.com", &bundle).await;
+    let _conn = connect_with_bundle(gw.quic_addr, "default.gateway.example.com", &bundle).await;
     let mut connected = false;
     for _ in 0..40 {
         let list: serde_json::Value = client
@@ -341,19 +341,19 @@ async fn pair_a_client_cannot_validate_pair_b_and_revoke_blocks_new_handshakes()
         .unwrap();
     let base = format!("http://{}", gw.http_addr);
     let client = reqwest::Client::new();
-    let a = create_pair(&base, &client, "pair-a", "a.example.com").await;
-    let b = create_pair(&base, &client, "pair-b", "b.example.com").await;
+    let a = create_pair(&base, &client, "pair-a", "default.a.example.com").await;
+    let b = create_pair(&base, &client, "pair-b", "default.b.example.com").await;
     let a_bundle = download(&base, &client, a["id"].as_str().unwrap()).await;
     let b_bundle = download(&base, &client, b["id"].as_str().unwrap()).await;
 
-    let _a_conn = connect_with_bundle(gw.quic_addr, "a.example.com", &a_bundle).await;
+    let _a_conn = connect_with_bundle(gw.quic_addr, "default.a.example.com", &a_bundle).await;
     assert!(
-        try_connect_with_bundle(gw.quic_addr, "b.example.com", &a_bundle)
+        try_connect_with_bundle(gw.quic_addr, "default.b.example.com", &a_bundle)
             .await
             .is_err(),
         "pair A client must not validate pair B server certificate"
     );
-    let _b_conn = connect_with_bundle(gw.quic_addr, "b.example.com", &b_bundle).await;
+    let _b_conn = connect_with_bundle(gw.quic_addr, "default.b.example.com", &b_bundle).await;
 
     client
         .post(format!(
@@ -365,7 +365,7 @@ async fn pair_a_client_cannot_validate_pair_b_and_revoke_blocks_new_handshakes()
         .await
         .unwrap();
     assert!(
-        try_connect_with_bundle(gw.quic_addr, "a.example.com", &a_bundle)
+        try_connect_with_bundle(gw.quic_addr, "default.a.example.com", &a_bundle)
             .await
             .is_err(),
         "revoked pair must reject new handshakes"
@@ -384,7 +384,7 @@ async fn https_gate_blocks_plain_downloads_when_required() {
         .unwrap();
     let base = format!("http://{}", gw.http_addr);
     let client = reqwest::Client::new();
-    let pair = create_pair(&base, &client, "pair-a", "a.example.com").await;
+    let pair = create_pair(&base, &client, "pair-a", "default.a.example.com").await;
     let id = pair["id"].as_str().unwrap();
     let plain = client
         .get(format!("{base}/system/pki/pairs/{id}/download"))
@@ -401,5 +401,165 @@ async fn https_gate_blocks_plain_downloads_when_required() {
         .await
         .unwrap();
     assert_eq!(proxied.status(), reqwest::StatusCode::OK);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn server_name_must_start_with_the_tenant_prefix() {
+    let dir = tempdir().unwrap();
+    let keys = dir.path().join("keys.db");
+    let gw = Gateway::start(GatewayConfig::pki(pki_config(dir.path()), options(keys)))
+        .await
+        .unwrap();
+    let base = format!("http://{}", gw.http_addr);
+    let client = reqwest::Client::new();
+    let create_tenant = |name: &str| {
+        let client = client.clone();
+        let base = base.clone();
+        let name = name.to_string();
+        async move {
+            let value: serde_json::Value = client
+                .post(format!("{base}/system/tenants"))
+                .bearer_auth("dev-admin")
+                .json(&serde_json::json!({ "name": name }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            value["id"].as_str().unwrap().to_string()
+        }
+    };
+    let tenant_a = create_tenant("tenant-a").await;
+    let tenant_b = create_tenant("tenant-b").await;
+
+    let no_tenant = client
+        .post(format!("{base}/system/pki/pairs"))
+        .bearer_auth("dev-admin")
+        .json(&serde_json::json!({
+            "name": "no-tenant",
+            "server_name": "default.no-tenant.example.com",
+            "server_sans": ["default.no-tenant.example.com"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_tenant.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let missing_prefix = client
+        .post(format!("{base}/system/pki/pairs"))
+        .bearer_auth("dev-admin")
+        .json(&serde_json::json!({
+            "name": "missing-prefix",
+            "tenant_id": tenant_a,
+            "server_name": "same.example.com",
+            "server_sans": ["same.example.com"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_prefix.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = missing_prefix.text().await.unwrap();
+    assert!(body.contains("tenant prefix"));
+    assert!(!body.contains("PRIVATE KEY"));
+    assert!(!body.contains("BEGIN CERTIFICATE"));
+
+    let first = client
+        .post(format!("{base}/system/pki/pairs"))
+        .bearer_auth("dev-admin")
+        .json(&serde_json::json!({
+            "name": "tenant-a-pair",
+            "tenant_id": tenant_a,
+            "server_name": "tenant-a.same.example.com",
+            "server_sans": ["tenant-a.same.example.com"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::CREATED);
+
+    let wrong_tenant_prefix = client
+        .post(format!("{base}/system/pki/pairs"))
+        .bearer_auth("dev-admin")
+        .json(&serde_json::json!({
+            "name": "tenant-b-pair",
+            "tenant_id": tenant_b,
+            "server_name": "tenant-a.same.example.com",
+            "server_sans": ["tenant-a.same.example.com"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong_tenant_prefix.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn revoke_then_reuse_server_name_resolves_a_new_certificate() {
+    let dir = tempdir().unwrap();
+    let keys = dir.path().join("keys.db");
+    let gw = Gateway::start(GatewayConfig::pki(pki_config(dir.path()), options(keys)))
+        .await
+        .unwrap();
+    let base = format!("http://{}", gw.http_addr);
+    let client = reqwest::Client::new();
+    let make = |name: &str| {
+        let client = client.clone();
+        let base = base.clone();
+        let name = name.to_string();
+        async move {
+            client
+                .post(format!("{base}/system/pki/pairs"))
+                .bearer_auth("dev-admin")
+                .json(&serde_json::json!({
+                    "name": name,
+                    "tenant_id": "default",
+                    "server_name": "default.reuse.example.com",
+                    "server_sans": ["default.reuse.example.com"]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let first = make("first").await;
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let first_cert =
+        std::fs::read(dir.path().join(format!("pki/pairs/{first_id}/server.crt"))).unwrap();
+    let first_download = client
+        .get(format!("{base}/system/pki/pairs/{first_id}/download"))
+        .bearer_auth("dev-admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_download.status(), reqwest::StatusCode::OK);
+
+    let revoke = client
+        .post(format!("{base}/system/pki/pairs/{first_id}/revoke"))
+        .bearer_auth("dev-admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let second = make("second").await;
+    let second_id = second["id"].as_str().unwrap();
+    let second_cert =
+        std::fs::read(dir.path().join(format!("pki/pairs/{second_id}/server.crt"))).unwrap();
+    assert_ne!(first_cert, second_cert);
+    let second_download = client
+        .get(format!("{base}/system/pki/pairs/{second_id}/download"))
+        .bearer_auth("dev-admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second_download.status(), reqwest::StatusCode::OK);
     gw.shutdown().await;
 }

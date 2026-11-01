@@ -108,7 +108,7 @@ pub async fn start_pki_gateway(tune: impl FnOnce(&mut Options)) -> TestPkiGatewa
 
     let base = format!("http://{}", gw.http_addr);
     let client = test_client();
-    let server_name = "pki-e2e.localhost";
+    let server_name = "default.pki-e2e.localhost";
     let created: serde_json::Value = client
         .post(format!("{base}/system/pki/pairs"))
         .bearer_auth("admin-token")

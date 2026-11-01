@@ -73,6 +73,44 @@ pub(crate) async fn list(
     }
 }
 
+fn is_dns_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+}
+
+fn check_tenant_sni_prefix(
+    state: &AdminRuntime,
+    tenant_id: &str,
+    server_name: &str,
+) -> Option<Response> {
+    let Some(tenant) = state.store.tenant(tenant_id) else {
+        return Some(crate::openai::error_response(
+            StatusCode::BAD_REQUEST,
+            "tenant does not exist; select a valid tenant before creating a certificate",
+        ));
+    };
+    let prefix = tenant.name().trim().to_ascii_lowercase();
+    if !is_dns_label(&prefix) {
+        return Some(crate::openai::error_response(
+            StatusCode::BAD_REQUEST,
+            "tenant name is not a valid DNS label; rename the tenant to lowercase letters, digits, or hyphens",
+        ));
+    }
+    let expected = format!("{prefix}.");
+    if !server_name.to_ascii_lowercase().starts_with(&expected) {
+        return Some(crate::openai::error_response(
+            StatusCode::BAD_REQUEST,
+            format!("server_name must start with tenant prefix {expected}"),
+        ));
+    }
+    None
+}
+
 pub(crate) async fn create(
     State(state): State<AdminRuntime>,
     Extension(principal): Extension<Principal>,
@@ -87,6 +125,9 @@ pub(crate) async fn create(
         }
         Err(e) => return rbac_response(e),
     };
+    if let Some(response) = check_tenant_sni_prefix(&state, &tenant, &body.server_name) {
+        return response;
+    }
     if let Err(e) = authorize(&principal, Action::PkiWrite, Some(&tenant)) {
         return rbac_response(e);
     }
