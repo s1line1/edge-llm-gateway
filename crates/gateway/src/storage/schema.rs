@@ -89,6 +89,39 @@ CREATE INDEX IF NOT EXISTS pki_tenant_idx ON pki_credentials(tenant_id);
 CREATE INDEX IF NOT EXISTS pki_server_name_idx ON pki_credentials(server_name);
 CREATE INDEX IF NOT EXISTS pki_status_idx ON pki_credentials(status);";
 
+/// One active certificate per SNI. `revoked_at` is the authoritative release point: an expired
+/// row still reserves its server_name until an operator explicitly revokes it.
+pub(super) const PKI_ACTIVE_SERVER_NAME_INDEX: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS pki_active_server_name_uq
+     ON pki_credentials(server_name) WHERE revoked_at IS NULL";
+
+/// Fail closed on legacy databases that already contain duplicate active SNI rows, then install
+/// the partial unique index. We must not pick a winner: choosing the wrong row would silently
+/// change which certificate an agent receives.
+pub(super) fn ensure_pki_server_name_uniqueness(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT server_name, group_concat(id, ',') FROM pki_credentials
+         WHERE revoked_at IS NULL GROUP BY server_name HAVING COUNT(*) > 1",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let name: String = r.get(0)?;
+        let ids: String = r.get(1)?;
+        Ok(format!("{name} ({ids})"))
+    })?;
+    let duplicates: Vec<String> = rows.collect::<rusqlite::Result<_>>()?;
+    if !duplicates.is_empty() {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(format!(
+                "duplicate active PKI server_name values; revoke all but one pair: {}",
+                duplicates.join("; ")
+            )),
+        ));
+    }
+    conn.execute_batch(PKI_ACTIVE_SERVER_NAME_INDEX)?;
+    Ok(())
+}
+
 /// 特权写操作审计。刻意不存密码/session/API key/agent token。
 pub(super) const ADMIN_AUDIT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS admin_audit (
     id TEXT PRIMARY KEY,

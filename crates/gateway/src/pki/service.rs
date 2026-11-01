@@ -20,6 +20,11 @@ impl PkiService {
     /// This must not generate a CA or certificate.
     pub fn new(config: PkiConfig, store: Storage) -> Result<Self, PkiError> {
         config.validate()?;
+        if let Some(Err(why)) = store.persistence_state() {
+            return Err(PkiError::Storage(format!(
+                "PKI requires a usable persistent keys_file database: {why}"
+            )));
+        }
         let service = Self {
             files: PkiFiles::new(config.dir.clone()),
             repo: PkiRepository::new(store),
@@ -48,6 +53,11 @@ impl PkiService {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn resolved_pair_id(&self, server_name: &str) -> Option<String> {
+        self.runtime.pair_id_for_server(server_name)
+    }
+
     pub fn list(&self, tenant_id: Option<&str>) -> Result<Vec<PkiRecord>, PkiError> {
         let mut records = self.repo.list(tenant_id)?;
         for record in &mut records {
@@ -69,7 +79,16 @@ impl PkiService {
     }
 
     fn load_active_pairs(&self) -> Result<(), PkiError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut duplicates = Vec::new();
         for record in self.active_records()? {
+            if !seen.insert(record.server_name.clone()) {
+                duplicates.push(format!(
+                    "{} (tenant {}, pair {})",
+                    record.server_name, record.tenant_id, record.id
+                ));
+                continue;
+            }
             let loaded = self
                 .files
                 .load_pair(&record.id, &record.server_name)
@@ -83,6 +102,12 @@ impl PkiService {
             let key = loaded.certified_key()?;
             self.runtime
                 .add_pair(&record.server_name, &record.id, key, loaded.ca_cert.clone())?;
+        }
+        if !duplicates.is_empty() {
+            return Err(PkiError::Conflict(format!(
+                "duplicate active PKI server_name values; revoke all but one pair: {}",
+                duplicates.join("; ")
+            )));
         }
         Ok(())
     }
@@ -112,12 +137,22 @@ impl PkiService {
             ));
         }
         let existing = self.list(None)?;
+        if let Some(owner) = existing
+            .iter()
+            .find(|r| r.revoked_at.is_none() && r.server_name == server_name)
+        {
+            return Err(PkiError::Conflict(format!(
+                "server_name {server_name} is already used by tenant {} pair {}; use a distinct SNI",
+                owner.tenant_id, owner.id
+            )));
+        }
         if existing.iter().any(|r| {
             (r.status == "waiting" || r.status == "connected")
-                && (r.server_name == server_name || (r.tenant_id == tenant_id && r.name == name))
+                && r.tenant_id == tenant_id
+                && r.name == name
         }) {
             return Err(PkiError::Conflict(
-                "an active pair already uses this name or server_name".into(),
+                "an active pair already uses this name; choose a different name".into(),
             ));
         }
 

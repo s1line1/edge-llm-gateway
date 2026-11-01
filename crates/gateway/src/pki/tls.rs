@@ -246,6 +246,17 @@ impl PkiRuntime {
         key: rustls::sign::CertifiedKey,
         ca: rustls::pki_types::CertificateDer<'static>,
     ) -> Result<(), PkiError> {
+        if self.resolver.contains(server_name)
+            || self
+                .pairs_by_server
+                .read()
+                .expect("pki pair map lock poisoned")
+                .contains_key(&server_name.to_ascii_lowercase())
+        {
+            return Err(PkiError::Conflict(format!(
+                "server_name {server_name} already has a runtime certificate; use a distinct SNI"
+            )));
+        }
         self.verifier.add_ca(ca)?;
         self.resolver.insert(server_name, Arc::new(key));
         self.pairs_by_server

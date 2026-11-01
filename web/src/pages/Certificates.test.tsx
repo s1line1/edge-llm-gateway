@@ -30,7 +30,7 @@ const pair: PkiPair = {
   id: "pair-1",
   name: "laptop-1",
   tenant_id: "tenant-a",
-  server_name: "gateway.example.com",
+  server_name: "tenant-a.gateway.example.com",
   serial: "ABCD",
   ca_fingerprint_sha256: "ca",
   server_fingerprint_sha256: "srv",
@@ -96,9 +96,11 @@ describe("Certificates page", () => {
     expect(mocks.createPkiPair).toHaveBeenCalledWith("system", {
       name: "laptop-1",
       tenant_id: "tenant-a",
-      server_name: "gateway.example.com",
+      server_name: "tenant-a.gateway.example.com",
       server_sans: [],
     });
+    expect(screen.getByText("tenant-a.")).toBeDefined();
+    expect(screen.getAllByText("tenant-a.gateway.example.com").length).toBeGreaterThan(0);
   });
 
   it("lists a pair and revokes it with confirmation", async () => {
@@ -131,5 +133,47 @@ describe("Certificates page", () => {
     renderPage("tenant_admin");
     await screen.findByText("laptop-1");
     expect(document.body.textContent ?? "").not.toMatch(/BEGIN (RSA |EC )?PRIVATE KEY/);
+  });
+
+  it("shows tenant-qualified SNI guidance", async () => {
+    mocks.fetchPkiStatus.mockResolvedValue({
+      enabled: true,
+      credentials: 0,
+      tunnel_ready: false,
+      waiting_for_credentials: true,
+    });
+    mocks.listPkiPairs.mockResolvedValue([]);
+    mocks.listTenants.mockResolvedValue([]);
+    renderPage("super_admin");
+    expect((await screen.findAllByText(/不同 tenant 必须使用不同 SNI/)).length).toBeGreaterThan(0);
+    expect(screen.getByText(/tenant-a\.gateway\.example\.com/)).toBeDefined();
+    expect(screen.getAllByText("选择 tenant").length).toBeGreaterThan(0);
+    expect(screen.queryByText("tenant.")).toBeNull();
+  });
+
+  it("shows a duplicate-SNI conflict without a success state", async () => {
+    mocks.fetchPkiStatus.mockResolvedValue({
+      enabled: true,
+      credentials: 0,
+      tunnel_ready: false,
+      waiting_for_credentials: true,
+    });
+    mocks.listPkiPairs.mockResolvedValue([]);
+    mocks.listTenants.mockResolvedValue([{ id: "tenant-a", name: "tenant-a" }]);
+    mocks.createPkiPair.mockReset();
+    mocks.createPkiPair.mockRejectedValue(
+      new Error("server_name duplicate.example.com is already used by tenant tenant-a pair p1"),
+    );
+    renderPage("super_admin");
+    await screen.findByRole("option", { name: "tenant-a" });
+    fireEvent.change(await screen.findByLabelText("名称"), { target: { value: "laptop-1" } });
+    fireEvent.change(screen.getByLabelText("Server name (SNI)"), {
+      target: { value: "duplicate.example.com" },
+    });
+    fireEvent.change(screen.getByLabelText("Tenant"), { target: { value: "tenant-a" } });
+    fireEvent.click(screen.getByRole("button", { name: /创建凭证对/ }));
+    await waitFor(() => expect(mocks.createPkiPair).toHaveBeenCalled());
+    expect(await screen.findByText(/duplicate\.example\.com is already used/)).toBeDefined();
+    expect(screen.queryByText("凭证已创建")).toBeNull();
   });
 });

@@ -16,13 +16,15 @@ export function OneTimeDownload({
       <p className="mt-1 text-[11px] leading-relaxed text-mist">
         client 私钥只下载一次；下载后服务器会删除它。请立即保存。
       </p>
-      <div className="mt-3 flex flex-wrap items-center gap-2">
+      <div className="mt-3 space-y-2">
+        <div>
+          <div className="micro-label">Server name (SNI)</div>
+          <div className="mt-1 break-all font-mono text-[11px] text-paper">{pair.server_name}</div>
+        </div>
+        <div className="font-mono text-[10px] text-mist-dim">serial {pair.serial}</div>
         <Button type="button" onClick={onDownload}>
           下载 client 包
         </Button>
-        <span className="font-mono text-[10px] text-mist-dim">
-          {pair.server_name} · {pair.serial}
-        </span>
       </div>
       {error && <p className="mt-2 text-[10px] text-coral">{error}</p>}
     </div>

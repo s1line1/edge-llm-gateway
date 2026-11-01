@@ -69,7 +69,7 @@ export default function Certificates() {
       <Panel>
         <PanelHead
           title="创建凭证对"
-          description="每对包含独立 CA、server 证书和 client 证书；server_name 必须是 DNS 名。"
+          description="每对包含独立 CA、server 证书和 client 证书；server_name 必须是 DNS 名，且不同 tenant 必须使用不同 SNI。"
         />
         <div className="panel-body">
           <CreatePairForm
