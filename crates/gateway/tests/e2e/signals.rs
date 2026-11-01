@@ -9,7 +9,6 @@
 use super::common::*;
 use std::{
     fs::File,
-    net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
@@ -35,16 +34,9 @@ impl Drop for ChildGuard {
     }
 }
 
-/// 内核分配一个空闲端口后立刻放掉：真进程的配置里写不了 `:0`（拿不回实际端口，
-/// 而 `gw.http_addr` 那种回读只在库内可用）。
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
+/// 信号测试不需要访问监听端口，因此让内核分配 HTTP/QUIC 端口。
+/// 不能先用 TCP `free_port()` 猜 UDP 端口：并发测试时另一个进程可能已经占用该 UDP 端口，
+/// 子进程会在 QUIC bind 阶段直接因 `Address already in use` 退出。
 fn write_file(dir: &Path, name: &str, content: &str) -> PathBuf {
     let p = dir.join(name);
     std::fs::write(&p, content).unwrap();
@@ -99,14 +91,12 @@ async fn wait_for_exit(child: &mut ChildGuard, limit: Duration) -> ExitStatus {
 /// 颜色"的判据变成假绿——它要测的正是"没有 `NO_COLOR` 时靠 TTY 判断"。`RUST_LOG=info` 保证
 /// 日志里有内容。
 fn spawn_gateway(dir: &Path) -> (ChildGuard, PathBuf) {
-    let http_port = free_port();
-    let quic_port = free_port();
     let cfg = write_file(
         dir,
         "gateway.yml",
         &format!(
-            "listen_addr: \"127.0.0.1:{http_port}\"\n\
-             quic_addr: \"127.0.0.1:{quic_port}\"\n\
+            "listen_addr: \"127.0.0.1:0\"\n\
+             quic_addr: \"127.0.0.1:0\"\n\
              pki:\n  enabled: true\n  dir: {}\n\
              keys_file: {}\n",
             dir.join("pki").display(),
