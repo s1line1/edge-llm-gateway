@@ -224,13 +224,8 @@ dev-ui: web-build dev ## 构建前端并一键起全栈（含 Dashboard）
 logs: ## 查看 dev 后台进程日志
 	@tail -f $(LOGDIR)/gateway.log $(LOGDIR)/agent.log $(LOGDIR)/mock-llm.log
 
-stop: ## 停止 dev 启动的全部后台进程
-	@for p in gateway agent mock-llm; do \
-		if [ -f .tmp/$$p.pid ]; then \
-			kill $$(cat .tmp/$$p.pid) 2>/dev/null && echo "✔ 已停止 $$p" || echo "  $$p 未在运行"; \
-			rm -f .tmp/$$p.pid; \
-		fi; \
-	done
+stop: ## 停止 dev 后台进程（pid 文件丢失也能找回孤儿）
+	@bash scripts/dev/stop.sh
 
 docker-gateway-down: ## 用 compose 停止并移除网关容器（在仓库根执行）
 	docker compose -f crates/gateway/docker-compose.yml down

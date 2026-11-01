@@ -444,7 +444,7 @@ deny.toml       cargo-deny 策略（依赖许可证 / 公告）
 | [`CERT_MANAGEMENT.md`](CERT_MANAGEMENT.md) | **设计（未实现）**：证书与信任根的动态管理——加 agent 不重启网关、CSR 路线（私钥不出机器）、信任语义与身份难点 |
 | [`STORAGE.md`](STORAGE.md) | **设计（分阶段）**：存储层多库抽象——换库只换一个实现、加新表只声明表本身；P0–P2 属重构可做，P3+ 未实现 |
 | [`EDGE_MULTI_BACKEND.md`](EDGE_MULTI_BACKEND.md) | **设计（未实现，⛔）**：一个 edge-agent 连接多台 vLLM——按 `model` 选本机后端再转发一次；协议与网关零改动 |
-| [`CODE_READING.md`](CODE_READING.md) | **源码阅读指南**：从哪开始读、锚点文件、验证式学习法 |
+| [`CODE_READING.md`](CODE_READING.md) | **源码阅读指南**：从哪开始读、锚点文件、验证式学习法；含**进程级排障**（孤儿进程 / 旧二进制 / 日志 inode） |
 | [`TODO.md`](TODO.md) | **开发状态与 roadmap**（同时是已知问题登记表） |
 
 ---

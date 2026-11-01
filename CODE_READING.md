@@ -185,3 +185,28 @@ cargo llvm-cov --workspace --summary-only   # 覆盖率（**本地**跑；CI 不
 3. 看指标：`curl :8080/metrics`（hlmg_agents / quic_connections / 状态码分布）
 4. 常见区分：**429 = admission 拒绝**（agent max_concurrency 上限，设计行为）；
    **503 = 无健康 agent**；**5xx = 网关/上游真故障**
+
+## 进程级排查（起不来 / 停不掉 / 改了不生效）
+
+上面那节是"请求走得对不对"，这节是"进程本身有没有问题"——两者要分开看，否则容易对着 `curl` 超时瞎猜。
+
+**1. `make stop` 停不掉，下次 `make dev` 端口被占**
+pid 文件可能**丢失**（上次 stop 自己删了、`make clean` 清了 `.tmp/`）或**过期**（进程早退了，PID 被复用）。
+`make stop` 现在走 `scripts/dev/stop.sh`：候选 = pid 文件 + `pgrep -f 'target/debug/<bin>'` 兜底，每个候选要过两道
+核对——`cwd` 是本仓库根、可执行文件是本仓库的 `target/debug/<bin>`——不过就只打印原因、**不 kill**。
+所以别的仓库/副本里的同名进程、被过期 pid 文件指到的无关进程都不会被误杀。
+
+**2. 改了代码不生效，但进程还活着**
+`ls target/debug/agent` 报"不存在"、进程却在跑：它持有的是**已删除 inode**（`make clean`、`cargo clean`、
+重新构建替换二进制都会造成），跑的是旧代码。`lsof -p <pid> -d txt` 能打出路径，但文件已不在磁盘上。
+处理：`make stop && make build-debug && make dev`。
+
+**3. `tail .tmp/logs/*.log` 看不到输出，怀疑进程死了**
+`nohup ... > .tmp/logs/x.log` 持有的是**打开时的 inode**；文件被删或重建后，进程继续写旧 inode，`tail` 新文件自然是空的。
+判断死活别靠日志，靠 `kill -0 <pid>` / `pgrep`；`lsof -p <pid> -d 1,2` 能看到 fd 实际指向哪个文件、多大。
+
+**4. fd 数异常高（`lsof -p <pid> | wc -l` 接近一万）**
+QUIC 重连可能攒下大量 UDP socket（实测一次约 4700 个）：进程活着、CPU 0%、fd 却很多。重启 agent 即回收
+（`make stop` 走优雅退出）。
+
+> 收栈先 SIGTERM：agent 有优雅关闭分支，`stop.sh` 会等 5s，真卡住再 `kill -9`。

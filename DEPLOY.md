@@ -3,6 +3,7 @@
 > 目标：把 Edge LLM 网关（cloud-gateway + edge-agent）跑在公网上——中转网关放阿里云 ECS，agent 放 LLM 所在机器（edge 节点：家里 / 分支 / 云主机），任何地点通过 HTTPS 按 model 访问边缘模型服务。
 >
 > 阅读前提：已按 `README.md` 在本地跑通全链路（mock 或真实模型）。
+> 本地起停与进程级排障速查：[`CODE_READING.md`](CODE_READING.md)。
 
 ## 架构回顾
 
