@@ -3,7 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 
-import { createKey, deleteKey, listKeys, listTenants } from "../api/client";
+import { createKey, deleteKey, listKeys, listTenants, scopeForRole } from "../api/client";
 import type { CreatedKey, KeyUsage } from "../api/types";
 import { useAuth } from "../auth/useAuth";
 import { Icon } from "../components/icons";
@@ -22,6 +22,7 @@ export default function Keys() {
   const queryClient = useQueryClient();
   const isSuper = user?.role === "super_admin";
   const isUser = user?.role === "user";
+  const scope = user ? scopeForRole(user.role) : "account";
 
   const [name, setName] = useState("");
   const [tenantFilter, setTenantFilter] = useState("");
@@ -30,21 +31,21 @@ export default function Keys() {
   const [search, setSearch] = useState("");
 
   const tenantsQuery = useQuery({
-    queryKey: ["admin", "tenants"],
-    queryFn: listTenants,
+    queryKey: ["admin", "tenants", scope],
+    queryFn: () => listTenants(scope),
     enabled: isSuper,
     staleTime: 10_000,
   });
 
   const keysQuery = useQuery({
-    queryKey: ["admin", "keys", tenantFilter],
-    queryFn: () => listKeys(tenantFilter || undefined),
+    queryKey: ["admin", "keys", scope, tenantFilter],
+    queryFn: () => listKeys(scope, tenantFilter || undefined),
     enabled: !!user,
     refetchInterval: 10_000,
   });
 
   const createMutation = useMutation({
-    mutationFn: (keyName: string) => createKey(keyName, tenantFilter || undefined),
+    mutationFn: (keyName: string) => createKey(scope, keyName, tenantFilter || undefined),
     onSuccess: (rec) => {
       setCreated(rec);
       setName("");
@@ -53,7 +54,7 @@ export default function Keys() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (id: string) => deleteKey(id),
+    mutationFn: (id: string) => deleteKey(scope, id),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "keys"] }),
   });
 

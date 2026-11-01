@@ -126,7 +126,7 @@ impl Gateway {
         // ① 纯校验 + 派生：TLS 材料有问题必须**在碰任何资源之前**失败（fail fast）。
         //    否则进程会"启动成功"却从未监听公网端口——systemd 显示 active(running)、
         //    日志写着 Gateway ready，而端口是 connection refused；且 /healthz、/metrics、
-        //    /admin/* 全在同一端口上，可观测性一起陪葬。
+        //    控制面命名空间全在同一端口上，可观测性一起陪葬。
         let store = Storage::with_verified(
             opts.keys_file.clone(),
             opts.verified_cache_max,

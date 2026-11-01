@@ -1,7 +1,7 @@
 # edge-llm-gateway 网关配置示例
 # 使用：cp gateway-config.example.yml gateway-config.yml，按需修改后
 #       gateway --config gateway-config.yml
-# 所有字段都有默认值。服务器证书不再从 YAML 加载；凭证通过 /admin/pki/pairs 按需创建。
+# 所有字段都有默认值。服务器证书不再从 YAML 加载；凭证通过 /system/pki/pairs 按需创建。
 
 # listen_addr: "[::]:8080"
 # quic_addr: "[::]:4433"

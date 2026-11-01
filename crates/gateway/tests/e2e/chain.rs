@@ -552,7 +552,7 @@ async fn e2e_client_disconnect_while_upstream_is_silent_releases_the_slot() {
     let client = test_client();
     let inflight = || async {
         let v: serde_json::Value = client
-            .get(format!("{base}/admin/agents"))
+            .get(format!("{base}/system/agents"))
             .header("Authorization", "Bearer admin-token")
             .send()
             .await

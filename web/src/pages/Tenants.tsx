@@ -8,6 +8,7 @@ import {
   deleteTenant,
   listTenants,
   rotateAgentToken,
+  scopeForRole,
   updateTenant,
 } from "../api/client";
 import type { Tenant } from "../api/types";
@@ -30,6 +31,7 @@ function formatUsage(t: Tenant) {
 export default function Tenants() {
   const { user } = useAuth();
   const isSuper = user?.role === "super_admin";
+  const scope = user ? scopeForRole(user.role) : "account";
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
   const [max, setMax] = useState("0");
@@ -37,8 +39,8 @@ export default function Tenants() {
   const [token, setToken] = useState<{ label: string; value: string } | null>(null);
 
   const tenantsQuery = useQuery({
-    queryKey: ["admin", "tenants"],
-    queryFn: listTenants,
+    queryKey: ["admin", "tenants", scope],
+    queryFn: () => listTenants(scope),
     staleTime: 5000,
   });
 
@@ -46,7 +48,7 @@ export default function Tenants() {
 
   const createMutation = useMutation({
     mutationFn: () =>
-      createTenant({
+      createTenant(scope, {
         name: name.trim(),
         max_concurrent_requests: Number(max) || 0,
         requests_per_minute: Number(rpm) || 0,
@@ -61,12 +63,12 @@ export default function Tenants() {
   });
 
   const toggleMutation = useMutation({
-    mutationFn: (tenant: Tenant) => updateTenant(tenant.id, { enabled: !tenant.enabled }),
+    mutationFn: (tenant: Tenant) => updateTenant(scope, tenant.id, { enabled: !tenant.enabled }),
     onSuccess: invalidate,
   });
 
   const rotateMutation = useMutation({
-    mutationFn: (tenant: Tenant) => rotateAgentToken(tenant.id),
+    mutationFn: (tenant: Tenant) => rotateAgentToken(scope, tenant.id),
     onSuccess: (result, tenant) => {
       setToken({ label: `${tenant.name} 的新 agent token`, value: result.agent_token });
       invalidate();
@@ -74,7 +76,7 @@ export default function Tenants() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (id: string) => deleteTenant(id),
+    mutationFn: (id: string) => deleteTenant(scope, id),
     onSuccess: invalidate,
   });
 

@@ -11,9 +11,14 @@ use axum::{
     response::Response,
 };
 
+use crate::access::rbac::{AuthSource, Principal};
 use crate::options::Options;
 use crate::state::AppState;
-use crate::{metrics::Metrics, registry::Registry, storage::Storage};
+use crate::{
+    metrics::Metrics,
+    registry::Registry,
+    storage::{Storage, UserRole},
+};
 
 pub(super) fn test_state(ui: Option<PathBuf>) -> AppState {
     // 测试档位：只改这个文件真正关心的旋钮，其余取库默认（`Options::default()`）。
@@ -48,4 +53,27 @@ pub(super) async fn body_str(resp: Response) -> String {
         .await
         .unwrap();
     String::from_utf8_lossy(&bytes).to_string()
+}
+
+pub(crate) fn principal(role: UserRole) -> Principal {
+    let (user_id, username, tenant_id) = match role {
+        UserRole::User => (
+            Some("user-1".into()),
+            "user-1".into(),
+            Some("default".into()),
+        ),
+        UserRole::TenantAdmin => (
+            Some("tenant-admin-1".into()),
+            "tenant-admin-1".into(),
+            Some("default".into()),
+        ),
+        UserRole::SuperAdmin => (Some("root".into()), "root".into(), None),
+    };
+    Principal {
+        user_id,
+        username,
+        role,
+        tenant_id,
+        source: AuthSource::Session,
+    }
 }

@@ -18,6 +18,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/client", () => ({
+  scopeForRole: (role: string) =>
+    role === "user" ? "account" : role === "tenant_admin" ? "admin" : "system",
   listKeys: mocks.listKeys,
   createKey: mocks.createKey,
   deleteKey: mocks.deleteKey,
@@ -79,7 +81,7 @@ describe("Keys 页的吊销失败提示（P3-18②）", () => {
       await screen.findByText(/吊销失败：SQLite 错误: forced rollback（这条 Key 仍然有效）/),
     ).toBeDefined();
     // mutate 的 mutationFn 是异步派发的：上面那条 findByText 已经等到了结果，这里再确认参数
-    expect(mocks.deleteKey).toHaveBeenCalledWith("k1");
+    expect(mocks.deleteKey).toHaveBeenCalledWith("system", "k1");
   });
 
   it("渲染出来的文本里没有 `//` —— JSX 子节点位置的注释会原样变成文本", async () => {
@@ -100,7 +102,7 @@ describe("Keys 页的吊销失败提示（P3-18②）", () => {
 
     // 等一次列表重取（invalidate）落地，确认这段时间没有冒失败文案
     await waitFor(() => expect(mocks.listKeys.mock.calls.length).toBeGreaterThan(1));
-    expect(mocks.deleteKey).toHaveBeenCalledWith("k1");
+    expect(mocks.deleteKey).toHaveBeenCalledWith("system", "k1");
     expect(screen.queryByText(/吊销失败/)).toBeNull();
   });
 });

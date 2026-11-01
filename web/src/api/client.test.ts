@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { fetchAgents, fetchMetricsText, listKeys } from "./client";
+import { fetchAgents, fetchMetricsText, listKeys, scopeForRole } from "./client";
 
 const jsonResponse = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -15,17 +15,30 @@ afterEach(() => {
 describe("JSON 边界的形状校验（P3-20）", () => {
   it("期望数组却收到对象时给可读错误，而不是让 data.map 炸掉", async () => {
     vi.stubGlobal("fetch", async () => jsonResponse({ not: "an array" }));
-    await expect(listKeys()).rejects.toThrow(/GET \/admin\/keys: 期望数组，收到 object/);
+    await expect(listKeys("system")).rejects.toThrow(/GET \/system\/keys: 期望数组，收到 object/);
   });
 
   it("形状正确时原样返回", async () => {
     vi.stubGlobal("fetch", async () => jsonResponse([{ id: "k1" }]));
-    await expect(listKeys()).resolves.toEqual([{ id: "k1" }]);
+    await expect(listKeys("system")).resolves.toEqual([{ id: "k1" }]);
   });
 
   it("404 折成 null（旧版网关/未挂载 admin），不是抛错", async () => {
     vi.stubGlobal("fetch", async () => jsonResponse({ error: { message: "not found" } }, 404));
-    await expect(fetchAgents()).resolves.toBeNull();
+    await expect(fetchAgents("system")).resolves.toBeNull();
+  });
+});
+
+describe("role to namespace", () => {
+  it("maps exactly the three Dashboard roles", () => {
+    expect(scopeForRole("user")).toBe("account");
+    expect(scopeForRole("tenant_admin")).toBe("admin");
+    expect(scopeForRole("super_admin")).toBe("system");
+  });
+
+  it("rejects an unknown role instead of silently using /admin", () => {
+    expect(() => scopeForRole(undefined)).toThrow(/unknown role/);
+    expect(() => scopeForRole("owner" as never)).toThrow(/unknown role/);
   });
 });
 

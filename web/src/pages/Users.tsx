@@ -3,7 +3,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
-import { createUser, deleteUser, listTenants, listUsers, updateUser } from "../api/client";
+import {
+  createUser,
+  deleteUser,
+  listTenants,
+  listUsers,
+  scopeForRole,
+  updateUser,
+} from "../api/client";
 import type { AdminUser, UserRole } from "../api/types";
 import { useAuth } from "../auth/useAuth";
 import { Icon } from "../components/icons";
@@ -20,6 +27,7 @@ import {
 export default function Users() {
   const { user } = useAuth();
   const isSuper = user?.role === "super_admin";
+  const scope = user ? scopeForRole(user.role) : "account";
   const queryClient = useQueryClient();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -27,13 +35,13 @@ export default function Users() {
   const [tenantId, setTenantId] = useState("");
 
   const tenantsQuery = useQuery({
-    queryKey: ["admin", "tenants"],
-    queryFn: listTenants,
+    queryKey: ["admin", "tenants", scope],
+    queryFn: () => listTenants(scope),
     enabled: isSuper,
   });
   const usersQuery = useQuery({
-    queryKey: ["admin", "users", tenantId],
-    queryFn: () => listUsers(isSuper && tenantId ? tenantId : undefined),
+    queryKey: ["admin", "users", scope, tenantId],
+    queryFn: () => listUsers(scope, isSuper && tenantId ? tenantId : undefined),
     staleTime: 5000,
   });
   const invalidate = () => {
@@ -43,7 +51,7 @@ export default function Users() {
 
   const createMutation = useMutation({
     mutationFn: () =>
-      createUser({
+      createUser(scope, {
         username: username.trim(),
         password,
         role,
@@ -57,13 +65,13 @@ export default function Users() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: (args: { id: string; patch: Parameters<typeof updateUser>[1] }) =>
-      updateUser(args.id, args.patch),
+    mutationFn: (args: { id: string; patch: Parameters<typeof updateUser>[2] }) =>
+      updateUser(scope, args.id, args.patch),
     onSuccess: invalidate,
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (id: string) => deleteUser(id),
+    mutationFn: (id: string) => deleteUser(scope, id),
     onSuccess: invalidate,
   });
 

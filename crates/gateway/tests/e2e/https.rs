@@ -749,7 +749,7 @@ async fn e2e_proxy_protocol_edge_cases() {
 /// 回归背景：HTTPS 的 PEM 解析原先放在 spawn 的任务里（`serve_https` 的第一行），
 /// 解析失败只留一行 `warn!`，listener 随即被 drop —— 进程活着、systemd 显示
 /// active(running)、日志写着 `Gateway ready`，但 8443 是 connection refused；
-/// 而 `/healthz`、`/metrics`、`/admin/*` 全挂在同一端口上，可观测性一起陪葬。
+/// 而 `/healthz`、`/metrics`、控制面命名空间 全挂在同一端口上，可观测性一起陪葬。
 ///
 /// 有效证书下的正常启动由 `e2e_https_public_entry` 覆盖（防"无脑全拒"的假修复）。
 #[tokio::test(flavor = "multi_thread")]

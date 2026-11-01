@@ -41,7 +41,7 @@ function isUnsafe(method: string): boolean {
 }
 
 /**
- * 所有 `/admin/*` 请求的统一入口：同源 cookie、禁止缓存、写方法带 CSRF。
+ * 控制面请求的统一入口：同源 cookie、禁止缓存、写方法带 CSRF。
  * 会话 token 是 HttpOnly，前端只负责携带 cookie；CSRF 从非 HttpOnly cookie 读取。
  */
 export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
@@ -127,21 +127,42 @@ export async function fetchMetricsText(timeoutMs: number = METRICS_TIMEOUT_MS): 
   return text;
 }
 
+export type ApiScope = "account" | "admin" | "system";
+
+/** Map the authenticated role to its control-plane namespace. */
+export function scopeForRole(role: UserRole | null | undefined): ApiScope {
+  switch (role) {
+    case "user":
+      return "account";
+    case "tenant_admin":
+      return "admin";
+    case "super_admin":
+      return "system";
+    default:
+      throw new Error(`unknown role: ${String(role)}`);
+  }
+}
+
+function scopeBase(scope: ApiScope): string {
+  return `/${scope}`;
+}
+
 function adminQuery(tenantId?: string | null): string {
   return tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : "";
 }
 
-export async function listKeys(tenantId?: string | null): Promise<ApiKey[]> {
-  const resp = await apiFetch(`/admin/keys${adminQuery(tenantId)}`);
-  return expectArray<ApiKey>(await handle<unknown>(resp), "GET /admin/keys");
+export async function listKeys(scope: ApiScope, tenantId?: string | null): Promise<ApiKey[]> {
+  const resp = await apiFetch(`${scopeBase(scope)}/keys${adminQuery(tenantId)}`);
+  return expectArray<ApiKey>(await handle<unknown>(resp), `GET /${scope}/keys`);
 }
 
 export async function createKey(
+  scope: ApiScope,
   name: string,
   tenantId?: string | null,
   ownerUserId?: string | null,
 ): Promise<CreatedKey> {
-  const resp = await apiFetch("/admin/keys", {
+  const resp = await apiFetch(`${scopeBase(scope)}/keys`, {
     method: "POST",
     body: JSON.stringify({
       name,
@@ -149,90 +170,114 @@ export async function createKey(
       ...(ownerUserId ? { owner_user_id: ownerUserId } : {}),
     }),
   });
-  return expectObject<CreatedKey>(await handle<unknown>(resp), "POST /admin/keys");
+  return expectObject<CreatedKey>(await handle<unknown>(resp), `POST /${scope}/keys`);
 }
 
-export async function listUsage(tenantId?: string | null): Promise<UsageRecord[]> {
-  const resp = await apiFetch(`/admin/usage${adminQuery(tenantId)}`);
-  return expectArray<UsageRecord>(await handle<unknown>(resp), "GET /admin/usage");
+export async function listUsage(
+  scope: ApiScope,
+  tenantId?: string | null,
+): Promise<UsageRecord[]> {
+  const resp = await apiFetch(`${scopeBase(scope)}/usage${adminQuery(tenantId)}`);
+  return expectArray<UsageRecord>(await handle<unknown>(resp), `GET /${scope}/usage`);
 }
 
-export async function deleteKey(id: string): Promise<void> {
-  const resp = await apiFetch(`/admin/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+export async function deleteKey(scope: ApiScope, id: string): Promise<void> {
+  const resp = await apiFetch(`${scopeBase(scope)}/keys/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
   await handle<void>(resp);
 }
 
-/** Agent 明细；404 仍表示旧版网关或未挂载 /admin/*。 */
-export async function fetchAgents(tenantId?: string | null): Promise<AgentInfo[] | null> {
-  const resp = await apiFetch(`/admin/agents${adminQuery(tenantId)}`);
+/** Agent 明细；404 表示当前 namespace 未挂载该资源。 */
+export async function fetchAgents(
+  scope: ApiScope,
+  tenantId?: string | null,
+): Promise<AgentInfo[] | null> {
+  const resp = await apiFetch(`${scopeBase(scope)}/agents${adminQuery(tenantId)}`);
   if (resp.status === 404) return null;
-  return expectArray<AgentInfo>(await handle<unknown>(resp), "GET /admin/agents");
+  return expectArray<AgentInfo>(await handle<unknown>(resp), `GET /${scope}/agents`);
 }
 
-export async function listTenants(): Promise<Tenant[]> {
-  const resp = await apiFetch("/admin/tenants");
-  return expectArray<Tenant>(await handle<unknown>(resp), "GET /admin/tenants");
+export async function listTenants(scope: ApiScope): Promise<Tenant[]> {
+  const resp = await apiFetch(`${scopeBase(scope)}/tenants`);
+  return expectArray<Tenant>(await handle<unknown>(resp), `GET /${scope}/tenants`);
 }
 
-export async function createTenant(input: {
-  name: string;
-  max_concurrent_requests?: number;
-  requests_per_minute?: number;
-}): Promise<Tenant> {
-  const resp = await apiFetch("/admin/tenants", {
+export async function createTenant(
+  scope: ApiScope,
+  input: {
+    name: string;
+    max_concurrent_requests?: number;
+    requests_per_minute?: number;
+  },
+): Promise<Tenant> {
+  const resp = await apiFetch(`${scopeBase(scope)}/tenants`, {
     method: "POST",
     body: JSON.stringify(input),
   });
-  return expectObject<Tenant>(await handle<unknown>(resp), "POST /admin/tenants");
+  return expectObject<Tenant>(await handle<unknown>(resp), `POST /${scope}/tenants`);
 }
 
 export async function updateTenant(
+  scope: ApiScope,
   id: string,
   patch: Partial<
     Pick<Tenant, "name" | "enabled" | "max_concurrent_requests" | "requests_per_minute">
   >,
 ): Promise<Tenant> {
-  const resp = await apiFetch(`/admin/tenants/${encodeURIComponent(id)}`, {
+  const resp = await apiFetch(`${scopeBase(scope)}/tenants/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: JSON.stringify(patch),
   });
-  return expectObject<Tenant>(await handle<unknown>(resp), "PATCH /admin/tenants");
+  return expectObject<Tenant>(await handle<unknown>(resp), `PATCH /${scope}/tenants`);
 }
 
-export async function deleteTenant(id: string): Promise<void> {
-  const resp = await apiFetch(`/admin/tenants/${encodeURIComponent(id)}`, { method: "DELETE" });
+export async function deleteTenant(scope: ApiScope, id: string): Promise<void> {
+  const resp = await apiFetch(`${scopeBase(scope)}/tenants/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
   await handle<void>(resp);
 }
 
-export async function rotateAgentToken(id: string): Promise<{ agent_token: string }> {
-  const resp = await apiFetch(`/admin/tenants/${encodeURIComponent(id)}/agent-token`, {
+export async function rotateAgentToken(
+  scope: ApiScope,
+  id: string,
+): Promise<{ agent_token: string }> {
+  const resp = await apiFetch(`${scopeBase(scope)}/tenants/${encodeURIComponent(id)}/agent-token`, {
     method: "POST",
   });
   return expectObject<{ agent_token: string }>(
     await handle<unknown>(resp),
-    "POST /admin/tenants/{id}/agent-token",
+    `POST /${scope}/tenants/{id}/agent-token`,
   );
 }
 
-export async function listUsers(tenantId?: string | null): Promise<AdminUser[]> {
-  const resp = await apiFetch(`/admin/users${adminQuery(tenantId)}`);
-  return expectArray<AdminUser>(await handle<unknown>(resp), "GET /admin/users");
+export async function listUsers(
+  scope: ApiScope,
+  tenantId?: string | null,
+): Promise<AdminUser[]> {
+  const resp = await apiFetch(`${scopeBase(scope)}/users${adminQuery(tenantId)}`);
+  return expectArray<AdminUser>(await handle<unknown>(resp), `GET /${scope}/users`);
 }
 
-export async function createUser(input: {
-  username: string;
-  password: string;
-  role: UserRole;
-  tenant_id?: string | null;
-}): Promise<AdminUser> {
-  const resp = await apiFetch("/admin/users", {
+export async function createUser(
+  scope: ApiScope,
+  input: {
+    username: string;
+    password: string;
+    role: UserRole;
+    tenant_id?: string | null;
+  },
+): Promise<AdminUser> {
+  const resp = await apiFetch(`${scopeBase(scope)}/users`, {
     method: "POST",
     body: JSON.stringify(input),
   });
-  return expectObject<AdminUser>(await handle<unknown>(resp), "POST /admin/users");
+  return expectObject<AdminUser>(await handle<unknown>(resp), `POST /${scope}/users`);
 }
 
 export async function updateUser(
+  scope: ApiScope,
   id: string,
   patch: {
     username?: string;
@@ -243,51 +288,62 @@ export async function updateUser(
     enabled?: boolean;
   },
 ): Promise<AdminUser> {
-  const resp = await apiFetch(`/admin/users/${encodeURIComponent(id)}`, {
+  const resp = await apiFetch(`${scopeBase(scope)}/users/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: JSON.stringify(patch),
   });
-  return expectObject<AdminUser>(await handle<unknown>(resp), "PATCH /admin/users");
+  return expectObject<AdminUser>(await handle<unknown>(resp), `PATCH /${scope}/users`);
 }
 
-export async function deleteUser(id: string): Promise<void> {
-  const resp = await apiFetch(`/admin/users/${encodeURIComponent(id)}`, { method: "DELETE" });
+export async function deleteUser(scope: ApiScope, id: string): Promise<void> {
+  const resp = await apiFetch(`${scopeBase(scope)}/users/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
   await handle<void>(resp);
 }
 
-export async function listAudit(tenantId?: string | null): Promise<AuditRecord[]> {
-  const resp = await apiFetch(`/admin/audit${adminQuery(tenantId)}`);
-  return expectArray<AuditRecord>(await handle<unknown>(resp), "GET /admin/audit");
+export async function listAudit(
+  scope: ApiScope,
+  tenantId?: string | null,
+): Promise<AuditRecord[]> {
+  const resp = await apiFetch(`${scopeBase(scope)}/audit${adminQuery(tenantId)}`);
+  return expectArray<AuditRecord>(await handle<unknown>(resp), `GET /${scope}/audit`);
 }
 
-export async function fetchPkiStatus(): Promise<PkiStatus> {
-  const resp = await apiFetch("/admin/pki/status");
-  return expectObject<PkiStatus>(await handle<unknown>(resp), "GET /admin/pki/status");
+export async function fetchPkiStatus(scope: ApiScope): Promise<PkiStatus> {
+  const resp = await apiFetch(`${scopeBase(scope)}/pki/status`);
+  return expectObject<PkiStatus>(await handle<unknown>(resp), `GET /${scope}/pki/status`);
 }
 
-export async function listPkiPairs(tenantId?: string | null): Promise<PkiPair[]> {
-  const resp = await apiFetch(`/admin/pki/pairs${adminQuery(tenantId)}`);
-  return expectArray<PkiPair>(await handle<unknown>(resp), "GET /admin/pki/pairs");
+export async function listPkiPairs(
+  scope: ApiScope,
+  tenantId?: string | null,
+): Promise<PkiPair[]> {
+  const resp = await apiFetch(`${scopeBase(scope)}/pki/pairs${adminQuery(tenantId)}`);
+  return expectArray<PkiPair>(await handle<unknown>(resp), `GET /${scope}/pki/pairs`);
 }
 
-export async function createPkiPair(body: CreatePkiPairBody): Promise<PkiPair> {
-  const resp = await apiFetch("/admin/pki/pairs", {
+export async function createPkiPair(
+  scope: ApiScope,
+  body: CreatePkiPairBody,
+): Promise<PkiPair> {
+  const resp = await apiFetch(`${scopeBase(scope)}/pki/pairs`, {
     method: "POST",
     body: JSON.stringify(body),
   });
-  return expectObject<PkiPair>(await handle<unknown>(resp), "POST /admin/pki/pairs");
+  return expectObject<PkiPair>(await handle<unknown>(resp), `POST /${scope}/pki/pairs`);
 }
 
-export async function revokePkiPair(id: string): Promise<void> {
-  const resp = await apiFetch(`/admin/pki/pairs/${encodeURIComponent(id)}/revoke`, {
+export async function revokePkiPair(scope: ApiScope, id: string): Promise<void> {
+  const resp = await apiFetch(`${scopeBase(scope)}/pki/pairs/${encodeURIComponent(id)}/revoke`, {
     method: "POST",
   });
   await handle<void>(resp);
 }
 
 /** Fetch the one-time tar as a blob; the caller creates the download link. */
-export async function downloadPkiPair(id: string): Promise<Blob> {
-  const resp = await apiFetch(`/admin/pki/pairs/${encodeURIComponent(id)}/download`);
+export async function downloadPkiPair(scope: ApiScope, id: string): Promise<Blob> {
+  const resp = await apiFetch(`${scopeBase(scope)}/pki/pairs/${encodeURIComponent(id)}/download`);
   if (!resp.ok) {
     let message = `HTTP ${resp.status}`;
     try {

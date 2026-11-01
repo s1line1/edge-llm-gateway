@@ -14,12 +14,12 @@ export default function MyAccess() {
   const { user } = useAuth();
   const keysQuery = useQuery({
     queryKey: ["admin", "keys", "mine"],
-    queryFn: () => listKeys(),
+    queryFn: () => listKeys("account"),
     enabled: !!user,
   });
   const usageQuery = useQuery({
     queryKey: ["admin", "usage", "mine"],
-    queryFn: () => listUsage(),
+    queryFn: () => listUsage("account"),
     enabled: !!user,
   });
   const [current, setCurrent] = useState("");

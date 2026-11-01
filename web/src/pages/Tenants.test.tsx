@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
   updateTenant: vi.fn(),
 }));
 vi.mock("../api/client", () => ({
+  scopeForRole: (role: string) =>
+    role === "user" ? "account" : role === "tenant_admin" ? "admin" : "system",
   listTenants: mocks.listTenants,
   createTenant: mocks.createTenant,
   deleteTenant: mocks.deleteTenant,

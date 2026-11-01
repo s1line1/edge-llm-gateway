@@ -10,7 +10,7 @@
 
 ```bash
 make dev                                     # mock-llm + gateway + agent
-KEY=$(curl -s -X POST http://127.0.0.1:8080/admin/keys \
+KEY=$(curl -s -X POST http://127.0.0.1:8080/system/keys \
   -H "Authorization: Bearer dev-admin" -H "Content-Type: application/json" \
   -d '{"name":"k6"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['key'])")
 ```

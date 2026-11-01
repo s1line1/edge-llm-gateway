@@ -43,7 +43,7 @@ async fn starts_with_zero_credentials_and_creates_a_pair_on_demand() {
     let base = format!("http://{}", gw.http_addr);
     let client = reqwest::Client::new();
     let status: serde_json::Value = client
-        .get(format!("{base}/admin/pki/status"))
+        .get(format!("{base}/system/pki/status"))
         .bearer_auth("dev-admin")
         .send()
         .await
@@ -55,7 +55,7 @@ async fn starts_with_zero_credentials_and_creates_a_pair_on_demand() {
     assert_eq!(status["waiting_for_credentials"], true);
 
     let created = client
-        .post(format!("{base}/admin/pki/pairs"))
+        .post(format!("{base}/system/pki/pairs"))
         .bearer_auth("dev-admin")
         .json(&serde_json::json!({
             "name": "laptop-1",
@@ -69,6 +69,13 @@ async fn starts_with_zero_credentials_and_creates_a_pair_on_demand() {
     assert_eq!(created.status(), reqwest::StatusCode::CREATED);
     let created: serde_json::Value = created.json().await.unwrap();
     assert_eq!(created["status"], "waiting");
+    assert!(
+        created["download_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("/system/pki/pairs/"),
+        "super-admin PKI URLs must use the /system namespace"
+    );
     assert!(dir.path().join("pki/pairs").exists());
     assert!(!dir
         .path()
@@ -79,7 +86,7 @@ async fn starts_with_zero_credentials_and_creates_a_pair_on_demand() {
         .is_none());
 
     let list: serde_json::Value = client
-        .get(format!("{base}/admin/pki/pairs"))
+        .get(format!("{base}/system/pki/pairs"))
         .bearer_auth("dev-admin")
         .send()
         .await
@@ -91,7 +98,7 @@ async fn starts_with_zero_credentials_and_creates_a_pair_on_demand() {
 
     let id = created["id"].as_str().unwrap();
     let download = client
-        .get(format!("{base}/admin/pki/pairs/{id}/download"))
+        .get(format!("{base}/system/pki/pairs/{id}/download"))
         .bearer_auth("dev-admin")
         .send()
         .await
@@ -115,7 +122,7 @@ async fn starts_with_zero_credentials_and_creates_a_pair_on_demand() {
     );
 
     let second = client
-        .get(format!("{base}/admin/pki/pairs/{id}/download"))
+        .get(format!("{base}/system/pki/pairs/{id}/download"))
         .bearer_auth("dev-admin")
         .send()
         .await
@@ -136,7 +143,7 @@ async fn active_pairs_are_reloaded_on_restart_without_new_generation() {
     let base = format!("http://{}", first.http_addr);
     let client = reqwest::Client::new();
     let created: serde_json::Value = client
-        .post(format!("{base}/admin/pki/pairs"))
+        .post(format!("{base}/system/pki/pairs"))
         .bearer_auth("dev-admin")
         .json(&serde_json::json!({
             "name": "laptop-1",
@@ -158,7 +165,7 @@ async fn active_pairs_are_reloaded_on_restart_without_new_generation() {
         .unwrap();
     let base = format!("http://{}", second.http_addr);
     let status: serde_json::Value = client
-        .get(format!("{base}/admin/pki/status"))
+        .get(format!("{base}/system/pki/status"))
         .bearer_auth("dev-admin")
         .send()
         .await
@@ -245,7 +252,7 @@ async fn downloaded_client_bundle_completes_mtls_and_marks_connected() {
     let base = format!("http://{}", gw.http_addr);
     let client = reqwest::Client::new();
     let created: serde_json::Value = client
-        .post(format!("{base}/admin/pki/pairs"))
+        .post(format!("{base}/system/pki/pairs"))
         .bearer_auth("dev-admin")
         .json(&serde_json::json!({
             "name": "laptop-1",
@@ -260,7 +267,7 @@ async fn downloaded_client_bundle_completes_mtls_and_marks_connected() {
         .unwrap();
     let id = created["id"].as_str().unwrap();
     let bundle = client
-        .get(format!("{base}/admin/pki/pairs/{id}/download"))
+        .get(format!("{base}/system/pki/pairs/{id}/download"))
         .bearer_auth("dev-admin")
         .send()
         .await
@@ -272,7 +279,7 @@ async fn downloaded_client_bundle_completes_mtls_and_marks_connected() {
     let mut connected = false;
     for _ in 0..40 {
         let list: serde_json::Value = client
-            .get(format!("{base}/admin/pki/pairs"))
+            .get(format!("{base}/system/pki/pairs"))
             .bearer_auth("dev-admin")
             .send()
             .await
@@ -297,7 +304,7 @@ async fn create_pair(
     server_name: &str,
 ) -> serde_json::Value {
     client
-        .post(format!("{base}/admin/pki/pairs"))
+        .post(format!("{base}/system/pki/pairs"))
         .bearer_auth("dev-admin")
         .json(&serde_json::json!({
             "name": name,
@@ -314,7 +321,7 @@ async fn create_pair(
 
 async fn download(base: &str, client: &reqwest::Client, id: &str) -> Vec<u8> {
     client
-        .get(format!("{base}/admin/pki/pairs/{id}/download"))
+        .get(format!("{base}/system/pki/pairs/{id}/download"))
         .bearer_auth("dev-admin")
         .send()
         .await
@@ -350,7 +357,7 @@ async fn pair_a_client_cannot_validate_pair_b_and_revoke_blocks_new_handshakes()
 
     client
         .post(format!(
-            "{base}/admin/pki/pairs/{}/revoke",
+            "{base}/system/pki/pairs/{}/revoke",
             a["id"].as_str().unwrap()
         ))
         .bearer_auth("dev-admin")
@@ -380,14 +387,14 @@ async fn https_gate_blocks_plain_downloads_when_required() {
     let pair = create_pair(&base, &client, "pair-a", "a.example.com").await;
     let id = pair["id"].as_str().unwrap();
     let plain = client
-        .get(format!("{base}/admin/pki/pairs/{id}/download"))
+        .get(format!("{base}/system/pki/pairs/{id}/download"))
         .bearer_auth("dev-admin")
         .send()
         .await
         .unwrap();
     assert_eq!(plain.status(), reqwest::StatusCode::CONFLICT);
     let proxied = client
-        .get(format!("{base}/admin/pki/pairs/{id}/download"))
+        .get(format!("{base}/system/pki/pairs/{id}/download"))
         .bearer_auth("dev-admin")
         .header("x-forwarded-proto", "https")
         .send()

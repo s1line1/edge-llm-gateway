@@ -68,7 +68,7 @@ done
 curl -sf "http://127.0.0.1:${HTTP_PORT}/healthz" >/dev/null || { echo "gateway 未就绪"; tail -5 "$TMP/gw.log"; exit 1; }
 
 # ---- 3. 建测试 key ----
-KEY_JSON=$(curl -s -X POST "http://127.0.0.1:${HTTP_PORT}/admin/keys" \
+KEY_JSON=$(curl -s -X POST "http://127.0.0.1:${HTTP_PORT}/system/keys" \
   -H "Authorization: Bearer adm-test" -H "Content-Type: application/json" \
   -d '{"name":"adm-test"}')
 KEY=$(echo "$KEY_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['key'])" \

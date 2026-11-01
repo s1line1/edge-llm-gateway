@@ -15,6 +15,7 @@ use crate::{
 use super::{
     dto::{pair_json, CreatePairBody, PkiQuery},
     errors::{audit, pki_error_response},
+    PkiScope,
 };
 
 pub(crate) async fn status(
@@ -42,6 +43,7 @@ pub(crate) async fn status(
 pub(crate) async fn list(
     State(state): State<AdminRuntime>,
     Extension(principal): Extension<Principal>,
+    Extension(scope): Extension<PkiScope>,
     Query(query): Query<PkiQuery>,
 ) -> Response {
     if let Err(e) = authorize(&principal, Action::PkiRead, query.tenant_id.as_deref()) {
@@ -60,7 +62,7 @@ pub(crate) async fn list(
             .map(|r| pair_json(
                 r,
                 if r.downloaded_at.is_none() && r.status != "revoked" {
-                    Some(format!("/admin/pki/pairs/{}/download", r.id))
+                    Some(scope.download_url(&r.id))
                 } else {
                     None
                 }
@@ -74,6 +76,7 @@ pub(crate) async fn list(
 pub(crate) async fn create(
     State(state): State<AdminRuntime>,
     Extension(principal): Extension<Principal>,
+    Extension(scope): Extension<PkiScope>,
     Json(body): Json<CreatePairBody>,
 ) -> Response {
     let requested = body.tenant_id.as_deref();
@@ -117,7 +120,7 @@ pub(crate) async fn create(
                 "pki.pair.create",
                 &record.id,
             );
-            let url = format!("/admin/pki/pairs/{}/download", record.id);
+            let url = scope.download_url(&record.id);
             (StatusCode::CREATED, Json(pair_json(&record, Some(url)))).into_response()
         }
         Err(e) => pki_error_response(e),

@@ -1,7 +1,7 @@
 // 「同名不同来源」的渲染契约（2026-10-16，agent-node 身份改动）。
 //
 // 背景：网关的注册表键从 `agent_id` 变成了 `(agent_id, peer_ip)` —— 同一个 `agent_id` 从两个
-// 来源 IP 连进来是**两个并存的节点**，`/admin/agents` 会返回**两行同名**。而本页原先用
+// 来源 IP 连进来是**两个并存的节点**，`控制面 agents 端点` 会返回**两行同名**。而本页原先用
 // `key={a.agent_id}`，碰上同名两行就会撞 React key：两行被当成同一行，行状态（在线/失联/已满）
 // 与子节点会错位。
 //
@@ -18,7 +18,11 @@ import { TestAuthProvider } from "../auth/TestAuthProvider";
 
 const mocks = vi.hoisted(() => ({ fetchAgents: vi.fn() }));
 
-vi.mock("../api/client", () => ({ fetchAgents: mocks.fetchAgents }));
+vi.mock("../api/client", () => ({
+  fetchAgents: mocks.fetchAgents,
+  scopeForRole: (role: string) =>
+      role === "user" ? "account" : role === "tenant_admin" ? "admin" : "system",
+}));
 
 vi.mock("../hooks/useMetricsHistory", () => ({
   useMetricsHistoryOptional: () => ({

@@ -13,7 +13,11 @@ import { TestAuthProvider } from "../auth/TestAuthProvider";
 const mocks = vi.hoisted(() => ({ fetchAgents: vi.fn() }));
 
 // `fetchAgents` 的契约：404 → `null`（`api/client.ts:112`）。这里只替掉网络层，保留页面逻辑。
-vi.mock("../api/client", () => ({ fetchAgents: mocks.fetchAgents }));
+vi.mock("../api/client", () => ({
+  fetchAgents: mocks.fetchAgents,
+  scopeForRole: (role: string) =>
+      role === "user" ? "account" : role === "tenant_admin" ? "admin" : "system",
+}));
 
 vi.mock("../hooks/useMetricsHistory", () => ({
   useMetricsHistoryOptional: () => ({
@@ -66,7 +70,7 @@ describe("Agents 页的明细降级（P3-18①）", () => {
     expect(await screen.findByText(/返回 404/)).toBeDefined();
     expect(screen.queryByText("暂无在线 agent")).toBeNull();
     // 顶栏副标题也要说"未取到明细"，而不是假装有数据
-    expect(screen.getByText(/未取到 \/admin\/agents 明细/)).toBeDefined();
+    expect(screen.getByText(/未取到 agents 明细/)).toBeDefined();
   });
 
   it("明细为空数组（真的零个 agent）才显示『暂无在线 agent』", async () => {
@@ -75,7 +79,7 @@ describe("Agents 页的明细降级（P3-18①）", () => {
 
     expect(await screen.findByText("暂无在线 agent")).toBeDefined();
     expect(screen.queryByText(/返回 404/)).toBeNull();
-    expect(screen.getByText(/来自 \/admin\/agents/)).toBeDefined();
+    expect(screen.getByText(/来自控制面 agents 端点/)).toBeDefined();
   });
 
   it("默认卡片视图，并可以切换到 Orbit 选择节点", async () => {

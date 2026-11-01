@@ -1,4 +1,4 @@
-// 测试专用：直接提供 AuthContext，不触发 /admin/auth/me 网络请求。
+// 测试专用：直接提供 AuthContext，不触发 /account/me 网络请求。
 
 import type { ReactNode } from "react";
 

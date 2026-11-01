@@ -19,7 +19,7 @@
 #    nextest 把"等待"和"运行"分开统计，所以下面的超时阈值报出来的就是真的卡住。
 
 [test-groups]
-# e2e currently contains 82 tests; keep this filter aligned with the Makefile guard.
+# e2e currently contains 84 tests; keep this filter aligned with the Makefile guard.
 e2e-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]

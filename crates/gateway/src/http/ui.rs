@@ -149,7 +149,7 @@ const UI_MISSING: &str = r#"<!doctype html>
 {reason}
 <p>Web 管理面板尚未构建。构建前端后配置 <code>ui_dir</code> 并重启网关：</p>
 <pre>cd web &amp;&amp; pnpm install &amp;&amp; pnpm build</pre>
-<p>API 端点（<code>/v1/*</code>、<code>/admin/*</code>、<code>/metrics</code>、<code>/healthz</code>）不受影响。</p>
+<p>API 端点（<code>/v1/*</code>、<code>/account/*</code>、<code>/admin/*</code>、<code>/system/*</code>、<code>/metrics</code>、<code>/healthz</code>）不受影响。</p>
 </body>
 </html>"#;
 
@@ -205,7 +205,7 @@ mod tests {
         assert!(body_str(resp).await.contains("console.log"));
 
         // API 类未注册路径（Accept: */*、无扩展名）→ 404，绝不能返回 index.html
-        let resp = call_ui_fallback(state.clone(), "/admin/agents", Some("*/*")).await;
+        let resp = call_ui_fallback(state.clone(), "/system/agents", Some("*/*")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             vary(&resp),

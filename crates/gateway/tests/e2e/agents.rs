@@ -9,7 +9,7 @@ async fn e2e_admission_control() {
     // agent max_concurrency=1：两个**确定重叠**的慢请求，一个 200、一个 429；完成后槽位释放。
     //
     // 记录 P2-18：原先用 `tokio::join!` 赌"两个请求一定重叠"（唯一保证是上游 800ms 的 sleep）。
-    // 现在改成"先发第一个 → 等 `/admin/agents` 显示槽位真被占上 → 再发第二个"，重叠是**构造**
+    // 现在改成"先发第一个 → 等 `/system/agents` 显示槽位真被占上 → 再发第二个"，重叠是**构造**
     // 出来的，不依赖调度时序。
     let (gw, agent, base, key) =
         start_stack(1, |o| o.admin_token = Some("admin-token".into())).await;
@@ -249,7 +249,7 @@ async fn e2e_admin_agents_lists_registry() {
 
     // 无 admin token → 401
     let resp = client
-        .get(format!("{base}/admin/agents"))
+        .get(format!("{base}/system/agents"))
         .send()
         .await
         .unwrap();
@@ -257,7 +257,7 @@ async fn e2e_admin_agents_lists_registry() {
 
     // 带 admin token → 明细（已注册 1 个 agent：test-agent, mock-llm, 容量 4）
     let resp = client
-        .get(format!("{base}/admin/agents"))
+        .get(format!("{base}/system/agents"))
         .header("Authorization", "Bearer admin-token")
         .send()
         .await

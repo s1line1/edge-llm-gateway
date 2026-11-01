@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => ({
   downloadPkiPair: vi.fn(),
 }));
 vi.mock("../api/client", () => ({
+  scopeForRole: (role: string) =>
+    role === "user" ? "account" : role === "tenant_admin" ? "admin" : "system",
   fetchPkiStatus: mocks.fetchPkiStatus,
   listPkiPairs: mocks.listPkiPairs,
   listTenants: mocks.listTenants,
@@ -40,7 +42,7 @@ const pair: PkiPair = {
   last_connected_at: null,
   revoked_at: null,
   client_not_after: 2_000_000_000,
-  download_url: "/admin/pki/pairs/pair-1/download",
+  download_url: "/system/pki/pairs/pair-1/download",
 };
 
 function renderPage(role: "super_admin" | "tenant_admin") {
@@ -91,7 +93,7 @@ describe("Certificates page", () => {
 
     expect(await screen.findByText("凭证已创建")).toBeDefined();
     expect(screen.getByText(/client 私钥只下载一次/)).toBeDefined();
-    expect(mocks.createPkiPair).toHaveBeenCalledWith({
+    expect(mocks.createPkiPair).toHaveBeenCalledWith("system", {
       name: "laptop-1",
       tenant_id: "tenant-a",
       server_name: "gateway.example.com",
@@ -114,7 +116,7 @@ describe("Certificates page", () => {
 
     expect(await screen.findByText("laptop-1")).toBeDefined();
     fireEvent.click(screen.getByRole("button", { name: "吊销" }));
-    await waitFor(() => expect(mocks.revokePkiPair).toHaveBeenCalledWith("pair-1"));
+    await waitFor(() => expect(mocks.revokePkiPair).toHaveBeenCalledWith("admin", "pair-1"));
   });
 
   it("does not render private key material", async () => {

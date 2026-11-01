@@ -1,6 +1,6 @@
 //! Dashboard 登录/会话：cookie、CSRF、bootstrap、me、logout、改密。
 //!
-//! 会话解析在 [`admin_auth`] 中间件里完成；本模块只负责认证入口和 cookie 材料。会话 token
+//! 会话解析在 [`console_auth`] 中间件里完成；本模块只负责认证入口和 cookie 材料。会话 token
 //! 只写入 `HttpOnly` cookie，绝不出现在 JSON；CSRF token 走独立的非 HttpOnly cookie，
 //! 用于 double-submit 校验。
 
@@ -139,8 +139,8 @@ fn is_unsafe_method(method: &axum::http::Method) -> bool {
     )
 }
 
-/// `/admin/*` 保护中间件：session 或 break-glass admin token → `Extension<Principal>`。
-pub async fn admin_auth(
+/// 控制面保护中间件：session 或 break-glass admin token → `Extension<Principal>`。
+pub async fn console_auth(
     State(state): State<AdminRuntime>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -172,6 +172,43 @@ pub async fn admin_auth(
     let mut req = req;
     req.extensions_mut().insert(principal);
     next.run(req).await
+}
+
+/// Account/tenant/global namespace guard helpers.
+///
+/// These run inside [`console_auth`] so `Principal` is already present. A missing principal is a
+/// wiring error and still returns 401; a valid principal outside the namespace returns 403.
+pub async fn require_user(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    require_role(req, next, |role| role == UserRole::User).await
+}
+
+pub async fn require_tenant_admin(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    require_role(req, next, |role| role == UserRole::TenantAdmin).await
+}
+
+pub async fn require_super_admin(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    require_role(req, next, |role| role == UserRole::SuperAdmin).await
+}
+
+async fn require_role(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+    allowed: impl FnOnce(UserRole) -> bool,
+) -> Response {
+    let Some(principal) = req.extensions().get::<Principal>() else {
+        return unauthorized("missing authenticated principal");
+    };
+    if allowed(principal.role) {
+        next.run(req).await
+    } else {
+        crate::access::rbac::response(crate::access::rbac::RbacError::Forbidden)
+    }
 }
 
 fn break_glass_ok(state: &AdminRuntime, headers: &HeaderMap) -> bool {
@@ -544,7 +581,7 @@ mod tests {
             .clone()
             .oneshot(
                 axum::extract::Request::builder()
-                    .uri("/admin/auth/status")
+                    .uri("/auth/status")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -555,7 +592,7 @@ mod tests {
         let bootstrap = app
             .clone()
             .oneshot(post(
-                "/admin/auth/bootstrap",
+                "/auth/bootstrap",
                 json!({"username": "root", "password": "correct horse battery"}),
                 true,
                 None,
@@ -567,7 +604,7 @@ mod tests {
         let login = app
             .clone()
             .oneshot(post(
-                "/admin/auth/login",
+                "/auth/login",
                 json!({"username": "root", "password": "correct horse battery"}),
                 false,
                 None,
@@ -608,7 +645,7 @@ mod tests {
             .clone()
             .oneshot(
                 axum::extract::Request::builder()
-                    .uri("/admin/auth/me")
+                    .uri("/account/me")
                     .header(header::COOKIE, &session_cookie)
                     .body(Body::empty())
                     .unwrap(),
@@ -623,7 +660,7 @@ mod tests {
             .oneshot(
                 axum::extract::Request::builder()
                     .method("POST")
-                    .uri("/admin/auth/logout")
+                    .uri("/account/logout")
                     .header(header::COOKIE, &cookie_pair)
                     .body(Body::empty())
                     .unwrap(),
@@ -636,7 +673,7 @@ mod tests {
             .oneshot(
                 axum::extract::Request::builder()
                     .method("POST")
-                    .uri("/admin/auth/logout")
+                    .uri("/account/logout")
                     .header(header::COOKIE, cookie_pair)
                     .header(CSRF_HEADER, csrf)
                     .body(Body::empty())
@@ -706,5 +743,103 @@ mod tests {
             HeaderValue::from_static("https://evil.example"),
         );
         assert!(!origin_matches(&headers));
+    }
+}
+
+#[cfg(test)]
+mod role_guard_tests {
+    use axum::{
+        body::Body,
+        extract::Request,
+        http::StatusCode,
+        middleware::{self, Next},
+        response::{IntoResponse, Response},
+        routing::get,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::http::test_util::principal;
+
+    async fn probe() -> Response {
+        StatusCode::NO_CONTENT.into_response()
+    }
+
+    async fn inject_role(mut req: Request, next: Next) -> Response {
+        let role = match req
+            .headers()
+            .get("x-test-role")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+        {
+            "user" => UserRole::User,
+            "tenant_admin" => UserRole::TenantAdmin,
+            "super_admin" => UserRole::SuperAdmin,
+            _ => return StatusCode::UNAUTHORIZED.into_response(),
+        };
+        req.extensions_mut().insert(principal(role));
+        next.run(req).await
+    }
+
+    async fn call(router: Router, role: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        if let Some(role) = role {
+            req.headers_mut()
+                .insert("x-test-role", role.parse().unwrap());
+        }
+        router.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn role_guards_require_a_principal_and_match_exact_role() {
+        let user_app = Router::new()
+            .route("/", get(probe))
+            .route_layer(middleware::from_fn(require_user))
+            .layer(middleware::from_fn(inject_role));
+        assert_eq!(call(user_app.clone(), None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            call(user_app.clone(), Some("tenant_admin")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(call(user_app, Some("user")).await, StatusCode::NO_CONTENT);
+
+        let admin_app = Router::new()
+            .route("/", get(probe))
+            .route_layer(middleware::from_fn(require_tenant_admin))
+            .layer(middleware::from_fn(inject_role));
+        assert_eq!(
+            call(admin_app.clone(), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(admin_app.clone(), Some("user")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(admin_app.clone(), Some("super_admin")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(admin_app, Some("tenant_admin")).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let system_app = Router::new()
+            .route("/", get(probe))
+            .route_layer(middleware::from_fn(require_super_admin))
+            .layer(middleware::from_fn(inject_role));
+        assert_eq!(
+            call(system_app.clone(), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(system_app.clone(), Some("tenant_admin")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(system_app, Some("super_admin")).await,
+            StatusCode::NO_CONTENT
+        );
     }
 }

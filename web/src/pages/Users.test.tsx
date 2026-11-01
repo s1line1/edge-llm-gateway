@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
   deleteUser: vi.fn(),
 }));
 vi.mock("../api/client", () => ({
+  scopeForRole: (role: string) =>
+    role === "user" ? "account" : role === "tenant_admin" ? "admin" : "system",
   listUsers: mocks.listUsers,
   listTenants: mocks.listTenants,
   createUser: mocks.createUser,
