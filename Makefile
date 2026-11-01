@@ -238,6 +238,9 @@ docker-gateway-down: ## 用 compose 停止并移除网关容器（在仓库根�
 docker-gateway-up: ## 用 compose 构建并后台启动网关容器（在仓库根执行）
 	docker compose -f crates/gateway/docker-compose.yml up -d --build
 
+docker-build-gateway: ## 直接用 gateway Dockerfile 构建镜像
+	docker build -f crates/gateway/Dockerfile -t edge-llm-gateway .
+
 ## ---------- 清理 ----------
 
 clean: ## 清理构建产物（Rust + 前端）
