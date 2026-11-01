@@ -1,4 +1,4 @@
-// Dashboard 会话上下文：唯一的 /admin/auth/me 查询与登录/登出动作。
+// Dashboard 会话上下文：唯一的 /account/me 查询与登录/登出动作。
 
 import { createContext, useEffect, useMemo, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";

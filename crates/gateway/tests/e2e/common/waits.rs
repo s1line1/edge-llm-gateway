@@ -57,7 +57,7 @@ pub fn seed_keys_db() -> (PathBuf, String) {
 }
 
 /// 读 `/metrics` 里的某个 gauge 值（测试用它断言"槽位是否归还"）。
-/// 等"至少一个 agent 的在途数 ≥ `want`"（读 `/admin/agents` 的实时视图；需要测试里配
+/// 等"至少一个 agent 的在途数 ≥ `want`"（读 `/system/agents` 的实时视图；需要测试里配
 /// `admin_token = Some("admin-token")`）。
 ///
 /// 为什么需要它（记录 P2-18）：并发 e2e 的断言——"恰好一个 200 + 一个 429"、"两个请求分散到
@@ -69,12 +69,12 @@ pub async fn wait_for_any_agent_inflight(base: &str, want: u64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         // 解析失败按"还没就绪"处理、继续轮询——**不要 panic**：这个函数本身就是个轮询循环，
-        // 而 `/admin/agents` 在网关刚起来/连接刚建立的那个瞬间可能返回一个 `.json()` 解析不了的
+        // 而 `/system/agents` 在网关刚起来/连接刚建立的那个瞬间可能返回一个 `.json()` 解析不了的
         // 体（实测：`EOF while parsing a value, line 1 column 0`）。以前这里 `.unwrap()` 会把这个
         // **瞬态**变成整条用例的硬失败，只因为它恰好落在第一次轮询上（`agents.rs` 的既有用法
         // 触发不到，新加的接管用例会）。
         let agents: serde_json::Value = match client
-            .get(format!("{base}/admin/agents"))
+            .get(format!("{base}/system/agents"))
             .header("Authorization", "Bearer admin-token")
             .send()
             .await
@@ -100,7 +100,7 @@ pub async fn wait_for_any_agent_inflight(base: &str, want: u64) {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "等 agent 在途数 ≥{want} 超时；/admin/agents = {agents}"
+            "等 agent 在途数 ≥{want} 超时；/system/agents = {agents}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

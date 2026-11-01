@@ -17,7 +17,7 @@ pub struct ConfigFile {
     /// QUIC 隧道监听地址（UDP）
     #[serde(default = "default_quic_addr")]
     quic_addr: String,
-    /// Admin token（提供后启用 /admin/keys 管理接口）
+    /// Break-glass control-plane token（提供后启用 /account、/admin、/system 控制面）
     #[serde(default)]
     admin_token: Option<String>,
     /// 动态 API Key 持久化数据库文件（SQLite；null = 仅内存）
@@ -249,7 +249,7 @@ pub fn from_path(path: &PathBuf) -> anyhow::Result<GatewayConfig> {
                 anyhow::bail!(
                     "config: `{key}` is no longer supported; the gateway does not load fixed \
                      certificate paths. Remove it and create a credential pair through \
-                     /admin/pki/pairs (see the pki section in gateway-config.example.yml)."
+                     /system/pki/pairs (see the pki section in gateway-config.example.yml)."
                 );
             }
         }

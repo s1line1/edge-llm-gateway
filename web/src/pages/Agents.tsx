@@ -1,10 +1,10 @@
 // Agents：把每个 edge 当作一张可观测的节点卡，而不是一张通用表格。
-// 明细来自 /admin/agents，状态结论一律采用网关返回的 healthy。
+// 明细来自控制面 agents 端点，状态结论一律采用网关返回的 healthy。
 
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
-import { fetchAgents } from "../api/client";
+import { fetchAgents, scopeForRole } from "../api/client";
 import { AgentCard } from "../components/AgentCard";
 import { EdgeOrbit } from "../components/EdgeOrbit";
 import { agentKey, isAgentFull } from "../components/orbitGeometry";
@@ -23,6 +23,7 @@ const FILTERS: { id: Filter; label: string }[] = [
 
 export default function Agents() {
   const { user } = useAuth();
+  const scope = user ? scopeForRole(user.role) : "account";
   const metrics = useMetricsHistoryOptional();
   const latest = metrics?.latest ?? null;
   const [filter, setFilter] = useState<Filter>("all");
@@ -31,8 +32,8 @@ export default function Agents() {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
   const detailQuery = useQuery({
-    queryKey: ["admin", "agents"],
-    queryFn: () => fetchAgents(),
+    queryKey: ["admin", "agents", scope],
+    queryFn: () => fetchAgents(scope),
     enabled: !!user,
     refetchInterval: 5000,
     retry: false,
@@ -150,8 +151,8 @@ export default function Agents() {
           title="Agent 明细"
           description={
             hasDetail
-              ? "来自 /admin/agents（每 5 秒刷新）"
-              : "未取到 /admin/agents 明细（旧版网关或未启用 /admin/*），仅显示汇总"
+              ? "来自控制面 agents 端点（每 5 秒刷新）"
+              : "未取到 agents 明细（旧版网关或未启用控制面），仅显示汇总"
           }
           right={
             hasDetail ? (
@@ -209,7 +210,7 @@ export default function Agents() {
 
         <div className="panel-body">
           {detailQuery.isPending ? (
-            <EmptyState title="加载中…" detail="正在读取 /admin/agents 快照。" />
+            <EmptyState title="加载中…" detail="正在读取 agents 快照。" />
           ) : detailUnavailable ? (
             <div className="rounded-lg border border-line bg-ink-950/35 p-4">
               <div className="flex items-start gap-3">
@@ -218,7 +219,7 @@ export default function Agents() {
                 </span>
                 <div>
                   <p className="text-[12px] font-medium text-paper">
-                    <code className="font-mono text-[11px]">GET /admin/agents</code> 返回 404
+                    <code className="font-mono text-[11px]">控制面 agents 端点</code> 返回 404
                   </p>
                   <p className="mt-1.5 max-w-2xl text-[11px] leading-relaxed text-mist">
                     网关版本较旧，或该部署没有挂载管理接口。在线总数见上方卡片。

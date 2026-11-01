@@ -355,7 +355,7 @@ mod tests {
         let state = state_with(&opts, &controller);
         assert_eq!(state.admin().admin_token.as_deref(), Some("to k"));
 
-        // `None`（不启用 /admin/*）不受影响
+        // `None`（不启用控制面命名空间）不受影响
         let no_admin = state_with(&Options::default(), &controller);
         assert!(no_admin.admin().admin_token.is_none());
     }

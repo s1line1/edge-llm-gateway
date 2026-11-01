@@ -3,6 +3,7 @@
 import { useState } from "react";
 
 import type { CreatePkiPairBody, PkiPair } from "../api/types";
+import { scopeForRole } from "../api/client";
 import { useAuth } from "../auth/useAuth";
 import { CreatePairForm } from "../components/certificates/CreatePairForm";
 import { OneTimeDownload } from "../components/certificates/OneTimeDownload";
@@ -14,7 +15,8 @@ import { downloadPkiBundle, usePki } from "../hooks/usePki";
 export default function Certificates() {
   const { user } = useAuth();
   const isSuper = user?.role === "super_admin";
-  const pki = usePki(isSuper, user?.tenant_id ?? null);
+  const scope = user ? scopeForRole(user.role) : "account";
+  const pki = usePki(scope, isSuper, user?.tenant_id ?? null);
   const [oneTime, setOneTime] = useState<PkiPair | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
 
@@ -30,7 +32,7 @@ export default function Certificates() {
   const download = async (pair: PkiPair) => {
     setDownloadError(null);
     try {
-      await downloadPkiBundle(pair);
+      await downloadPkiBundle(scope, pair);
       pki.invalidate();
     } catch (error) {
       setDownloadError(error instanceof Error ? error.message : "下载失败");

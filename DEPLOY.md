@@ -25,6 +25,9 @@ edge 节点（家里 / 分支 / 云主机）  agent → 本地 Ollama / vLLM / l
 | 域名（可选但推荐） | 有域名则证书 SAN 用 `DNS:`，IP 变更不影响；没有就用 `IP:` SAN 的自签证书 |
 | 本地 | 仓库已 clone（或 `dist/` 里有现成二进制） |
 
+> **Breaking API change**: control-plane routes are now `/auth/*`, `/account/*`, `/admin/*`, and
+> `/system/*`; the old all-role `/admin/*` routes are removed.
+
 ## 1. 凭证管理（不再使用固定 YAML 证书）
 
 Gateway 启动时**不会生成 CA 或证书**，也不再从 `gateway-config.yml` 读取
@@ -179,7 +182,7 @@ sudo cp target/release/gateway /usr/local/bin/gateway
 
 ```bash
 # 1) 生成强随机 Admin Token（网关没有静态 API Key，key 一律由 Admin API 运行时创建）
-openssl rand -hex 32        # Admin Token（记下来，登录管理页 / 调 /admin/* 用）
+openssl rand -hex 32        # Admin Token（记下来，登录管理页 / 调 /account/*、/admin/*、/system/* 用）
 
 # 2) 基于模板生成网关配置（所有参数都在这里）
 sudo cp gateway-config.example.yml /etc/edge-llm-gateway/gateway-config.yml
@@ -224,12 +227,12 @@ ui_dir: web/dist                   # Web UI 目录（§4 上传的产物；相�
 **运行时签发 API Key**（不用重启网关）：
 
 ```bash
-curl -X POST http://127.0.0.1:8443/admin/keys \
+curl -X POST http://127.0.0.1:8443/system/keys \
   -H "Authorization: Bearer <admin-token>" -H "Content-Type: application/json" \
   -d '{"name":"dsh-client"}'
 # 返回 {"id":...,"key":"sk-...","name":...}，key 只显示这一次，记下来
-curl http://127.0.0.1:8443/admin/keys -H "Authorization: Bearer <admin-token>"   # 列出（脱敏）
-curl -X DELETE http://127.0.0.1:8443/admin/keys/<id> -H "Authorization: Bearer <admin-token>"  # 吊销
+curl http://127.0.0.1:8443/system/keys -H "Authorization: Bearer <admin-token>"   # 列出（脱敏）
+curl -X DELETE http://127.0.0.1:8443/system/keys/<id> -H "Authorization: Bearer <admin-token>"  # 吊销
 ```
 
 **本机自检**：
@@ -272,7 +275,7 @@ sudo vi /etc/edge-llm-gateway/agent-config.yml
 > ⚠️ **`agent_id` 必须每台机器唯一**：`agent-config.example.yml` 与 `Makefile` 生成的默认值都是
 > `edge-1`，**多台机器直接照抄就会撞车**。同名时网关会关掉旧连接（本意是同一台机器重连接管），
 > 两台机器于是轮流接管——**凡活得比接管周期长的请求都可能失败（502）**，而两侧进程都健康、
-> `/admin/agents` 恒显示"1 个 agent 在线"，信号只有 `hlmg_agent_connections_total` 在飞涨。
+> `/system/agents` 恒显示"1 个 agent 在线"，信号只有 `hlmg_agent_connections_total` 在飞涨。
 > **2026-09-22 起 agent 侧那半边已修**：退避不再被"连上就被踢"重置回 500ms（改看会话存活时长，
 > 短命会话继续指数退避 + ±20% 抖动），所以不再退化成"每 ~500ms 互踢、永不收敛"的风暴；
 > 但网关侧"同名接管"仍是当前语义，**多台机器依然要各用各的 `agent_id`**。详见 `TODO.md` 与
@@ -316,7 +319,7 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 | agent：TLS 握手失败 | 配置项 `server_name` 与网关 server 证书 SAN 不匹配；确认填的是 SAN 里的域名或公网 IP |
 | 网关日志：agent connected 但很快消失 | agent 心跳被断（网络不稳）；检查 UDP 丢包；`agent_stale_secs`（网关配置）适当调大 |
 | **周期性 503/404，但两侧进程都活着、注册表看着正常** | 心跳与失联窗口**没配成对**：`agent_stale_secs`（网关）必须明显大于 `heartbeat_secs`（agent），窗口里至少容得下**两次**心跳。两侧启动时都会为这种情况打一条 WARN，先去看日志（agent 侧说 `heartbeat_secs is slow…`，网关侧说 `agent_stale_secs is tight…`） |
-| **请求大面积 502/超时，`/admin/agents` 恒显示 1 个 agent，`hlmg_agent_connections_total` 飞涨** | **两台机器 `agent_id` 撞车**（见 §6 警告）：改配置里任一方的 `agent_id` 为唯一值后重启该 agent |
+| **请求大面积 502/超时，`/system/agents` 恒显示 1 个 agent，`hlmg_agent_connections_total` 飞涨** | **两台机器 `agent_id` 撞车**（见 §6 警告）：改配置里任一方的 `agent_id` 为唯一值后重启该 agent |
 | curl 返回 401 | API Key 不对或没带 `Authorization: Bearer` |
 | curl 返回 503 | 网关没注册到健康 agent（看网关/agent 日志） |
 | curl 返回 429 | 限流超了（等下一分钟）或 agent 并发占满 |
@@ -328,7 +331,7 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 
 - [ ] `ca.key` 只在本地，未上传到任何服务器
 - [ ] 第一个 API Key 由 Admin API 创建（明文只显示一次），未使用可猜测的名字/弱口令
-- [ ] `admin_token` 用独立强随机串（配置文件 `admin_token`）；`/admin/*` 在安全组中仅对管理网段开放
+- [ ] `admin_token` 用独立强随机串（配置文件 `admin_token`）；`/account/*、/admin/*、/system/*` 在安全组中仅对管理网段开放
 - [ ] 每台 LLM 机器的 `agent_id` 唯一（见 §6 警告）
 - [ ] 安全组仅放行所需端口（22 限制来源 IP）
 - [ ] `/metrics` 未加认证：安全组中仅对监控网段放行，或后续给 metrics 加鉴权

@@ -514,12 +514,12 @@ mod tests {
         state.policy.max_concurrent_requests = 1;
         let router = app(state.clone());
 
-        // 5ms 放弃 vs `/admin/keys` 里的真 argon2（10–30ms，本模块不装 CheapArgon2）：
+        // 5ms 放弃 vs `/system/keys` 里的真 argon2（10–30ms，本模块不装 CheapArgon2）：
         // 窗口足够宽，20 次里应当次次落在窗口内（与既有 abort 测试同一姿态）。
         for _ in 0..20 {
             let req = axum::extract::Request::builder()
                 .method("POST")
-                .uri("/admin/keys")
+                .uri("/system/keys")
                 .header(axum::http::header::AUTHORIZATION, "Bearer admin")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(r#"{"name":"probe"}"#))
@@ -560,13 +560,13 @@ mod tests {
         state.policy.max_concurrent_requests = 1;
         let router = app(state);
 
-        // /admin/keys 的 handler 会 parked 在 spawn_blocking(argon2)（约 10-30ms），
+        // /system/keys 的 handler 会 parked 在 spawn_blocking(argon2)（约 10-30ms），
         // 1ms 后放弃即落在窗口内。多次尝试确保至少一次落在窗口内：若全部正常返回，
         // 本测试会退化成空转（不会误报，但也拦不住回归）。
         for _ in 0..30 {
             let req = axum::extract::Request::builder()
                 .method("POST")
-                .uri("/admin/keys")
+                .uri("/system/keys")
                 .header(axum::http::header::AUTHORIZATION, "Bearer admin")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(r#"{"name":"probe"}"#))

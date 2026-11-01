@@ -38,7 +38,7 @@ pub struct Options {
     pub https: Option<TlsPem>,
 
     // ── 落地 ──
-    /// Admin token；提供后启用 `/admin/*`（None = 整块路由不注册）。
+    /// Break-glass control-plane token；提供后启用 `/account`、`/admin`、`/system`（None = 控制面不注册）。
     pub admin_token: Option<String>,
     /// 动态 API Key 持久化文件（None = 仅内存：**进程重启后所有 Key 消失**）。
     ///
@@ -379,11 +379,11 @@ impl Options {
         }
 
         // `admin_token: ""`（YAML 里写了空串）是**配了却用不了**：`http/mod.rs` 见 `is_some()`
-        // 就把 `/admin/*` 挂上，而 admin 鉴权把空串当期望值 —— 可 `bearer_token` 对空凭据一律
+        // 就把 control-plane routes 挂上，而 admin 鉴权把空串当期望值 —— 可 `bearer_token` 对空凭据一律
         // 返回 `None`（P3-17），于是每个管理请求都是 401，运维从现象看不出来哪里配错了。
         // 按"配了却用不了 ⇒ 启动失败"的既有口径拒掉它，并点名字段。
         //
-        // **`None`（不写这一项）必须继续放行**：那表示不挂载 `/admin/*`，是合法配置（内存模式
+        // **`None`（不写这一项）必须继续放行**：那表示不挂载 control-plane routes，是合法配置（内存模式
         // 同样的口径，见 `storage::Storage::persistence_state`）。
         if self
             .admin_token
@@ -391,7 +391,7 @@ impl Options {
             .is_some_and(|token| token.trim().is_empty())
         {
             return Err(
-                "admin_token = \"\"：/admin/* 会被挂载，但空凭据一律被拒 —— 每个管理请求都会 401；\
+                "admin_token = \"\"：control-plane routes 会被挂载，但空凭据一律被拒 —— 每个管理请求都会 401；\
                  想启用就填一个非空串，不想启用就删掉这一项"
                     .into(),
             );
@@ -654,10 +654,10 @@ mod tests {
     }
 
     /// 规格（SL-P2-9）：`admin_token: ""` 是**配了却用不了** —— `http/mod.rs` 见 `is_some()` 就把
-    /// `/admin/*` 挂上，而 admin 鉴权拿空串当期望值，可 `bearer_token` 对空凭据一律返回 `None`
+    /// control-plane routes 挂上，而 admin 鉴权拿空串当期望值，可 `bearer_token` 对空凭据一律返回 `None`
     /// （P3-17），于是每个管理请求都是 401，运维从现象看不出哪里配错了。启动即失败、点名字段。
     ///
-    /// 注意 `None`（不写这一项）= 不挂载 `/admin/*`，是**合法**配置，必须继续放行。
+    /// 注意 `None`（不写这一项）= 不挂载 control-plane routes，是**合法**配置，必须继续放行。
     #[test]
     fn an_empty_admin_token_is_rejected_while_absent_stays_legal() {
         let mut opts = Options {
@@ -676,7 +676,7 @@ mod tests {
         opts.admin_token = Some("   ".into());
         assert!(opts.validate().is_err(), "纯空白同样用不了");
 
-        // 不配置 = 不挂载 /admin/*，合法
+        // 不配置 = 不挂载 control-plane routes，合法
         opts.admin_token = None;
         assert!(
             opts.validate().is_ok(),

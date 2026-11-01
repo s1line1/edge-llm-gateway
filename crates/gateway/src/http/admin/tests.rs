@@ -1,4 +1,4 @@
-//! Compatibility path for the split admin resource modules.
+//! Handler tests for the split admin resource modules.
 
 pub use crate::http::admin::*;
 
@@ -120,7 +120,7 @@ mod handler_tests {
             .oneshot(
                 axum::extract::Request::builder()
                     .method("POST")
-                    .uri("/admin/keys")
+                    .uri("/system/keys")
                     .header(axum::http::header::AUTHORIZATION, "Bearer admin-token")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(r#"{"name":"p3-20"}"#))
@@ -172,7 +172,7 @@ mod handler_tests {
             .oneshot(
                 axum::extract::Request::builder()
                     .method("DELETE")
-                    .uri(format!("/admin/keys/{id}"))
+                    .uri(format!("/system/keys/{id}"))
                     .header(axum::http::header::AUTHORIZATION, "Bearer admin-token")
                     .body(axum::body::Body::empty())
                     .unwrap(),
@@ -262,7 +262,7 @@ mod handler_tests {
         );
     }
 
-    /// `/admin/*` 的错误体必须与网关别处**同一个**格式：`error.type` 按状态码映射。
+    /// `/system/*` 的错误体必须与网关别处**同一个**格式：`error.type` 按状态码映射。
     ///
     /// 拆分前这里是自造的名字（`auth_error`），而 `proxy::error_response` 用的是
     /// `authentication_error`——同一个网关两种错误语义，SDK 只能按其中一种判断。
@@ -274,7 +274,7 @@ mod handler_tests {
         let resp = crate::http::app(state)
             .oneshot(
                 axum::extract::Request::builder()
-                    .uri("/admin/keys")
+                    .uri("/system/keys")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -296,9 +296,9 @@ mod handler_tests {
         assert_eq!(body["error"]["message"], "invalid admin token");
     }
 
-    /// 规格（P3-6）：`/admin/*` 的响应必须带 `Cache-Control: no-store`。
+    /// 规格（P3-6）：`/system/*` 的响应必须带 `Cache-Control: no-store`。
     ///
-    /// `POST /admin/keys` 的响应体里就是**一次性明文 API key**，列表/用量响应带 key 名与用量
+    /// `POST /system/keys` 的响应体里就是**一次性明文 API key**，列表/用量响应带 key 名与用量
     /// ——这些都不该被任何共享缓存留存（即便按 RFC，带凭据的请求一般不会被缓存，这仍是
     /// 显式声明）。401 那条路径也一并钉住：它是同一个 router 的响应。
     #[tokio::test]
@@ -307,7 +307,7 @@ mod handler_tests {
 
         for (label, auth) in [("带 token", Some("Bearer admin-token")), ("401", None)] {
             let state = test_state(); // admin_token = Some("admin-token")
-            let mut req = axum::extract::Request::builder().uri("/admin/keys");
+            let mut req = axum::extract::Request::builder().uri("/system/keys");
             if let Some(a) = auth {
                 req = req.header(axum::http::header::AUTHORIZATION, a);
             }
@@ -327,14 +327,14 @@ mod handler_tests {
 
     /// 规格（P3-17）：admin 鉴权与 `/v1` 认证必须共用同一套 Bearer 解析——小写 scheme 也放行。
     #[tokio::test]
-    async fn admin_auth_accepts_a_lowercase_bearer_scheme() {
+    async fn console_auth_accepts_a_lowercase_bearer_scheme() {
         use tower::ServiceExt;
 
         let state = test_state(); // admin_token = Some("admin-token")
         let resp = crate::http::app(state)
             .oneshot(
                 axum::extract::Request::builder()
-                    .uri("/admin/keys")
+                    .uri("/system/keys")
                     .header(axum::http::header::AUTHORIZATION, "bearer admin-token")
                     .body(axum::body::Body::empty())
                     .unwrap(),
@@ -344,7 +344,7 @@ mod handler_tests {
         assert_eq!(resp.status(), StatusCode::OK, "`bearer` 小写应当被接受");
     }
 
-    /// 规格（复扫 D2）：配置里 `admin_token` 带首尾空白时，**`/admin/*` 仍然可用**。
+    /// 规格（复扫 D2）：配置里 `admin_token` 带首尾空白时，**`/system/*` 仍然可用**。
     ///
     /// 走完整路由（挂载判据 + 鉴权比较）而不只是 `AppState` 字段：入站凭据到不了带空白的那一步
     /// （`bearer_token` 与 httparse 各剪一端），所以 `"  admin-token  "` 这种值在修好前是
@@ -367,7 +367,7 @@ mod handler_tests {
         let resp = crate::http::app(state)
             .oneshot(
                 axum::extract::Request::builder()
-                    .uri("/admin/keys")
+                    .uri("/system/keys")
                     .header(axum::http::header::AUTHORIZATION, "Bearer admin-token")
                     .body(axum::body::Body::empty())
                     .unwrap(),
@@ -422,7 +422,7 @@ mod rbac_tests {
         storage::UserRole,
     };
     use axum::{
-        extract::{Extension, Query, State},
+        extract::{Extension, Path, Query, State},
         http::{HeaderMap, StatusCode},
         response::Response,
         Json,
@@ -560,5 +560,50 @@ mod rbac_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn account_and_admin_key_deletes_are_owner_and_tenant_scoped() {
+        let _cheap = cheap();
+        let (state, _store, a, b, ta, user) = setup();
+        let other_user = state
+            .admin()
+            .store
+            .create_user(
+                "someone-else".into(),
+                "correct horse battery".into(),
+                UserRole::User,
+                Some(a.clone()),
+                None,
+            )
+            .unwrap()
+            .record;
+        let foreign_user_key = state
+            .admin()
+            .store
+            .create_in(&a, Some(other_user.id()), "foreign".into())
+            .unwrap();
+        let user_resp = delete_key(
+            State(state.admin().clone()),
+            ext(UserRole::User, Some(&a), &user),
+            HeaderMap::new(),
+            Path(foreign_user_key.record.id().to_string()),
+        )
+        .await;
+        assert_eq!(user_resp.status(), StatusCode::NOT_FOUND);
+
+        let foreign_tenant_key = state
+            .admin()
+            .store
+            .create_in(&b, None, "beta-key".into())
+            .unwrap();
+        let admin_resp = delete_key(
+            State(state.admin().clone()),
+            ext(UserRole::TenantAdmin, Some(&a), &ta),
+            HeaderMap::new(),
+            Path(foreign_tenant_key.record.id().to_string()),
+        )
+        .await;
+        assert_eq!(admin_resp.status(), StatusCode::NOT_FOUND);
     }
 }

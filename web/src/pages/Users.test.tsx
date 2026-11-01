@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { AdminUser } from "../api/types";
@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
   deleteUser: vi.fn(),
 }));
 vi.mock("../api/client", () => ({
+  scopeForRole: (role: string) =>
+    role === "user" ? "account" : role === "tenant_admin" ? "admin" : "system",
   listUsers: mocks.listUsers,
   listTenants: mocks.listTenants,
   createUser: mocks.createUser,
@@ -77,5 +79,107 @@ describe("Users page", () => {
     renderPage("tenant_admin");
     expect(await screen.findByText("tenant-admin")).toBeDefined();
     expect(screen.getByText("tenant_admin")).toBeDefined();
+  });
+});
+
+describe("Users page password reset dialog", () => {
+  it("opens an in-page dialog with a password input instead of a native prompt", async () => {
+    mocks.listUsers.mockResolvedValue([user]);
+    mocks.listTenants.mockResolvedValue([]);
+    const prompt = vi.spyOn(window, "prompt").mockReturnValue(null);
+    renderPage("super_admin");
+
+    fireEvent.click(await screen.findByRole("button", { name: "改密" }));
+
+    expect(await screen.findByRole("dialog", { name: "修改密码：alice" })).toBeDefined();
+    expect(screen.getByLabelText("新密码")).toBeDefined();
+    expect(prompt).not.toHaveBeenCalled();
+    prompt.mockRestore();
+  });
+
+  it("validates the password length before calling the API", async () => {
+    mocks.listUsers.mockResolvedValue([user]);
+    mocks.listTenants.mockResolvedValue([]);
+    mocks.updateUser.mockReset();
+    renderPage("super_admin");
+
+    fireEvent.click(await screen.findByRole("button", { name: "改密" }));
+    fireEvent.change(screen.getByLabelText("新密码"), { target: { value: "short" } });
+    fireEvent.click(screen.getByRole("button", { name: "更新密码" }));
+
+    expect(await screen.findByText("密码长度必须为 12–128 个字符")).toBeDefined();
+    expect(mocks.updateUser).not.toHaveBeenCalled();
+  });
+
+  it("submits the new password with the super_admin system scope and reports success", async () => {
+    mocks.listUsers.mockResolvedValue([user]);
+    mocks.listTenants.mockResolvedValue([]);
+    mocks.updateUser.mockReset();
+    mocks.updateUser.mockResolvedValue(user);
+    renderPage("super_admin");
+
+    fireEvent.click(await screen.findByRole("button", { name: "改密" }));
+    fireEvent.change(screen.getByLabelText("新密码"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "更新密码" }));
+
+    await waitFor(() =>
+      expect(mocks.updateUser).toHaveBeenCalledWith("system", "u1", {
+        password: "correct horse battery",
+      }),
+    );
+    expect(await screen.findByText("密码已更新：alice")).toBeDefined();
+    expect(screen.queryByRole("dialog", { name: "修改密码：alice" })).toBeNull();
+  });
+
+  it("uses the tenant_admin admin scope", async () => {
+    mocks.listUsers.mockResolvedValue([user]);
+    mocks.listTenants.mockResolvedValue([]);
+    mocks.updateUser.mockReset();
+    mocks.updateUser.mockResolvedValue(user);
+    renderPage("tenant_admin");
+
+    fireEvent.click(await screen.findByRole("button", { name: "改密" }));
+    fireEvent.change(screen.getByLabelText("新密码"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "更新密码" }));
+
+    await waitFor(() =>
+      expect(mocks.updateUser).toHaveBeenCalledWith("admin", "u1", {
+        password: "correct horse battery",
+      }),
+    );
+  });
+
+  it("cancel closes the dialog without calling the API", async () => {
+    mocks.listUsers.mockResolvedValue([user]);
+    mocks.listTenants.mockResolvedValue([]);
+    mocks.updateUser.mockReset();
+    renderPage("super_admin");
+
+    fireEvent.click(await screen.findByRole("button", { name: "改密" }));
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+
+    expect(screen.queryByRole("dialog", { name: "修改密码：alice" })).toBeNull();
+    expect(mocks.updateUser).not.toHaveBeenCalled();
+  });
+
+  it("keeps the dialog open and shows the server error when reset fails", async () => {
+    mocks.listUsers.mockResolvedValue([user]);
+    mocks.listTenants.mockResolvedValue([]);
+    mocks.updateUser.mockReset();
+    mocks.updateUser.mockRejectedValue(new Error("current password is incorrect"));
+    renderPage("super_admin");
+
+    fireEvent.click(await screen.findByRole("button", { name: "改密" }));
+    fireEvent.change(screen.getByLabelText("新密码"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "更新密码" }));
+
+    expect(await screen.findByText("current password is incorrect")).toBeDefined();
+    expect(screen.getByRole("dialog", { name: "修改密码：alice" })).toBeDefined();
   });
 });

@@ -49,7 +49,7 @@ die() { printf '\033[31m错误: %s\033[0m\n' "$*" >&2; exit 1; }
 # ---------- 前置检查 ----------
 command -v k6 >/dev/null || die "找不到 k6（macOS: brew install k6）"
 command -v python3 >/dev/null || die "找不到 python3"
-[ -n "$GATEWAY_KEY" ] || die "必须给 GATEWAY_KEY=sk-xxx（用 /admin/keys 签发，或见 make bench-k6 注释）"
+[ -n "$GATEWAY_KEY" ] || die "必须给 GATEWAY_KEY=sk-xxx（用 /system/keys 签发，或见 make bench-k6 注释）"
 
 if [ "$FORCE" != "1" ] && [ "$SKIP_SWEEP" != "1" ]; then
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$GATEWAY_URL/healthz" || true)"

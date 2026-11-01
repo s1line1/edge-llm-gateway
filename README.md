@@ -17,7 +17,7 @@
 任何地方用标准的 OpenAI SDK 调它，同时**不把本地推理端点直接暴露到公网**。
 
 <p align="center">
-  <img alt="测试" src="https://img.shields.io/badge/tests-474%20passed-brightgreen">
+  <img alt="测试" src="https://img.shields.io/badge/tests-478%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -108,14 +108,14 @@ agent 只做一件事：把隧道里收到的请求帧，变成一次对本地 L
   只在 `allow_legacy_agent_registration: true` 的迁移窗口内接受
 - 每 tenant 可配 `requests_per_minute` 与 `max_concurrent_requests`，与 per-key 限流叠加；
   并发票持有到响应 body 结束
-- Agent 注册使用一次性 `agent_token`（只存 sha256；见 `/admin/tenants`），一条 QUIC 连接只属于一个 tenant
-- 管理面：`/admin/tenants` CRUD、agent-token rotate，`/admin/keys`、`/admin/usage`、`/admin/agents`
+- Agent 注册使用一次性 `agent_token`（只存 sha256；见 `/system/tenants`），一条 QUIC 连接只属于一个 tenant
+- 管理面：`/system/tenants` CRUD、agent-token rotate，`/system/keys`、`/system/usage`、`/system/agents`
   支持 tenant 过滤；tenant 不进 metric label（避免高基数），进结构化日志
 
 **Users & Roles**
 - Dashboard 使用账号密码登录：`super_admin`（平台级）、`tenant_admin`（单 tenant）、`user`（个人 key/用量）
 - 服务端 session 存 `sha256(token)`，cookie 为 `HttpOnly + SameSite=Lax`；写请求要求 CSRF double-submit
-- 首次启动用现有 `admin_token` 调 `POST /admin/auth/bootstrap` 创建第一个 `super_admin`；
+- 首次启动用现有 `admin_token` 调 `POST /auth/bootstrap` 创建第一个 `super_admin`；
   `admin_token` 此后只作为 break-glass 凭据，不是日常登录方式
 - 禁用/删除用户会撤销 session 并禁用其名下 API key；改角色/改密码也会撤销旧 session
 - 最后一名 `super_admin` 不能被删除、禁用或降级
@@ -125,7 +125,7 @@ agent 只做一件事：把隧道里收到的请求帧，变成一次对本地 L
 - 已验证身份缓存（单飞 + 凭据版本核对），把 argon2 从"每请求一次"降到"每凭据版本一次"，
   且**吊销即时生效**、不依赖 TTL
 - 调用方凭据（`Authorization` / `Cookie`）只留在「客户端 ↔ 网关」这一跳，**不**随隧道转发给上游
-- `admin_token` 与 API Key 相互独立；`/admin/*` 响应带 `Cache-Control: no-store`
+- `admin_token` 与 API Key 相互独立；`/account/*、/admin/*、/system/*` 响应带 `Cache-Control: no-store`
 
 **Reliability**
 - 建立阶段失败（开流 / 写请求帧）**换一个 agent 重试**：那时请求帧必然未送达，重放无副作用
@@ -141,6 +141,10 @@ agent 只做一件事：把隧道里收到的请求帧，变成一次对本地 L
 - 按需凭证管理：Gateway 启动不生成证书；需要时创建 client/server 成对凭证，server 半部分留在网关，client 半部分一次性下载
 
 ---
+
+> **破坏性 API 变更**：控制面已拆分为 `/auth/*`、`/account/*`、`/admin/*`、`/system/*`；
+> 旧的 all-role `/admin/*` 路由（包括 `/admin/auth/*`）已移除。
+> 完整路径映射见 [角色拆分计划](plan/architecture-role-split-api-1.md)。
 
 ## Quick Start
 
@@ -160,7 +164,7 @@ make dev       # 编译 debug 二进制，一键起 mock-llm + gateway + agent
 
 ```bash
 # 1) 创建第一把 API key —— 网关没有静态 key，全部运行时签发
-KEY=$(curl -s -X POST http://127.0.0.1:8080/admin/keys \
+KEY=$(curl -s -X POST http://127.0.0.1:8080/system/keys \
   -H "Authorization: Bearer dev-admin" -H "Content-Type: application/json" \
   -d '{"name":"dev"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['key'])")
 
@@ -209,16 +213,16 @@ client.chat.completions.create(model="qwen2.5", messages=[{"role": "user", "cont
 
 ```bash
 # 首次启动：用 admin_token 创建第一个 super_admin（仅 users 表为空时可用）
-curl -X POST http://127.0.0.1:8080/admin/auth/bootstrap -H "Authorization: Bearer <admin-token>" \
+curl -X POST http://127.0.0.1:8080/auth/bootstrap -H "Authorization: Bearer <admin-token>" \
   -H "Content-Type: application/json" -d '{"username":"root","password":"<12+ chars>"}'
 
 # 浏览器打开 / 用 root 登录；脚本/应急仍可用 Bearer admin-token：
-curl -X POST   http://127.0.0.1:8080/admin/keys      -H "Authorization: Bearer <admin-token>" \
+curl -X POST   http://127.0.0.1:8080/system/keys      -H "Authorization: Bearer <admin-token>" \
   -H "Content-Type: application/json" -d '{"name":"dsh-client"}'   # 返回明文 key，仅此一次
-curl           http://127.0.0.1:8080/admin/keys      -H "Authorization: Bearer <admin-token>"   # 列表（脱敏）
-curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <admin-token>"   # 吊销（立即生效）
-curl           http://127.0.0.1:8080/admin/agents    -H "Authorization: Bearer <admin-token>"
-curl           http://127.0.0.1:8080/admin/usage     -H "Authorization: Bearer <admin-token>"
+curl           http://127.0.0.1:8080/system/keys      -H "Authorization: Bearer <admin-token>"   # 列表（脱敏）
+curl -X DELETE http://127.0.0.1:8080/system/keys/<id> -H "Authorization: Bearer <admin-token>"   # 吊销（立即生效）
+curl           http://127.0.0.1:8080/system/agents    -H "Authorization: Bearer <admin-token>"
+curl           http://127.0.0.1:8080/system/usage     -H "Authorization: Bearer <admin-token>"
 ```
 
 ---
@@ -334,8 +338,8 @@ fmt · clippy -D warnings · nextest · e2e 接线 · toolchain-check · check-r
 
 `make check` 在它之外再加 `cargo deny` 与前端四项（web-format / web-lint / web-test / web-build）。
 
-> **当前规模（`cargo nextest run --workspace` 实测）**：**474 个被执行且通过的测试（0 skipped）**，其中
-> **82 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
+> **当前规模（`cargo nextest run --workspace` 实测）**：**478 个被执行且通过的测试（0 skipped）**，其中
+> **84 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
 >
 > 两点与 `cargo test` 不同的行为要知道：**nextest 每条测试一个进程**，所以 `serial_test` 的
 > `#[serial]`（进程内锁）在它下面失效——e2e 的串行改由 `.config/nextest.toml` 的 `test-group`

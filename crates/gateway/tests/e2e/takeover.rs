@@ -24,7 +24,7 @@ async fn e2e_takeover_drains_the_in_flight_request_instead_of_cutting_it() {
     // 好把 `certs` 拿在手上签第二条（接管用的）agent 连接。
     let t = start_gateway(|o| {
         o.evict_close_grace = Duration::from_secs(30);
-        // `/admin/agents` 只在配了 admin_token 时才注册（`http/mod.rs`）——本用例要读
+        // `/system/agents` 只在配了 admin_token 时才注册（`http/mod.rs`）——本用例要读
         // `inflight` 确认请求真的在途，所以必须开。
         o.admin_token = Some("admin-token".into());
     })
@@ -89,7 +89,7 @@ async fn e2e_takeover_drains_the_in_flight_request_instead_of_cutting_it() {
 /// 是两个真正不同的 IP。
 ///
 /// 变异验证：把 `AgentKey` 的 `peer_ip` 从 `Hash`/`Eq` 里去掉（或固定成常量）⇒ 第二条注册会顶掉
-/// 第一条，`/admin/agents` 只剩一行，本用例红。
+/// 第一条，`/system/agents` 只剩一行，本用例红。
 #[tokio::test]
 #[serial]
 async fn e2e_same_agent_id_from_two_source_ips_coexists() {
@@ -106,16 +106,16 @@ async fn e2e_same_agent_id_from_two_source_ips_coexists() {
     register_raw_agent_from(port, "[::1]:0", &t.certs, "edge", 4).await;
     wait_for_agents(&t.gw, 2, Duration::from_secs(10)).await;
 
-    // `/admin/agents` 必须给出**同名两行**，各自带自己的来源 IP
+    // `/system/agents` 必须给出**同名两行**，各自带自己的来源 IP
     let agents: serde_json::Value = test_client()
-        .get(format!("{}/admin/agents", t.base))
+        .get(format!("{}/system/agents", t.base))
         .header("Authorization", "Bearer admin-token")
         .send()
         .await
-        .expect("/admin/agents 应当可查")
+        .expect("/system/agents 应当可查")
         .json()
         .await
-        .expect("/admin/agents 应当返回 JSON");
+        .expect("/system/agents 应当返回 JSON");
     let rows: Vec<(String, String)> = agents
         .as_array()
         .expect("应当是数组")

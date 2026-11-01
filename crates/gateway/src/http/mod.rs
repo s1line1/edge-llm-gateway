@@ -18,7 +18,7 @@ mod api;
 mod entry;
 mod observability;
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 mod ui;
 
 use admission::admission_middleware;
@@ -27,9 +27,9 @@ pub(crate) use entry::spawn_entry;
 use observability::request_id_middleware;
 use ui::{ui_fallback, ui_missing};
 
-/// `/admin/*` 的响应一律 `Cache-Control: no-store`（P3-6）。
+/// 控制面命名空间（`/account`、`/admin`、`/system`）的响应一律 `Cache-Control: no-store`（P3-6）。
 ///
-/// `POST /admin/keys` 的响应体里是**一次性明文 API key**，列表/用量响应带 key 名与用量；按
+/// `POST /account/keys`、`/admin/keys`、`/system/keys` 的响应体里是**一次性明文 API key**，列表/用量响应带 key 名与用量；按
 /// RFC，带凭据的 GET 一般不会被共享缓存留存，所以这是**显式声明**而非补漏洞。做成中间件而不是
 /// 逐个 handler 加头：新增 admin 路由时不会漏。
 async fn no_store(req: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
@@ -55,6 +55,41 @@ pub(super) fn vary_on_accept(mut resp: Response) -> Response {
     resp
 }
 
+/// Resource routes shared by `/admin` and `/system`; the caller supplies the role gate and PKI
+/// scope. Keeping composition here avoids duplicating handler wiring across namespaces.
+fn control_resource_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/keys",
+            get(crate::http::admin::list_keys_filtered).post(crate::http::admin::create_key),
+        )
+        .route("/keys/{id}", delete(crate::http::admin::delete_key))
+        .route("/usage", get(crate::http::admin::usage_filtered))
+        .route("/agents", get(crate::http::admin::list_agents))
+        .route(
+            "/users",
+            get(crate::http::admin::users::list_users).post(crate::http::admin::users::create_user),
+        )
+        .route(
+            "/users/{id}",
+            axum::routing::patch(crate::http::admin::users::update_user)
+                .delete(crate::http::admin::users::delete_user),
+        )
+        .route("/pki/status", get(crate::http::admin_pki::status))
+        .route(
+            "/pki/pairs",
+            get(crate::http::admin_pki::list).post(crate::http::admin_pki::create),
+        )
+        .route(
+            "/pki/pairs/{id}/download",
+            get(crate::http::admin_pki::download),
+        )
+        .route(
+            "/pki/pairs/{id}/revoke",
+            axum::routing::post(crate::http::admin_pki::revoke),
+        )
+}
+
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
@@ -70,31 +105,59 @@ pub fn app(state: AppState) -> Router {
                 .delete(crate::proxy::proxy)
                 .patch(crate::proxy::proxy),
         );
-    let admin_public = Router::new()
-        .route("/auth/status", get(crate::access::session::status))
+    let auth_public = Router::new()
+        .route("/status", get(crate::access::session::status))
         .route(
-            "/auth/bootstrap",
+            "/bootstrap",
             axum::routing::post(crate::access::session::bootstrap),
         )
-        .route(
-            "/auth/login",
-            axum::routing::post(crate::access::session::login),
-        );
-    let admin_protected = Router::new()
-        .route(
-            "/auth/logout",
-            axum::routing::post(crate::access::session::logout),
-        )
-        .route("/auth/me", get(crate::access::session::me))
-        .route(
-            "/auth/password",
-            axum::routing::post(crate::access::session::change_password),
-        )
+        .route("/login", axum::routing::post(crate::access::session::login))
+        .layer(middleware::from_fn(no_store));
+
+    let account_user = Router::new()
         .route(
             "/keys",
             get(crate::http::admin::list_keys_filtered).post(crate::http::admin::create_key),
         )
         .route("/keys/{id}", delete(crate::http::admin::delete_key))
+        .route("/usage", get(crate::http::admin::usage_filtered))
+        .route_layer(middleware::from_fn(crate::access::session::require_user));
+    let account = Router::new()
+        .route(
+            "/logout",
+            axum::routing::post(crate::access::session::logout),
+        )
+        .route("/me", get(crate::access::session::me))
+        .route(
+            "/password",
+            axum::routing::post(crate::access::session::change_password),
+        )
+        .merge(account_user)
+        .route_layer(middleware::from_fn_with_state(
+            state.admin().clone(),
+            crate::access::session::console_auth,
+        ))
+        .layer(middleware::from_fn(no_store));
+
+    let common = control_resource_routes();
+    let admin = Router::new()
+        .route("/tenants", get(crate::http::admin::list_tenants))
+        .route("/tenants/{id}", get(crate::http::admin::tenant_by_id))
+        .route(
+            "/tenants/{id}/agent-token",
+            axum::routing::post(crate::http::admin::rotate_agent_token),
+        )
+        .merge(common.clone())
+        .route_layer(middleware::from_fn(
+            crate::access::session::require_tenant_admin,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.admin().clone(),
+            crate::access::session::console_auth,
+        ))
+        .layer(axum::Extension(crate::http::admin_pki::PkiScope::Admin))
+        .layer(middleware::from_fn(no_store));
+    let system = Router::new()
         .route(
             "/tenants",
             get(crate::http::admin::list_tenants).post(crate::http::admin::create_tenant),
@@ -109,41 +172,23 @@ pub fn app(state: AppState) -> Router {
             "/tenants/{id}/agent-token",
             axum::routing::post(crate::http::admin::rotate_agent_token),
         )
-        .route("/agents", get(crate::http::admin::list_agents))
-        .route("/usage", get(crate::http::admin::usage_filtered))
-        .route(
-            "/users",
-            get(crate::http::admin::users::list_users).post(crate::http::admin::users::create_user),
-        )
-        .route(
-            "/users/{id}",
-            axum::routing::patch(crate::http::admin::users::update_user)
-                .delete(crate::http::admin::users::delete_user),
-        )
         .route("/audit", get(crate::http::admin::users::list_audit))
-        .route("/pki/status", get(crate::http::admin_pki::status))
-        .route(
-            "/pki/pairs",
-            get(crate::http::admin_pki::list).post(crate::http::admin_pki::create),
-        )
-        .route(
-            "/pki/pairs/{id}/download",
-            get(crate::http::admin_pki::download),
-        )
-        .route(
-            "/pki/pairs/{id}/revoke",
-            axum::routing::post(crate::http::admin_pki::revoke),
-        )
+        .merge(common)
+        .route_layer(middleware::from_fn(
+            crate::access::session::require_super_admin,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.admin().clone(),
-            crate::access::session::admin_auth,
-        ));
-    router = router.nest(
-        "/admin",
-        admin_public
-            .merge(admin_protected)
-            .layer(middleware::from_fn(no_store)),
-    );
+            crate::access::session::console_auth,
+        ))
+        .layer(axum::Extension(crate::http::admin_pki::PkiScope::System))
+        .layer(middleware::from_fn(no_store));
+
+    router = router
+        .nest("/auth", auth_public)
+        .nest("/account", account)
+        .nest("/admin", admin)
+        .nest("/system", system);
 
     // React UI 静态托管：存在时 `/` 返回 Dashboard，未命中的路径（SPA 前端路由，
     // 如 /keys、/metrics 的浏览器直接访问/刷新）fallback 到 index.html。
@@ -183,35 +228,63 @@ mod tests {
     // 那是它们的共同前提。本模块只剩"路由表能不能装起来"这一条测试。
     use crate::http::test_util::test_state;
 
-    /// 规格（Phase 6）：admin 资源拆分后，每个资源的路径/方法仍然挂在同一个鉴权层后面。
-    /// 这里用“未认证必须 401”作为路由存在的判据；404 会让测试立刻抓到漏挂的路由。
+    /// Contract test: every namespace path is mounted and protected routes reject an anonymous
+    /// request before any extractor or handler runs.
     #[tokio::test]
-    async fn admin_resource_routes_are_registered_behind_auth() {
+    async fn role_scoped_route_contract() {
         use axum::body::Body;
         use axum::http::{Method, Request, StatusCode};
         use tower::ServiceExt;
 
         let router = app(test_state(None));
-        let routes = [
+        let protected = [
+            (Method::POST, "/account/logout"),
+            (Method::GET, "/account/me"),
+            (Method::POST, "/account/password"),
+            (Method::GET, "/account/keys"),
+            (Method::POST, "/account/keys"),
+            (Method::DELETE, "/account/keys/test"),
+            (Method::GET, "/account/usage"),
+            (Method::GET, "/admin/tenants"),
+            (Method::GET, "/admin/tenants/test"),
+            (Method::POST, "/admin/tenants/test/agent-token"),
             (Method::GET, "/admin/keys"),
             (Method::POST, "/admin/keys"),
             (Method::DELETE, "/admin/keys/test"),
-            (Method::GET, "/admin/tenants"),
-            (Method::POST, "/admin/tenants"),
-            (Method::GET, "/admin/tenants/test"),
-            (Method::PATCH, "/admin/tenants/test"),
-            (Method::POST, "/admin/tenants/test/agent-token"),
-            (Method::GET, "/admin/agents"),
             (Method::GET, "/admin/usage"),
+            (Method::GET, "/admin/agents"),
             (Method::GET, "/admin/users"),
             (Method::POST, "/admin/users"),
+            (Method::PATCH, "/admin/users/test"),
+            (Method::DELETE, "/admin/users/test"),
             (Method::GET, "/admin/pki/status"),
             (Method::GET, "/admin/pki/pairs"),
             (Method::POST, "/admin/pki/pairs"),
             (Method::GET, "/admin/pki/pairs/test/download"),
             (Method::POST, "/admin/pki/pairs/test/revoke"),
+            (Method::GET, "/system/tenants"),
+            (Method::POST, "/system/tenants"),
+            (Method::GET, "/system/tenants/test"),
+            (Method::PATCH, "/system/tenants/test"),
+            (Method::DELETE, "/system/tenants/test"),
+            (Method::POST, "/system/tenants/test/agent-token"),
+            (Method::GET, "/system/keys"),
+            (Method::POST, "/system/keys"),
+            (Method::DELETE, "/system/keys/test"),
+            (Method::GET, "/system/usage"),
+            (Method::GET, "/system/agents"),
+            (Method::GET, "/system/users"),
+            (Method::POST, "/system/users"),
+            (Method::PATCH, "/system/users/test"),
+            (Method::DELETE, "/system/users/test"),
+            (Method::GET, "/system/audit"),
+            (Method::GET, "/system/pki/status"),
+            (Method::GET, "/system/pki/pairs"),
+            (Method::POST, "/system/pki/pairs"),
+            (Method::GET, "/system/pki/pairs/test/download"),
+            (Method::POST, "/system/pki/pairs/test/revoke"),
         ];
-        for (method, path) in routes {
+        for (method, path) in protected {
             let response = router
                 .clone()
                 .oneshot(
@@ -226,20 +299,50 @@ mod tests {
             assert_eq!(
                 response.status(),
                 StatusCode::UNAUTHORIZED,
-                "{path} must be routed through admin auth"
+                "{path} must be routed through console auth"
             );
         }
 
-        let public = router
+        let status = router
+            .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/admin/auth/status")
+                    .uri("/auth/status")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(public.status(), StatusCode::OK);
+        assert_eq!(status.status(), StatusCode::OK);
+
+        for path in ["/auth/login", "/auth/bootstrap"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_ne!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        for path in ["/admin/auth/status", "/admin/auth/login", "/admin/audit"] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must be gone"
+            );
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ async fn e2e_pki_agents_category_lists_a_registered_edge() {
 
     let agents: serde_json::Value = t
         .admin_client()
-        .get(format!("{}/admin/agents", t.base))
+        .get(format!("{}/system/agents", t.base))
         .bearer_auth(&t.admin_token)
         .send()
         .await
@@ -38,7 +38,7 @@ async fn e2e_pki_tenants_category_registers_in_a_created_tenant() {
     let t = start_pki_gateway(|_| {}).await;
     let tenant: serde_json::Value = t
         .admin_client()
-        .post(format!("{}/admin/tenants", t.base))
+        .post(format!("{}/system/tenants", t.base))
         .bearer_auth(&t.admin_token)
         .json(&serde_json::json!({
             "name": "pki-tenant",
@@ -66,7 +66,7 @@ async fn e2e_pki_tenants_category_registers_in_a_created_tenant() {
 
     let agents: serde_json::Value = t
         .admin_client()
-        .get(format!("{}/admin/agents?tenant_id={tenant_id}", t.base))
+        .get(format!("{}/system/agents?tenant_id={tenant_id}", t.base))
         .bearer_auth(&t.admin_token)
         .send()
         .await
@@ -142,7 +142,7 @@ async fn e2e_pki_lifecycle_category_starts_with_zero_credentials() {
     .unwrap();
     let base = format!("http://{}", gw.http_addr);
     let status: serde_json::Value = test_client()
-        .get(format!("{base}/admin/pki/status"))
+        .get(format!("{base}/system/pki/status"))
         .bearer_auth("admin-token")
         .send()
         .await

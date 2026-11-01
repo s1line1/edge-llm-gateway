@@ -23,7 +23,7 @@ fn cookie_from(resp: &Response, name: &str) -> String {
 
 async fn login(client: &Client, base: &str, user: &str, password: &str) -> Session {
     let resp = client
-        .post(format!("{base}/admin/auth/login"))
+        .post(format!("{base}/auth/login"))
         .json(&serde_json::json!({ "username": user, "password": password }))
         .send()
         .await
@@ -54,7 +54,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
 
     // 首次启动：status 未初始化，bootstrap 只接受 admin token。
     let status: serde_json::Value = client
-        .get(format!("{base}/admin/auth/status"))
+        .get(format!("{base}/auth/status"))
         .send()
         .await
         .unwrap()
@@ -64,7 +64,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
     assert_eq!(status["bootstrapped"], false);
 
     let bootstrap = client
-        .post(format!("{base}/admin/auth/bootstrap"))
+        .post(format!("{base}/auth/bootstrap"))
         .bearer_auth("admin-token")
         .json(&serde_json::json!({
             "username": "root",
@@ -78,7 +78,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
 
     // super 创建 tenant 与 tenant_admin。
     let tenant_resp = client
-        .post(format!("{base}/admin/tenants"))
+        .post(format!("{base}/system/tenants"))
         .header("cookie", cookie_pair(&super_session))
         .header("x-csrf-token", &super_session.csrf)
         .json(&serde_json::json!({ "name": "acme" }))
@@ -90,7 +90,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
     let tenant_id = tenant["id"].as_str().unwrap().to_string();
 
     let admin_resp = client
-        .post(format!("{base}/admin/users"))
+        .post(format!("{base}/system/users"))
         .header("cookie", cookie_pair(&super_session))
         .header("x-csrf-token", &super_session.csrf)
         .json(&serde_json::json!({
@@ -108,7 +108,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
 
     // super 再建一个 tenant；tenant_admin 对它的显式过滤必须 404，列表仍只有自己的。
     let second = client
-        .post(format!("{base}/admin/tenants"))
+        .post(format!("{base}/system/tenants"))
         .header("cookie", cookie_pair(&super_session))
         .header("x-csrf-token", &super_session.csrf)
         .json(&serde_json::json!({ "name": "other" }))
@@ -160,7 +160,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
     // 普通用户登录，创建自己的 key；没有 CSRF 必须 403。
     let user_session = login(&client, &base, "alice", "correct horse battery").await;
     let me: serde_json::Value = client
-        .get(format!("{base}/admin/auth/me"))
+        .get(format!("{base}/account/me"))
         .header("cookie", cookie_pair(&user_session))
         .send()
         .await
@@ -170,7 +170,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
         .unwrap();
     let user_id = me["user"]["id"].as_str().unwrap().to_string();
     let no_csrf = client
-        .post(format!("{base}/admin/keys"))
+        .post(format!("{base}/account/keys"))
         .header("cookie", cookie_pair(&user_session))
         .json(&serde_json::json!({ "name": "mine" }))
         .send()
@@ -179,7 +179,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
     assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
 
     let key_resp = client
-        .post(format!("{base}/admin/keys"))
+        .post(format!("{base}/account/keys"))
         .header("cookie", cookie_pair(&user_session))
         .header("x-csrf-token", &user_session.csrf)
         .json(&serde_json::json!({ "name": "mine" }))
@@ -192,7 +192,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
     assert_eq!(created["tenant_id"], tenant_id);
 
     let keys: serde_json::Value = client
-        .get(format!("{base}/admin/keys"))
+        .get(format!("{base}/account/keys"))
         .header("cookie", cookie_pair(&user_session))
         .send()
         .await
@@ -231,7 +231,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
 
     // break-glass admin token 仍可访问管理面。
     let break_glass = client
-        .get(format!("{base}/admin/keys"))
+        .get(format!("{base}/system/keys"))
         .bearer_auth("admin-token")
         .send()
         .await
@@ -240,7 +240,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
 
     // logout 撤销 session；随后 me 必须 401。
     let logout = client
-        .post(format!("{base}/admin/auth/logout"))
+        .post(format!("{base}/account/logout"))
         .header("cookie", cookie_pair(&user_session))
         .header("x-csrf-token", &user_session.csrf)
         .send()
@@ -248,7 +248,7 @@ async fn e2e_bootstrap_role_isolation_and_csrf() {
         .unwrap();
     assert_eq!(logout.status(), StatusCode::NO_CONTENT);
     let me = client
-        .get(format!("{base}/admin/auth/me"))
+        .get(format!("{base}/account/me"))
         .header("cookie", cookie_pair(&user_session))
         .send()
         .await

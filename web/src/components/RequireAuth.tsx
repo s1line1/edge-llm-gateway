@@ -1,4 +1,4 @@
-// 路由守卫：等待 /admin/auth/me，未登录时重定向到 /login 并记录来源页。
+// 路由守卫：等待 /account/me，未登录时重定向到 /login 并记录来源页。
 
 import { Navigate, Outlet, useLocation } from "react-router-dom";
 

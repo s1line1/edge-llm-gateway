@@ -4,7 +4,7 @@ use super::common::*;
 
 async fn create_tenant(client: &reqwest::Client, base: &str, name: &str) -> (String, String) {
     let resp = client
-        .post(format!("{base}/admin/tenants"))
+        .post(format!("{base}/system/tenants"))
         .bearer_auth("admin-token")
         .json(&serde_json::json!({ "name": name }))
         .send()
@@ -20,7 +20,7 @@ async fn create_tenant(client: &reqwest::Client, base: &str, name: &str) -> (Str
 
 async fn create_key(client: &reqwest::Client, base: &str, name: &str, tenant_id: &str) -> String {
     let resp = client
-        .post(format!("{base}/admin/keys"))
+        .post(format!("{base}/system/keys"))
         .bearer_auth("admin-token")
         .json(&serde_json::json!({ "name": name, "tenant_id": tenant_id }))
         .send()
@@ -122,7 +122,7 @@ async fn e2e_tenant_agent_and_model_isolation() {
     assert_eq!(post("model-a", &key_a).await.status(), 200);
 
     let tenants: serde_json::Value = client
-        .get(format!("{base}/admin/tenants"))
+        .get(format!("{base}/system/tenants"))
         .bearer_auth("admin-token")
         .send()
         .await
@@ -138,7 +138,7 @@ async fn e2e_tenant_agent_and_model_isolation() {
         .any(|t| t["id"] == tenant_a && t["key_count"] == 1));
 
     let agents: serde_json::Value = client
-        .get(format!("{base}/admin/agents?tenant_id={tenant_a}"))
+        .get(format!("{base}/system/agents?tenant_id={tenant_a}"))
         .bearer_auth("admin-token")
         .send()
         .await
@@ -150,7 +150,7 @@ async fn e2e_tenant_agent_and_model_isolation() {
     assert_eq!(agents[0]["tenant_id"], tenant_a);
 
     let rotated: serde_json::Value = client
-        .post(format!("{base}/admin/tenants/{tenant_a}/agent-token"))
+        .post(format!("{base}/system/tenants/{tenant_a}/agent-token"))
         .bearer_auth("admin-token")
         .send()
         .await
@@ -162,7 +162,7 @@ async fn e2e_tenant_agent_and_model_isolation() {
 
     // admin usage 必须按 tenant 归属
     let usage: serde_json::Value = client
-        .get(format!("{base}/admin/usage?tenant_id={tenant_a}"))
+        .get(format!("{base}/system/usage?tenant_id={tenant_a}"))
         .bearer_auth("admin-token")
         .send()
         .await
@@ -176,7 +176,7 @@ async fn e2e_tenant_agent_and_model_isolation() {
 
     // 禁用 A 后 A 的 key 被 403，B 不受影响
     let resp = client
-        .patch(format!("{base}/admin/tenants/{tenant_a}"))
+        .patch(format!("{base}/system/tenants/{tenant_a}"))
         .bearer_auth("admin-token")
         .json(&serde_json::json!({ "enabled": false }))
         .send()
@@ -208,7 +208,7 @@ async fn e2e_tenant_concurrency_is_enforced() {
     let client = test_client();
     let (tenant, token) = create_tenant(&client, &base, "tenant-limit").await;
     let resp = client
-        .patch(format!("{base}/admin/tenants/{tenant}"))
+        .patch(format!("{base}/system/tenants/{tenant}"))
         .bearer_auth("admin-token")
         .json(&serde_json::json!({ "max_concurrent_requests": 1 }))
         .send()

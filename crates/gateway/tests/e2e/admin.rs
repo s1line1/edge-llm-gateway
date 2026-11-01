@@ -12,7 +12,7 @@ async fn e2e_admin_api_keys() {
 
     // 无 admin token → 401；普通 API key 也不行
     let resp = client
-        .post(format!("{base}/admin/keys"))
+        .post(format!("{base}/system/keys"))
         .json(&serde_json::json!({"name": "x"}))
         .send()
         .await
@@ -26,7 +26,7 @@ async fn e2e_admin_api_keys() {
         "admin 401 必须带 WWW-Authenticate challenge"
     );
     let resp = client
-        .post(format!("{base}/admin/keys"))
+        .post(format!("{base}/system/keys"))
         .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({"name": "x"}))
         .send()
@@ -40,7 +40,7 @@ async fn e2e_admin_api_keys() {
 
     // 创建 key
     let resp = client
-        .post(format!("{base}/admin/keys"))
+        .post(format!("{base}/system/keys"))
         .header("Authorization", "Bearer admin-token")
         .json(&serde_json::json!({"name": "dsh-client"}))
         .send()
@@ -77,7 +77,7 @@ async fn e2e_admin_api_keys() {
 
     // 列表包含刚创建的 key（且不暴露明文）
     let resp = client
-        .get(format!("{base}/admin/keys"))
+        .get(format!("{base}/system/keys"))
         .header("Authorization", "Bearer admin-token")
         .send()
         .await
@@ -98,7 +98,7 @@ async fn e2e_admin_api_keys() {
 
     // 吊销 → 204，之后该 key 立即失效
     let resp = client
-        .delete(format!("{base}/admin/keys/{new_id}"))
+        .delete(format!("{base}/system/keys/{new_id}"))
         .header("Authorization", "Bearer admin-token")
         .send()
         .await
@@ -114,7 +114,7 @@ async fn e2e_admin_api_keys() {
 
     // 删除不存在的 key → 404
     let resp = client
-        .delete(format!("{base}/admin/keys/{new_id}"))
+        .delete(format!("{base}/system/keys/{new_id}"))
         .header("Authorization", "Bearer admin-token")
         .send()
         .await
@@ -125,8 +125,8 @@ async fn e2e_admin_api_keys() {
     gw.shutdown().await;
 }
 
-/// 打真实 chat 请求 → mock 返回 usage {prompt:1, completion:1} → /admin/usage
-/// 一致累计；/admin/keys 内嵌 usage；吊销 key 后用量记录仍保留（可审计）。
+/// 打真实 chat 请求 → mock 返回 usage {prompt:1, completion:1} → /system/usage
+/// 一致累计；/system/keys 内嵌 usage；吊销 key 后用量记录仍保留（可审计）。
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn e2e_usage_metering() {
@@ -156,7 +156,7 @@ async fn e2e_usage_metering() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let usage = loop {
         let resp = client
-            .get(format!("{base}/admin/usage"))
+            .get(format!("{base}/system/usage"))
             .header("Authorization", "Bearer admin-token")
             .send()
             .await
@@ -194,9 +194,9 @@ async fn e2e_usage_metering() {
         "last_used_at set"
     );
 
-    // /admin/keys 内嵌 usage 与 /admin/usage 一致
+    // /system/keys 内嵌 usage 与 /system/usage 一致
     let keys: serde_json::Value = client
-        .get(format!("{base}/admin/keys"))
+        .get(format!("{base}/system/keys"))
         .header("Authorization", "Bearer admin-token")
         .send()
         .await
@@ -215,14 +215,14 @@ async fn e2e_usage_metering() {
 
     // 吊销 key → usage 记录仍保留（独立表，可审计）
     let resp = client
-        .delete(format!("{base}/admin/keys/{id}"))
+        .delete(format!("{base}/system/keys/{id}"))
         .header("Authorization", "Bearer admin-token")
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
     let usage_after: serde_json::Value = client
-        .get(format!("{base}/admin/usage"))
+        .get(format!("{base}/system/usage"))
         .header("Authorization", "Bearer admin-token")
         .send()
         .await

@@ -110,7 +110,7 @@ pub async fn start_pki_gateway(tune: impl FnOnce(&mut Options)) -> TestPkiGatewa
     let client = test_client();
     let server_name = "pki-e2e.localhost";
     let created: serde_json::Value = client
-        .post(format!("{base}/admin/pki/pairs"))
+        .post(format!("{base}/system/pki/pairs"))
         .bearer_auth("admin-token")
         .json(&serde_json::json!({
             "name": "pki-e2e",
@@ -126,7 +126,7 @@ pub async fn start_pki_gateway(tune: impl FnOnce(&mut Options)) -> TestPkiGatewa
         .unwrap();
     let pair_id = created["id"].as_str().unwrap().to_string();
     let bytes = client
-        .get(format!("{base}/admin/pki/pairs/{pair_id}/download"))
+        .get(format!("{base}/system/pki/pairs/{pair_id}/download"))
         .bearer_auth("admin-token")
         .send()
         .await

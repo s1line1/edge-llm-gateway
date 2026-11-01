@@ -14,14 +14,14 @@ server_name="${name}.localhost"
 created="$(curl -fsS \
   -H "Authorization: Bearer ${admin_token}" \
   -H 'Content-Type: application/json' \
-  -X POST "${base}/admin/pki/pairs" \
+  -X POST "${base}/system/pki/pairs" \
   --data "{\"name\":\"${name}\",\"tenant_id\":\"default\",\"server_name\":\"${server_name}\"}")"
 
 id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$created")"
 
 curl -fsS \
   -H "Authorization: Bearer ${admin_token}" \
-  "${base}/admin/pki/pairs/${id}/download" \
+  "${base}/system/pki/pairs/${id}/download" \
   -o ".tmp/dev-client.tar"
 
 rm -rf "$out"

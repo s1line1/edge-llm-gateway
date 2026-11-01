@@ -21,7 +21,10 @@ async fn e2e_production_pki_pair_registers_an_agent() {
 
     let second = t
         .admin_client()
-        .get(format!("{}/admin/pki/pairs/{}/download", t.base, t.pair_id))
+        .get(format!(
+            "{}/system/pki/pairs/{}/download",
+            t.base, t.pair_id
+        ))
         .bearer_auth(&t.admin_token)
         .send()
         .await

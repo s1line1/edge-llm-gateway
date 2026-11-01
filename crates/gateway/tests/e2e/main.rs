@@ -3,6 +3,7 @@
 //! 注意：这些测试必须**串行**运行（`#[serial]`）——每个测试都启动独立的
 //! 多线程 runtime + QUIC 连接 + 时序敏感断言，默认并行会互相争抢 CPU。
 
+mod account;
 mod admin;
 mod agents;
 mod auth;
@@ -17,6 +18,7 @@ mod metrics;
 mod nofile;
 mod pki_categories;
 mod pki_identity;
+mod rbac_paths;
 mod signals;
 mod stalls;
 mod takeover;

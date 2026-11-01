@@ -18,7 +18,7 @@ port), and you want to call it from anywhere with a standard OpenAI SDK — **wi
 local inference endpoint to the public Internet.**
 
 <p align="center">
-  <img alt="tests" src="https://img.shields.io/badge/tests-474%20passed-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-478%20passed-brightgreen">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.97-000000?logo=rust&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -121,17 +121,17 @@ the local LLM, and stream the response back. Point `upstream` at your local serv
   legacy `Register` is accepted only while `allow_legacy_agent_registration: true`.
 - Each tenant can set `requests_per_minute` and `max_concurrent_requests`; the concurrency ticket
   is held through the response body, alongside the per-key rate limit.
-- Agent registration uses a one-time `agent_token` (sha256 stored only; `/admin/tenants`); one QUIC
+- Agent registration uses a one-time `agent_token` (sha256 stored only; `/system/tenants`); one QUIC
   connection belongs to exactly one tenant.
-- Admin: `/admin/tenants` CRUD and agent-token rotation; `/admin/keys`, `/admin/usage`, and
-  `/admin/agents` accept tenant filters. Tenant IDs are logged, not used as metric labels.
+- Admin: `/system/tenants` CRUD and agent-token rotation; `/system/keys`, `/system/usage`, and
+  `/system/agents` accept tenant filters. Tenant IDs are logged, not used as metric labels.
 
 **Users & Roles**
 - Dashboard login uses username/password with `super_admin` (platform), `tenant_admin` (one tenant),
   and `user` (own keys/usage) roles.
 - Server-side sessions store only `sha256(token)`; cookies are `HttpOnly + SameSite=Lax`, and unsafe
   requests require CSRF double-submit.
-- The first `super_admin` is created with `POST /admin/auth/bootstrap` using the configured
+- The first `super_admin` is created with `POST /auth/bootstrap` using the configured
   `admin_token`; afterwards the token is break-glass only, not the normal login.
 - Disabling/deleting a user revokes sessions and disables owned API keys; role/password changes revoke
   old sessions. The last enabled `super_admin` cannot be deleted, disabled, or demoted.
@@ -142,7 +142,7 @@ the local LLM, and stream the response back. Point `upstream` at your local serv
   into "once per credential version" — and **revocation is still immediate**, not TTL-based
 - Caller credentials (`Authorization` / `Cookie`) stay on the *client ↔ gateway* hop and are **not**
   forwarded to the edge (if your upstream needs auth, configure it on the agent)
-- `admin_token` is independent from API keys; `/admin/*` responses carry `Cache-Control: no-store`
+- `admin_token` is independent from API keys; `/account/*、/admin/*、/system/*` responses carry `Cache-Control: no-store`
 
 **Reliability**
 - Establishment-phase failures (open stream / write request frame) are **retried on another agent**:
@@ -163,6 +163,10 @@ the local LLM, and stream the response back. Point `upstream` at your local serv
 
 ---
 
+> **Breaking API change**: the control plane is now split into `/auth/*`, `/account/*`, `/admin/*`,
+> and `/system/*`. The old all-role `/admin/*` routes (including `/admin/auth/*`) are removed.
+> See [the role-split plan](plan/architecture-role-split-api-1.md) for the full mapping.
+
 ## Quick Start
 
 Everything runs locally, **no real model required** (`mock-llm` stands in for the upstream).
@@ -182,7 +186,7 @@ Once `make dev` is up (logs in `.tmp/logs/`):
 
 ```bash
 # 1) Create your first API key — the gateway has no static keys, everything is issued at runtime
-KEY=$(curl -s -X POST http://127.0.0.1:8080/admin/keys \
+KEY=$(curl -s -X POST http://127.0.0.1:8080/system/keys \
   -H "Authorization: Bearer dev-admin" -H "Content-Type: application/json" \
   -d '{"name":"dev"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['key'])")
 
@@ -231,12 +235,12 @@ client.chat.completions.create(model="qwen2.5", messages=[{"role": "user", "cont
 **Admin API** (enabled by `admin_token`; there is also a web UI at `/`):
 
 ```bash
-curl -X POST   http://127.0.0.1:8080/admin/keys      -H "Authorization: Bearer <admin-token>" \
+curl -X POST   http://127.0.0.1:8080/system/keys      -H "Authorization: Bearer <admin-token>" \
   -H "Content-Type: application/json" -d '{"name":"dsh-client"}'   # returns the plaintext key, once
-curl           http://127.0.0.1:8080/admin/keys      -H "Authorization: Bearer <admin-token>"   # list (masked)
-curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <admin-token>"   # revoke (immediate)
-curl           http://127.0.0.1:8080/admin/agents    -H "Authorization: Bearer <admin-token>"
-curl           http://127.0.0.1:8080/admin/usage     -H "Authorization: Bearer <admin-token>"
+curl           http://127.0.0.1:8080/system/keys      -H "Authorization: Bearer <admin-token>"   # list (masked)
+curl -X DELETE http://127.0.0.1:8080/system/keys/<id> -H "Authorization: Bearer <admin-token>"   # revoke (immediate)
+curl           http://127.0.0.1:8080/system/agents    -H "Authorization: Bearer <admin-token>"
+curl           http://127.0.0.1:8080/system/usage     -H "Authorization: Bearer <admin-token>"
 ```
 
 ---
@@ -372,8 +376,8 @@ fmt · clippy -D warnings · nextest · e2e wiring · toolchain-check · check-r
 
 `make check` adds `cargo deny` and the four web targets on top (web-format / web-lint / web-test / web-build).
 
-> **Current scale (`cargo nextest run --workspace`, measured)**: **474 tests executed and passed (0 skipped)**, of which
-> **82 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
+> **Current scale (`cargo nextest run --workspace`, measured)**: **478 tests executed and passed (0 skipped)**, of which
+> **84 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
 > per commit; trust the actual run output.
 >
 > Two behaviours differ from `cargo test` and are worth knowing: **nextest runs one process per test**,
